@@ -38,15 +38,15 @@ ENV/
 */.ipynb_checkpoints/
 
 # Model/data artifacts
-data/
-datasets/
-outputs/
-runs/
-logs/
-checkpoints/
-weights/
-models/
-artifacts/
+/data/
+/datasets/
+/outputs/
+/runs/
+/logs/
+/checkpoints/
+/weights/
+/models/
+/artifacts/
 *.ckpt
 *.h5
 *.hdf5
