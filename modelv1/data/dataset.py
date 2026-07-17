@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
+
+from modelv1.deca_cache import DecaFeatureCache
+from modelv1.data.normalization import UVTargetNormalizer, fit_uv_target_normalizer
 
 try:
     import torch
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, Dataset, Subset
 except ModuleNotFoundError as exc:  # pragma: no cover - depends on local env
     raise ModuleNotFoundError(
         "PyTorch is required for modelv1.data. Install torch before using the Dataset."
@@ -24,6 +27,8 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on local env
 
 CROP_CAM_COLUMNS = [f"crop_cam_{idx:02d}" for idx in range(36)]
 SCENE_COLUMNS = [f"scene_{idx:02d}" for idx in range(25)]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DECA_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "deca_features_v1.npz"
 
 FACE_SIZE = (224, 224)
 EYE_SIZE = (60, 36)
@@ -32,6 +37,7 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 ImageTransform = Callable[[torch.Tensor], torch.Tensor]
+SplitMode = Literal["random_80_20", "dataset_5"]
 
 
 class ModelV1Dataset(Dataset):
@@ -39,10 +45,12 @@ class ModelV1Dataset(Dataset):
 
     Each item returns a dictionary with:
 
-    - `face`, `left_eye`, `right_eye`: image tensors in CHW format.
+    - `face` (optional), `left_eye`, `right_eye`: image tensors in CHW format.
     - `crop_cam_vec`: 36D crop/camera metadata tensor.
     - `scene_vec`: 25D table/camera geometry tensor.
+    - `deca_feat`: cached 236D frozen DECA face feature.
     - `uv_gt`: 2D table-local gaze target in millimeters.
+    - `uv_target`: z-score-normalized target used by the UV head.
     - extra metadata for validation and debugging.
     """
 
@@ -54,12 +62,20 @@ class ModelV1Dataset(Dataset):
         face_transform: ImageTransform | None = None,
         eye_transform: ImageTransform | None = None,
         return_paths: bool = True,
+        load_face_image: bool = True,
+        deca_cache_path: str | Path | None = DEFAULT_DECA_CACHE_PATH,
+        require_deca_features: bool = True,
+        target_normalizer: UVTargetNormalizer | None = None,
+        fit_target_normalizer: bool = True,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.normalize_images = normalize_images
         self.face_transform = face_transform
         self.eye_transform = eye_transform
         self.return_paths = return_paths
+        self.load_face_image = load_face_image
+        if not load_face_image and face_transform is not None:
+            raise ValueError("face_transform requires load_face_image=True.")
 
         requested = normalize_dataset_names(datasets)
         self.rows = read_rows(self.csv_path)
@@ -70,6 +86,16 @@ class ModelV1Dataset(Dataset):
             raise ValueError(f"No samples found in {self.csv_path}")
 
         validate_required_columns(self.rows[0])
+        self.target_normalizer = target_normalizer
+        if self.target_normalizer is None and fit_target_normalizer:
+            self.target_normalizer = fit_uv_target_normalizer(self.rows)
+        if require_deca_features and deca_cache_path is None:
+            raise ValueError("require_deca_features=True requires deca_cache_path.")
+        self.deca_cache = (
+            DecaFeatureCache.load(deca_cache_path) if deca_cache_path is not None else None
+        )
+        if self.deca_cache is not None:
+            self.deca_cache.require_sample_ids(row["sample_id"] for row in self.rows)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -77,23 +103,32 @@ class ModelV1Dataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, object]:
         row = self.rows[index]
 
-        face = self._load_image(row["face_path"], FACE_SIZE)
+        face = (
+            self._load_image(row["face_path"], FACE_SIZE)
+            if self.load_face_image
+            else None
+        )
         left_eye = self._load_image(row["left_eye_path"], EYE_SIZE)
         right_eye = self._load_image(row["right_eye_path"], EYE_SIZE)
 
-        if self.face_transform is not None:
+        if face is not None and self.face_transform is not None:
             face = self.face_transform(face)
         if self.eye_transform is not None:
             left_eye = self.eye_transform(left_eye)
             right_eye = self.eye_transform(right_eye)
 
+        uv_gt = float_tensor(row, ["uv_gt_u_mm", "uv_gt_v_mm"])
         item: dict[str, object] = {
-            "face": face,
             "left_eye": left_eye,
             "right_eye": right_eye,
             "crop_cam_vec": float_tensor(row, CROP_CAM_COLUMNS),
             "scene_vec": float_tensor(row, SCENE_COLUMNS),
-            "uv_gt": float_tensor(row, ["uv_gt_u_mm", "uv_gt_v_mm"]),
+            "uv_gt": uv_gt,
+            "uv_target": (
+                self.target_normalizer.normalize(uv_gt)
+                if self.target_normalizer is not None
+                else uv_gt.clone()
+            ),
             "gaze_target_w": float_tensor(
                 row,
                 ["gaze_target_w_x_mm", "gaze_target_w_y_mm", "gaze_target_w_z_mm"],
@@ -106,6 +141,12 @@ class ModelV1Dataset(Dataset):
             "dataset": row["dataset"],
             "image_name": row["image_name"],
         }
+        if face is not None:
+            item["face"] = face
+        if self.deca_cache is not None:
+            item["deca_feat"] = torch.from_numpy(
+                self.deca_cache.lookup(row["sample_id"]).copy()
+            )
         if self.return_paths:
             item["paths"] = {
                 "face": row["face_path"],
@@ -139,30 +180,87 @@ def build_modelv1_dataloaders(
     csv_path: str | Path = "data/processed/modelv1_dataset.csv",
     train_datasets: Iterable[str] = ("3", "4"),
     val_datasets: Iterable[str] = ("5",),
+    split_mode: SplitMode = "dataset_5",
+    all_datasets: Iterable[str] = ("3", "4", "5"),
+    val_ratio: float = 0.2,
+    split_seed: int = 42,
     batch_size: int = 32,
     num_workers: int = 0,
     pin_memory: bool | None = None,
     normalize_images: bool = True,
+    load_face_image: bool = True,
+    deca_cache_path: str | Path | None = DEFAULT_DECA_CACHE_PATH,
+    require_deca_features: bool = True,
+    normalize_uv_targets: bool = True,
+    target_normalizer: UVTargetNormalizer | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create train/validation loaders.
 
-    The default split uses datasets 3 and 4 for training and dataset 5 for
-    validation, which keeps validation separated by collection session.
+    ``split_mode="random_80_20"`` merges datasets 3, 4, and 5, then performs
+    a deterministic random split using ``val_ratio`` and ``split_seed``.
+    ``split_mode="dataset_5"`` keeps datasets 3 and 4 for training and
+    dataset 5 for validation/test, which separates collection sessions.
     """
+
+    if split_mode not in {"random_80_20", "dataset_5"}:
+        raise ValueError(
+            f"Unknown split_mode={split_mode!r}; "
+            "expected 'random_80_20' or 'dataset_5'."
+        )
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError(f"val_ratio must be between 0 and 1, got {val_ratio}")
 
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
 
-    train_set = ModelV1Dataset(
-        csv_path,
-        datasets=train_datasets,
-        normalize_images=normalize_images,
-    )
-    val_set = ModelV1Dataset(
-        csv_path,
-        datasets=val_datasets,
-        normalize_images=normalize_images,
-    )
+    if split_mode == "random_80_20":
+        all_set = ModelV1Dataset(
+            csv_path,
+            datasets=all_datasets,
+            normalize_images=normalize_images,
+            load_face_image=load_face_image,
+            deca_cache_path=deca_cache_path,
+            require_deca_features=require_deca_features,
+            fit_target_normalizer=False,
+        )
+        val_count = int(round(len(all_set) * val_ratio))
+        val_count = max(1, min(len(all_set) - 1, val_count))
+        generator = torch.Generator().manual_seed(split_seed)
+        indices = torch.randperm(len(all_set), generator=generator).tolist()
+        val_indices = indices[:val_count]
+        train_indices = indices[val_count:]
+        normalizer = target_normalizer
+        if normalize_uv_targets and normalizer is None:
+            normalizer = fit_uv_target_normalizer(
+                [all_set.rows[index] for index in train_indices]
+            )
+        all_set.target_normalizer = normalizer
+        train_set = Subset(all_set, train_indices)
+        val_set = Subset(all_set, val_indices)
+    else:
+        train_set = ModelV1Dataset(
+            csv_path,
+            datasets=train_datasets,
+            normalize_images=normalize_images,
+            load_face_image=load_face_image,
+            deca_cache_path=deca_cache_path,
+            require_deca_features=require_deca_features,
+            fit_target_normalizer=False,
+        )
+        val_set = ModelV1Dataset(
+            csv_path,
+            datasets=val_datasets,
+            normalize_images=normalize_images,
+            load_face_image=load_face_image,
+            deca_cache_path=deca_cache_path,
+            require_deca_features=require_deca_features,
+            fit_target_normalizer=False,
+        )
+        normalizer = target_normalizer
+        if normalize_uv_targets and normalizer is None:
+            normalizer = fit_uv_target_normalizer(train_set.rows)
+        train_set.target_normalizer = normalizer
+        val_set.target_normalizer = normalizer
 
     train_loader = DataLoader(
         train_set,
@@ -181,6 +279,15 @@ def build_modelv1_dataloaders(
         drop_last=False,
     )
     return train_loader, val_loader
+
+
+def get_uv_target_normalizer(dataset: Dataset) -> UVTargetNormalizer | None:
+    """Return the normalizer fitted by :func:`build_modelv1_dataloaders`."""
+
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    if not isinstance(base_dataset, ModelV1Dataset):
+        raise TypeError("Expected a ModelV1Dataset or a torch.utils.data.Subset of one.")
+    return base_dataset.target_normalizer
 
 
 def normalize_dataset_names(values: Iterable[str] | None) -> set[str] | None:
