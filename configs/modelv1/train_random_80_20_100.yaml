@@ -10,7 +10,7 @@ data:
   split_mode: random_80_20
   all_datasets: ["3", "4", "5"]
   val_ratio: 0.2
-  split_seed: 1  # 42
+  split_seed: 42  # 42
   batch_size: 32
   num_workers: 0
   pin_memory: true
@@ -26,6 +26,10 @@ model:
   face_hidden_dims: [256]
   eye_embedding_dim: 128
   per_eye_embedding_dim: 96
+  # Options: cnn, resnet18, resnet34, resnet50, resnet101, resnet152
+  eye_backbone: resnet101
+  # Use null/random for scratch. For torchvision ResNets only, DEFAULT enables ImageNet weights.
+  eye_backbone_weights: null
   crop_cam_embedding_dim: 64
   crop_cam_hidden_dims: [128]
   scene_embedding_dim: 64

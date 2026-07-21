@@ -74,10 +74,22 @@ Open [validate_modelv1_dataset.ipynb](notebooks/validate_modelv1_dataset.ipynb) 
 The V1 model is a multi-branch PyTorch regressor:
 
 - `face_branch`: consumes frozen/offline DECA features from `deca_feat`.
-- `eye_branch`: encodes left/right eye crops.
+- `eye_branch`: encodes left/right eye crops with a configurable image backbone.
 - `crop_cam_branch`: embeds the 36D crop/camera vector.
 - `scene_branch`: embeds the 25D scene/table vector.
 - `fusion_mlp` + `uv_head`: predicts normalized table-local `(u, v)`.
+
+The eye backbone is selected in the training YAML:
+
+```yaml
+model:
+  eye_backbone: resnet18  # cnn, resnet18, resnet34, resnet50, resnet101, resnet152
+  eye_backbone_weights: null  # DEFAULT enables ImageNet weights for torchvision ResNets only
+```
+
+The torchvision ResNets can optionally use ImageNet weights when
+`eye_backbone_weights: DEFAULT` and `data.normalize_images: true`. Use `cnn` to
+select the project's compact custom eye encoder.
 
 Smoke-test the network shape with synthetic inputs:
 

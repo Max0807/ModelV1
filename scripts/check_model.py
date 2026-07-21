@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -15,8 +16,27 @@ if str(PROJECT_ROOT) not in sys.path:
 from modelv1 import ModelV1, ModelV1Config
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--eye-backbone",
+        default="resnet18",
+        help="Eye image backbone: cnn, resnet18, resnet34, resnet50, resnet101, resnet152.",
+    )
+    parser.add_argument(
+        "--eye-backbone-weights",
+        default=None,
+        help="Use DEFAULT for ImageNet weights on torchvision ResNet backbones; omit for scratch.",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
-    config = ModelV1Config()
+    args = parse_args()
+    config = ModelV1Config(
+        eye_backbone=args.eye_backbone,
+        eye_backbone_weights=args.eye_backbone_weights,
+    )
     model = ModelV1(config)
     model.eval()
 
@@ -33,6 +53,7 @@ def main() -> int:
         uv = model(batch)
 
     print("uv:", tuple(uv.shape))
+    print("eye_backbone:", config.eye_backbone)
     print("parameters:", sum(param.numel() for param in model.parameters()))
     return 0
 

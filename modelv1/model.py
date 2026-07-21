@@ -8,10 +8,11 @@ those feature vectors through ``deca_feat``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
+from torchvision import models
 
 
 DEFAULT_DECA_FEATURE_DIM = 236
@@ -21,6 +22,23 @@ DECA_BATCH_KEYS = (
     "face_deca_feat",
     "face_deca_features",
 )
+COMPACT_EYE_BACKBONE = "cnn"
+RESNET_EYE_BACKBONES = {
+    "resnet18": (models.resnet18, models.ResNet18_Weights),
+    "resnet34": (models.resnet34, models.ResNet34_Weights),
+    "resnet50": (models.resnet50, models.ResNet50_Weights),
+    "resnet101": (models.resnet101, models.ResNet101_Weights),
+    "resnet152": (models.resnet152, models.ResNet152_Weights),
+}
+SUPPORTED_EYE_BACKBONES = (
+    COMPACT_EYE_BACKBONE,
+    "resnet18",
+    "resnet34",
+    "resnet50",
+    "resnet101",
+    "resnet152",
+)
+NO_WEIGHT_VALUES = {"", "none", "null", "false", "random", "scratch"}
 
 
 @dataclass(frozen=True)
@@ -36,6 +54,8 @@ class ModelV1Config:
     face_hidden_dims: tuple[int, ...] = (256,)
     eye_embedding_dim: int = 128
     per_eye_embedding_dim: int = 96
+    eye_backbone: str = COMPACT_EYE_BACKBONE
+    eye_backbone_weights: str | None = None
     crop_cam_embedding_dim: int = 64
     crop_cam_hidden_dims: tuple[int, ...] = (128,)
     scene_embedding_dim: int = 64
@@ -59,6 +79,15 @@ class ModelV1Config:
             "crop_cam_embedding_dim": self.crop_cam_embedding_dim,
             "scene_embedding_dim": self.scene_embedding_dim,
         }
+        object.__setattr__(self, "eye_backbone", canonical_eye_backbone(self.eye_backbone))
+        if (
+            self.eye_backbone not in RESNET_EYE_BACKBONES
+            and self.eye_backbone_weights is not None
+            and str(self.eye_backbone_weights).strip().lower() not in NO_WEIGHT_VALUES
+        ):
+            raise ValueError(
+                "eye_backbone_weights is only supported for torchvision ResNet eye backbones."
+            )
         non_positive = [name for name, value in dims.items() if value <= 0]
         if non_positive:
             raise ValueError(f"ModelV1Config dimensions must be positive: {non_positive}")
@@ -90,7 +119,7 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 
-class EyeImageEncoder(nn.Module):
+class CompactEyeImageEncoder(nn.Module):
     """Compact CNN for one eye crop."""
 
     def __init__(
@@ -116,6 +145,70 @@ class EyeImageEncoder(nn.Module):
     def forward(self, image: Tensor) -> Tensor:
         image = ensure_image_batch(image, "eye")
         return self.net(image.float())
+
+
+class ResNetEyeImageEncoder(nn.Module):
+    """ResNet feature extractor for one eye crop."""
+
+    def __init__(
+        self,
+        backbone: str,
+        embedding_dim: int,
+        dropout: float,
+        weights: str | None = None,
+        in_channels: int = 3,
+    ) -> None:
+        super().__init__()
+        self.backbone_name = canonical_eye_backbone(backbone)
+        resolved_weights = resolve_resnet_weights(self.backbone_name, weights)
+        builder, _ = RESNET_EYE_BACKBONES[self.backbone_name]
+        resnet = builder(weights=resolved_weights)
+        if in_channels != 3:
+            resnet.conv1 = replace_first_conv(resnet.conv1, in_channels, bool(resolved_weights))
+        feature_dim = resnet.fc.in_features
+        resnet.fc = nn.Identity()
+        self.backbone = resnet
+        self.proj = nn.Sequential(
+            nn.Linear(feature_dim, embedding_dim),
+            nn.LayerNorm(embedding_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        if resolved_weights is not None:
+            mark_preserve_parameters(self.backbone)
+
+    def forward(self, image: Tensor) -> Tensor:
+        image = ensure_image_batch(image, "eye")
+        return self.proj(self.backbone(image.float()))
+
+
+class EyeImageEncoder(nn.Module):
+    """Configurable image encoder for one eye crop."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        dropout: float,
+        *,
+        backbone: str,
+        backbone_weights: str | None,
+        in_channels: int = 3,
+    ) -> None:
+        super().__init__()
+        self.backbone_name = canonical_eye_backbone(backbone)
+        if self.backbone_name == COMPACT_EYE_BACKBONE:
+            self.net = CompactEyeImageEncoder(embedding_dim, dropout, in_channels)
+        else:
+            self.net = ResNetEyeImageEncoder(
+                self.backbone_name,
+                embedding_dim,
+                dropout,
+                weights=backbone_weights,
+                in_channels=in_channels,
+            )
+
+    def forward(self, image: Tensor) -> Tensor:
+        return self.net(image)
 
 
 class FaceBranch(nn.Module):
@@ -161,14 +254,31 @@ class EyeBranch(nn.Module):
         embedding_dim: int,
         dropout: float,
         share_encoder: bool = True,
+        backbone: str = COMPACT_EYE_BACKBONE,
+        backbone_weights: str | None = None,
     ) -> None:
         super().__init__()
         self.share_encoder = share_encoder
         if share_encoder:
-            self.eye_encoder = EyeImageEncoder(per_eye_dim, dropout)
+            self.eye_encoder = EyeImageEncoder(
+                per_eye_dim,
+                dropout,
+                backbone=backbone,
+                backbone_weights=backbone_weights,
+            )
         else:
-            self.left_eye_encoder = EyeImageEncoder(per_eye_dim, dropout)
-            self.right_eye_encoder = EyeImageEncoder(per_eye_dim, dropout)
+            self.left_eye_encoder = EyeImageEncoder(
+                per_eye_dim,
+                dropout,
+                backbone=backbone,
+                backbone_weights=backbone_weights,
+            )
+            self.right_eye_encoder = EyeImageEncoder(
+                per_eye_dim,
+                dropout,
+                backbone=backbone,
+                backbone_weights=backbone_weights,
+            )
         self.project = make_mlp(
             input_dim=per_eye_dim * 2,
             hidden_dims=(embedding_dim,),
@@ -239,6 +349,8 @@ class ModelV1(nn.Module):
             embedding_dim=self.config.eye_embedding_dim,
             dropout=self.config.branch_dropout,
             share_encoder=self.config.share_eye_encoder,
+            backbone=self.config.eye_backbone,
+            backbone_weights=self.config.eye_backbone_weights,
         )
         self.crop_cam_branch = VectorBranch(
             name="crop_cam_vec",
@@ -346,6 +458,8 @@ class ModelV1(nn.Module):
         """Initialize trainable weights after all branches are built."""
 
         for module in self.modules():
+            if getattr(module, "_preserve_existing_parameters", False):
+                continue
             if isinstance(module, nn.Conv2d):
                 nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
             elif isinstance(module, nn.Linear):
@@ -358,6 +472,71 @@ def build_modelv1(config: ModelV1Config | None = None) -> ModelV1:
     """Factory used by training scripts."""
 
     return ModelV1(config)
+
+
+def canonical_eye_backbone(name: str) -> str:
+    normalized = str(name).strip().lower().replace("-", "").replace("_", "")
+    aliases = {
+        "compact": COMPACT_EYE_BACKBONE,
+        "compactcnn": COMPACT_EYE_BACKBONE,
+        "cnn": COMPACT_EYE_BACKBONE,
+        "resnet18": "resnet18",
+        "resnet34": "resnet34",
+        "resnet50": "resnet50",
+        "resnet101": "resnet101",
+        "resnet152": "resnet152",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        supported = ", ".join(SUPPORTED_EYE_BACKBONES)
+        raise ValueError(f"Unknown eye_backbone={name!r}; expected one of: {supported}") from exc
+
+
+def resolve_resnet_weights(backbone: str, weights: str | None) -> Any:
+    if weights is None:
+        return None
+    text = str(weights).strip()
+    if text.lower() in NO_WEIGHT_VALUES:
+        return None
+    _, weights_enum = RESNET_EYE_BACKBONES[backbone]
+    if text.upper() == "DEFAULT":
+        return weights_enum.DEFAULT
+    try:
+        return weights_enum[text]
+    except KeyError as exc:
+        valid = ", ".join(["DEFAULT", *(item.name for item in weights_enum)])
+        raise ValueError(
+            f"Unknown eye_backbone_weights={weights!r} for {backbone}; expected one of: {valid}"
+        ) from exc
+
+
+def replace_first_conv(conv: nn.Conv2d, in_channels: int, preserve_rgb: bool) -> nn.Conv2d:
+    new_conv = nn.Conv2d(
+        in_channels,
+        conv.out_channels,
+        kernel_size=conv.kernel_size,
+        stride=conv.stride,
+        padding=conv.padding,
+        dilation=conv.dilation,
+        groups=conv.groups,
+        bias=conv.bias is not None,
+        padding_mode=conv.padding_mode,
+    )
+    if preserve_rgb:
+        with torch.no_grad():
+            if in_channels == 1:
+                new_conv.weight.copy_(conv.weight.mean(dim=1, keepdim=True))
+            else:
+                nn.init.kaiming_normal_(new_conv.weight, nonlinearity="relu")
+            if conv.bias is not None and new_conv.bias is not None:
+                new_conv.bias.copy_(conv.bias)
+    return new_conv
+
+
+def mark_preserve_parameters(module: nn.Module) -> None:
+    for child in module.modules():
+        setattr(child, "_preserve_existing_parameters", True)
 
 
 def make_mlp(
