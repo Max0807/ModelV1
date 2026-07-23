@@ -1,8 +1,9 @@
-"""Extract frozen 236-D DECA ``E_flame`` features for ModelV1 face crops.
+"""Extract frozen 236-D DECA ``E_flame`` features for ModelV1 samples.
 
-The input CSV must contain ``sample_id`` and ``face_path``.  The output is one
-compressed NPZ cache aligned by sample id, so it can be consumed directly by
-``ModelV1Dataset(deca_cache_path=...)``.
+The input CSV must contain ``sample_id`` and ``face_path``.  With
+``--face-preprocess deca`` it must also contain the source image path and face
+bounding box columns. The output is one compressed NPZ cache aligned by sample
+id, so it can be consumed directly by ``ModelV1Dataset(deca_cache_path=...)``.
 """
 
 from __future__ import annotations
@@ -28,11 +29,19 @@ from modelv1.deca_cache import (
     DECA_PARAMETER_LAYOUT,
     DecaFeatureCache,
 )
+from modelv1.depth_prior.face_preprocess import (
+    DEFAULT_DECA_CROP_SCALE,
+    FACE_PREPROCESS_CHOICES,
+    FACE_PREPROCESS_DECA,
+    FACE_PREPROCESS_LEGACY,
+    prepare_deca_face_image,
+)
 
 
 DEFAULT_CSV_PATH = PROJECT_ROOT / "data" / "processed" / "modelv1_dataset.csv"
 DEFAULT_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "deca_features_v1.npz"
 DEFAULT_DECA_ROOT = PROJECT_ROOT / "DECA-master"
+DECA_PREPROCESS_VERSION = "deca_bbox_crop_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +56,21 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to <deca-root>/data/deca_model.tar.",
     )
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--face-preprocess",
+        choices=FACE_PREPROCESS_CHOICES,
+        default=FACE_PREPROCESS_LEGACY,
+        help=(
+            "DECA input crop. 'legacy' reproduces the existing saved face crop; "
+            "'deca' renders the official square bbox crop from source_image_path."
+        ),
+    )
+    parser.add_argument(
+        "--deca-crop-scale",
+        type=float,
+        default=DEFAULT_DECA_CROP_SCALE,
+        help="Official-style DECA bbox crop scale, used only with --face-preprocess deca.",
+    )
     parser.add_argument(
         "--device",
         default="auto",
@@ -68,7 +92,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_rows(csv_path: Path, limit: int | None) -> list[dict[str, str]]:
+def read_rows(
+    csv_path: Path,
+    limit: int | None,
+    face_preprocess: str,
+) -> list[dict[str, str]]:
     if not csv_path.exists():
         raise FileNotFoundError(f"Dataset CSV does not exist: {csv_path}")
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -76,6 +104,16 @@ def read_rows(csv_path: Path, limit: int | None) -> list[dict[str, str]]:
     if not rows:
         raise ValueError(f"Dataset CSV has no rows: {csv_path}")
     required = {"sample_id", "face_path"}
+    if face_preprocess == FACE_PREPROCESS_DECA:
+        required.update(
+            {
+                "source_image_path",
+                "face_bbox_x",
+                "face_bbox_y",
+                "face_bbox_w",
+                "face_bbox_h",
+            }
+        )
     missing = required.difference(rows[0])
     if missing:
         raise ValueError(f"Dataset CSV is missing columns: {sorted(missing)}")
@@ -97,17 +135,48 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def collect_image_hashes(rows: Iterable[dict[str, str]]) -> list[str]:
+def face_bbox_xywh(row: dict[str, str]) -> tuple[float, float, float, float]:
+    """Read the detector box used by the official-style DECA crop."""
+
+    columns = ("face_bbox_x", "face_bbox_y", "face_bbox_w", "face_bbox_h")
+    try:
+        return tuple(float(row[column]) for column in columns)  # type: ignore[return-value]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"Invalid face bounding box for sample_id={row.get('sample_id')!r}"
+        ) from error
+
+
+def collect_input_hashes(
+    rows: Iterable[dict[str, str]],
+    *,
+    face_preprocess: str,
+    deca_crop_scale: float,
+) -> list[str]:
+    """Hash every input affecting the rendered DECA tensor."""
+
     hashes: list[str] = []
     for index, row in enumerate(rows, start=1):
-        image_path = Path(row["face_path"])
+        image_path = Path(
+            row["source_image_path"]
+            if face_preprocess == FACE_PREPROCESS_DECA
+            else row["face_path"]
+        )
         if not image_path.exists():
             raise FileNotFoundError(
-                f"Missing face image for sample_id={row['sample_id']!r}: {image_path}"
+                f"Missing DECA input image for sample_id={row['sample_id']!r}: {image_path}"
             )
-        hashes.append(sha256_file(image_path))
+        digest = hashlib.sha256()
+        digest.update(sha256_file(image_path).encode("ascii"))
+        digest.update(face_preprocess.encode("ascii"))
+        digest.update(DECA_PREPROCESS_VERSION.encode("ascii"))
+        if face_preprocess == FACE_PREPROCESS_DECA:
+            bbox_text = ",".join(f"{value:.8f}" for value in face_bbox_xywh(row))
+            digest.update(bbox_text.encode("ascii"))
+            digest.update(f"{deca_crop_scale:.8f}".encode("ascii"))
+        hashes.append(digest.hexdigest())
         if index % 100 == 0:
-            print(f"Hashed {index} face images")
+            print(f"Hashed {index} DECA inputs")
     return hashes
 
 
@@ -176,14 +245,38 @@ def resolve_device(requested: str, torch: Any) -> str:
     return requested
 
 
-def load_face_batch(paths: list[Path], image_cls: Any, np: Any, torch: Any) -> Any:
+def load_deca_face_batch(
+    rows: list[dict[str, str]],
+    *,
+    face_preprocess: str,
+    deca_crop_scale: float,
+    image_cls: Any,
+    np: Any,
+    torch: Any,
+) -> Any:
+    """Render one batch exactly as the selected DECA input convention requires."""
+
     images = []
-    for path in paths:
-        with image_cls.open(path) as image:
-            image = image.convert("RGB")
+    for row in rows:
+        if face_preprocess == FACE_PREPROCESS_DECA:
+            source_path = Path(row["source_image_path"])
+            with image_cls.open(source_path) as source_image:
+                source_rgb = np.asarray(source_image.convert("RGB"), dtype=np.uint8)
+            image_rgb, _ = prepare_deca_face_image(
+                source_rgb,
+                face_bbox_xywh(row),
+                mode=FACE_PREPROCESS_DECA,
+                input_size=224,
+                deca_crop_scale=deca_crop_scale,
+            )
+        else:
+            path = Path(row["face_path"])
+            with image_cls.open(path) as source_image:
+                image = source_image.convert("RGB")
             if image.size != (224, 224):
                 image = image.resize((224, 224), image_cls.Resampling.BILINEAR)
-            array = np.asarray(image, dtype=np.float32) / 255.0
+            image_rgb = np.asarray(image, dtype=np.uint8)
+        array = np.asarray(image_rgb, dtype=np.float32) / 255.0
         images.append(torch.from_numpy(array.transpose(2, 0, 1)))
     return torch.stack(images, dim=0)
 
@@ -193,6 +286,8 @@ def reusable_features(
     sample_ids: list[str],
     image_hashes: list[str],
     checkpoint_hash: str,
+    face_preprocess: str,
+    deca_crop_scale: float,
     overwrite: bool,
 ) -> dict[str, Any]:
     if overwrite or not cache_path.exists():
@@ -202,6 +297,17 @@ def reusable_features(
     if old_checkpoint != checkpoint_hash:
         print("DECA checkpoint changed or is unknown; regenerating all features")
         return {}
+    cached_preprocess = str(
+        cache.metadata.get("face_preprocess", FACE_PREPROCESS_LEGACY)
+    )
+    if cached_preprocess != face_preprocess:
+        print("DECA face preprocessing changed or is unknown; regenerating all features")
+        return {}
+    if face_preprocess == FACE_PREPROCESS_DECA:
+        cached_scale = cache.metadata.get("deca_crop_scale")
+        if cached_scale is None or abs(float(cached_scale) - deca_crop_scale) > 1e-8:
+            print("DECA crop scale changed or is unknown; regenerating all features")
+            return {}
     result = {}
     for sample_id, image_hash in zip(sample_ids, image_hashes):
         if not cache.has_sample_id(sample_id):
@@ -238,11 +344,28 @@ def write_cache(
 
 def main() -> int:
     args = parse_args()
-    rows = read_rows(args.csv, args.limit)
+    if args.deca_crop_scale <= 0:
+        raise ValueError("--deca-crop-scale must be positive")
+    rows = read_rows(args.csv, args.limit, args.face_preprocess)
     sample_ids = [row["sample_id"] for row in rows]
     if args.verify_cache:
         cache = DecaFeatureCache.load(args.output)
         cache.require_sample_ids(sample_ids)
+        cached_preprocess = str(
+            cache.metadata.get("face_preprocess", FACE_PREPROCESS_LEGACY)
+        )
+        if cached_preprocess != args.face_preprocess:
+            raise ValueError(
+                "DECA cache preprocessing does not match --face-preprocess. "
+                "Rebuild the cache with the intended preprocessing."
+            )
+        if args.face_preprocess == FACE_PREPROCESS_DECA:
+            cached_scale = cache.metadata.get("deca_crop_scale")
+            if cached_scale is None or abs(float(cached_scale) - args.deca_crop_scale) > 1e-8:
+                raise ValueError(
+                    "DECA cache crop scale does not match --deca-crop-scale. "
+                    "Rebuild the cache with the intended preprocessing."
+                )
         print(f"Valid cache: {args.output}")
         print(f"Samples: {len(sample_ids)}, feature dim: {cache.features.shape[1]}")
         return 0
@@ -253,10 +376,20 @@ def main() -> int:
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
     device = resolve_device(args.device, torch)
-    image_hashes = collect_image_hashes(rows)
+    image_hashes = collect_input_hashes(
+        rows,
+        face_preprocess=args.face_preprocess,
+        deca_crop_scale=args.deca_crop_scale,
+    )
     checkpoint_hash = sha256_file(checkpoint)
     cached = reusable_features(
-        args.output, sample_ids, image_hashes, checkpoint_hash, args.overwrite
+        args.output,
+        sample_ids,
+        image_hashes,
+        checkpoint_hash,
+        args.face_preprocess,
+        args.deca_crop_scale,
+        args.overwrite,
     )
     encoder = load_encoder(args.deca_root, checkpoint, device, torch)
 
@@ -269,8 +402,14 @@ def main() -> int:
     with torch.inference_mode():
         for start in range(0, len(pending), args.batch_size):
             batch_rows = pending[start : start + args.batch_size]
-            batch_paths = [Path(row["face_path"]) for row in batch_rows]
-            images = load_face_batch(batch_paths, image_cls, np, torch).to(device)
+            images = load_deca_face_batch(
+                batch_rows,
+                face_preprocess=args.face_preprocess,
+                deca_crop_scale=args.deca_crop_scale,
+                image_cls=image_cls,
+                np=np,
+                torch=torch,
+            ).to(device)
             encoded = encoder(images).detach().cpu().to(dtype=torch.float32).numpy()
             if encoded.shape != (len(batch_rows), DECA_FEATURE_DIM):
                 raise RuntimeError(f"Unexpected E_flame output shape: {encoded.shape}")
@@ -287,7 +426,14 @@ def main() -> int:
         "deca_root": str(args.deca_root.resolve()),
         "deca_checkpoint": str(checkpoint.resolve()),
         "deca_checkpoint_sha256": checkpoint_hash,
-        "preprocess": "RGB, resize to 224x224 if needed, float32 pixels in [0, 1]",
+        "face_preprocess": args.face_preprocess,
+        "deca_crop_scale": args.deca_crop_scale,
+        "preprocess_version": DECA_PREPROCESS_VERSION,
+        "preprocess": (
+            "legacy: saved detector face crop resized to 224x224; "
+            "deca: official-style square bbox crop from source image, then resized to 224x224; "
+            "RGB float32 pixels in [0, 1]"
+        ),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "sample_count": len(sample_ids),
     }

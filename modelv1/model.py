@@ -23,8 +23,10 @@ DECA_BATCH_KEYS = (
     "face_deca_features",
 )
 COMPACT_EYE_BACKBONE = "cnn"
+SMALL_IMAGE_RESNET18_BACKBONE = "resnet18_3x3"
 RESNET_EYE_BACKBONES = {
     "resnet18": (models.resnet18, models.ResNet18_Weights),
+    SMALL_IMAGE_RESNET18_BACKBONE: (models.resnet18, models.ResNet18_Weights),
     "resnet34": (models.resnet34, models.ResNet34_Weights),
     "resnet50": (models.resnet50, models.ResNet50_Weights),
     "resnet101": (models.resnet101, models.ResNet101_Weights),
@@ -33,6 +35,7 @@ RESNET_EYE_BACKBONES = {
 SUPPORTED_EYE_BACKBONES = (
     COMPACT_EYE_BACKBONE,
     "resnet18",
+    SMALL_IMAGE_RESNET18_BACKBONE,
     "resnet34",
     "resnet50",
     "resnet101",
@@ -163,7 +166,14 @@ class ResNetEyeImageEncoder(nn.Module):
         resolved_weights = resolve_resnet_weights(self.backbone_name, weights)
         builder, _ = RESNET_EYE_BACKBONES[self.backbone_name]
         resnet = builder(weights=resolved_weights)
-        if in_channels != 3:
+        if self.backbone_name == SMALL_IMAGE_RESNET18_BACKBONE:
+            resnet.conv1 = replace_resnet_small_image_stem(
+                resnet.conv1,
+                in_channels,
+                bool(resolved_weights),
+            )
+            resnet.maxpool = nn.Identity()
+        elif in_channels != 3:
             resnet.conv1 = replace_first_conv(resnet.conv1, in_channels, bool(resolved_weights))
         feature_dim = resnet.fc.in_features
         resnet.fc = nn.Identity()
@@ -475,12 +485,21 @@ def build_modelv1(config: ModelV1Config | None = None) -> ModelV1:
 
 
 def canonical_eye_backbone(name: str) -> str:
-    normalized = str(name).strip().lower().replace("-", "").replace("_", "")
+    normalized = (
+        str(name)
+        .strip()
+        .lower()
+        .replace("-", "")
+        .replace("_", "")
+        .replace("*", "x")
+        .replace("×", "x")
+    )
     aliases = {
         "compact": COMPACT_EYE_BACKBONE,
         "compactcnn": COMPACT_EYE_BACKBONE,
         "cnn": COMPACT_EYE_BACKBONE,
         "resnet18": "resnet18",
+        "resnet183x3": SMALL_IMAGE_RESNET18_BACKBONE,
         "resnet34": "resnet34",
         "resnet50": "resnet50",
         "resnet101": "resnet101",
@@ -531,6 +550,33 @@ def replace_first_conv(conv: nn.Conv2d, in_channels: int, preserve_rgb: bool) ->
                 nn.init.kaiming_normal_(new_conv.weight, nonlinearity="relu")
             if conv.bias is not None and new_conv.bias is not None:
                 new_conv.bias.copy_(conv.bias)
+    return new_conv
+
+
+def replace_resnet_small_image_stem(
+    conv: nn.Conv2d,
+    in_channels: int,
+    preserve_rgb: bool,
+) -> nn.Conv2d:
+    """Build a CIFAR-style ResNet stem while retaining pretrained weights when possible."""
+
+    new_conv = nn.Conv2d(
+        in_channels,
+        conv.out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        bias=False,
+    )
+    if preserve_rgb:
+        with torch.no_grad():
+            center_weights = conv.weight[:, :, 2:5, 2:5]
+            if in_channels == 3:
+                new_conv.weight.copy_(center_weights)
+            elif in_channels == 1:
+                new_conv.weight.copy_(center_weights.mean(dim=1, keepdim=True))
+            else:
+                nn.init.kaiming_normal_(new_conv.weight, nonlinearity="relu")
     return new_conv
 
 

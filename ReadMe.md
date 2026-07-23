@@ -83,13 +83,16 @@ The eye backbone is selected in the training YAML:
 
 ```yaml
 model:
-  eye_backbone: resnet18  # cnn, resnet18, resnet34, resnet50, resnet101, resnet152
+  eye_backbone: resnet18_3x3  # cnn, resnet18, resnet18_3x3, resnet34, resnet50, resnet101, resnet152
   eye_backbone_weights: null  # DEFAULT enables ImageNet weights for torchvision ResNets only
 ```
 
 The torchvision ResNets can optionally use ImageNet weights when
-`eye_backbone_weights: DEFAULT` and `data.normalize_images: true`. Use `cnn` to
-select the project's compact custom eye encoder.
+`eye_backbone_weights: DEFAULT` and `data.normalize_images: true`.
+`resnet18_3x3` uses a small-image stem (3x3, stride 1, no max-pool) for the
+60x36 eye crops; with pretrained weights, its new first convolution is initialized
+from the center of the original 7x7 filters. Use `cnn` to select the project's
+compact custom eye encoder.
 
 Smoke-test the network shape with synthetic inputs:
 
@@ -139,7 +142,7 @@ python scripts\check_loss.py
 ## Training
 
 The default training configuration uses datasets 3, 4, and 5 in a fixed 80/20
-random split, trains for 100 epochs, and selects the best checkpoint by
+random split, trains for 300 epochs, and selects the best checkpoint by
 validation EPE in millimeters. Training reads only cached DECA features and eye
 crops; it does not load the unused face image tensor.
 
@@ -162,8 +165,9 @@ python scripts\train_modelv1.py --resume outputs\<project>\<run>\checkpoints\las
 
 ## DECA Offline Features
 
-The face branch uses DECA's frozen 236-D coarse `E_flame` output. Create the
-cache before training:
+The face branch uses DECA's frozen 236-D coarse `E_flame` output. The original
+configuration uses the saved detector crop (`legacy`). Create that cache before
+training:
 
 ```powershell
 python scripts\cache_deca_features.py --device cuda
@@ -173,6 +177,22 @@ This writes `data/processed/deca_features_v1.npz`. It stores one float32
 `deca_feat` vector per `sample_id`, plus face-image and checkpoint SHA-256
 digests and JSON metadata. Re-running the command reuses entries whose sample
 id and image digest have not changed.
+
+For an official-style DECA crop experiment, DECA reads `source_image_path`,
+forms the square bbox crop with a downward 0.12 bbox-size center offset and a
+1.25 scale, pads outside pixels with black, then resizes to `224x224`. Build a
+separate cache and train with the matching configuration:
+
+```powershell
+python scripts\cache_deca_features.py --device cuda --face-preprocess deca --deca-crop-scale 1.25 --output data\processed\deca_features_deca_crop_v1.npz
+python scripts\cache_deca_features.py --verify-cache --face-preprocess deca --deca-crop-scale 1.25 --output data\processed\deca_features_deca_crop_v1.npz
+python scripts\train_modelv1.py --config configs\modelv1\train_random_80_20_100_deca_crop.yaml
+```
+
+`data.deca_face_preprocess` and `data.deca_crop_scale` are recorded in the
+experiment configuration and checked against cache metadata before training.
+The ModelV1 network reads the resulting cached DECA feature, so this crop is
+performed once during cache generation rather than repeatedly in every epoch.
 
 The checked-in `DECA-master` directory must be a complete DECA checkout and
 contain `data/deca_model.tar`; see the official DECA README for its model/data

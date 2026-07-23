@@ -21,7 +21,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eye-backbone",
         default="resnet18",
-        help="Eye image backbone: cnn, resnet18, resnet34, resnet50, resnet101, resnet152.",
+        help=(
+            "Eye image backbone: cnn, resnet18, resnet18_3x3, resnet34, resnet50, "
+            "resnet101, resnet152."
+        ),
     )
     parser.add_argument(
         "--eye-backbone-weights",

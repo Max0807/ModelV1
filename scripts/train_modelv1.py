@@ -30,8 +30,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modelv1 import ModelV1, ModelV1Config, UVLossConfig, UVRegressionLoss
+from modelv1.deca_cache import DecaFeatureCache
 from modelv1.data import build_modelv1_dataloaders, get_uv_target_normalizer
 from modelv1.data.normalization import UVTargetNormalizer
+from modelv1.depth_prior.face_preprocess import (
+    DEFAULT_DECA_CROP_SCALE,
+    FACE_PREPROCESS_CHOICES,
+    FACE_PREPROCESS_DECA,
+    FACE_PREPROCESS_LEGACY,
+)
 
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "modelv1" / "train_random_80_20_100.yaml"
@@ -96,11 +103,52 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("data.val_ratio must be positive.")
     if float(config["training"]["optimizer"].get("lr", 0.0)) <= 0:
         raise ValueError("training.optimizer.lr must be positive.")
+    face_preprocess = str(
+        config["data"].get("deca_face_preprocess", FACE_PREPROCESS_LEGACY)
+    )
+    if face_preprocess not in FACE_PREPROCESS_CHOICES:
+        raise ValueError(
+            "data.deca_face_preprocess must be one of "
+            f"{FACE_PREPROCESS_CHOICES}, got {face_preprocess!r}."
+        )
+    if float(config["data"].get("deca_crop_scale", DEFAULT_DECA_CROP_SCALE)) <= 0:
+        raise ValueError("data.deca_crop_scale must be positive.")
 
 
 def resolve_project_path(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def validate_deca_cache_preprocess(
+    cache_path: Path,
+    data_config: Mapping[str, Any],
+) -> None:
+    """Reject a feature cache rendered with different DECA image preprocessing."""
+
+    expected_mode = str(
+        data_config.get("deca_face_preprocess", FACE_PREPROCESS_LEGACY)
+    )
+    expected_scale = float(
+        data_config.get("deca_crop_scale", DEFAULT_DECA_CROP_SCALE)
+    )
+    cache = DecaFeatureCache.load(cache_path)
+    # Caches produced before this field existed were necessarily legacy crops.
+    cache_mode = str(cache.metadata.get("face_preprocess", FACE_PREPROCESS_LEGACY))
+    if cache_mode != expected_mode:
+        raise ValueError(
+            "DECA cache preprocessing mismatch: "
+            f"config requests {expected_mode!r}, but {cache_path} was built with "
+            f"{cache_mode!r}. Rebuild the cache with scripts/cache_deca_features.py."
+        )
+    if expected_mode == FACE_PREPROCESS_DECA:
+        cache_scale = cache.metadata.get("deca_crop_scale")
+        if cache_scale is None or abs(float(cache_scale) - expected_scale) > 1e-8:
+            raise ValueError(
+                "DECA cache crop-scale mismatch: "
+                f"config requests {expected_scale}, but {cache_path} stores "
+                f"{cache_scale!r}. Rebuild the cache with the same scale."
+            )
 
 
 def make_run_dir(config: dict[str, Any], resume: Path | None) -> Path:
@@ -461,6 +509,8 @@ def main() -> int:
     device = resolve_device(str(config["training"]["device"]))
     amp_enabled = bool(config["training"]["amp"]) and device.type == "cuda"
     data_config = config["data"]
+    deca_cache_path = resolve_project_path(data_config["deca_cache_path"])
+    validate_deca_cache_preprocess(deca_cache_path, data_config)
     train_loader, val_loader = build_modelv1_dataloaders(
         csv_path=resolve_project_path(data_config["csv_path"]),
         split_mode=data_config["split_mode"],
@@ -472,7 +522,7 @@ def main() -> int:
         pin_memory=bool(data_config["pin_memory"]),
         normalize_images=bool(data_config["normalize_images"]),
         load_face_image=bool(data_config["load_face_image"]),
-        deca_cache_path=resolve_project_path(data_config["deca_cache_path"]),
+        deca_cache_path=deca_cache_path,
         require_deca_features=True,
     )
     normalizer = get_uv_target_normalizer(train_loader.dataset)

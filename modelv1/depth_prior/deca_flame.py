@@ -58,9 +58,11 @@ class DecaFlameConfig:
 class DecaFlameOutput:
     """DECA-FLAME geometry in FLAME local coordinates.
 
-    The tensors have batch-first layout.  ``vertices`` is normally
-    ``[B, 5023, 3]`` and ``landmarks3d`` is normally ``[B, 68, 3]``.  They are
-    not in camera coordinates and are not in millimetres yet.
+    The tensors have batch-first layout. ``vertices`` is normally
+    ``[B, 5023, 3]`` and ``landmarks3d`` is normally ``[B, 68, 3]``.
+    ``landmarks2d`` is FLAME's dynamic 2D landmark set, but its values are
+    still 3D FLAME-local coordinates. None of these outputs are camera-space
+    coordinates or millimetres yet.
     """
 
     vertices: Any
@@ -83,6 +85,54 @@ def _require_torch() -> Any:
             "PyTorch is required to run the DECA-FLAME extractor."
         ) from error
     return torch
+
+
+def _enable_chumpy_compatibility() -> None:
+    """Restore NumPy and inspect APIs required by the legacy FLAME dependency.
+
+    Official DECA's ``generic_model.pkl`` can import the unmaintained ``chumpy``
+    package while unpickling. Chumpy still imports aliases removed by NumPy 1.24
+    and calls ``inspect.getargspec``, which Python removed in 3.11. Define only
+    the historical APIs that are absent, so the DECA preprocessing wrapper works
+    without downgrading the whole project runtime.
+    """
+
+    try:
+        import numpy as np
+    except ImportError as error:  # pragma: no cover - external dependency
+        raise DecaFlameDependencyError(
+            "NumPy is required to load the official FLAME model."
+        ) from error
+
+    legacy_aliases = {
+        "bool": np.bool_,
+        "int": int,
+        "float": float,
+        "complex": complex,
+        "object": object,
+        "unicode": str,
+        "str": str,
+    }
+    for name, value in legacy_aliases.items():
+        if name not in np.__dict__:
+            setattr(np, name, value)
+
+    import inspect
+    from collections import namedtuple
+
+    if not hasattr(inspect, "getargspec"):
+        arg_spec = namedtuple("ArgSpec", ("args", "varargs", "keywords", "defaults"))
+
+        def getargspec(function: Any) -> Any:
+            full_spec = inspect.getfullargspec(function)
+            return arg_spec(
+                full_spec.args,
+                full_spec.varargs,
+                full_spec.varkw,
+                full_spec.defaults,
+            )
+
+        inspect.getargspec = getargspec  # type: ignore[attr-defined]
 
 
 def _import_official_deca(deca_root: Path) -> tuple[Any, Any, Any, Any]:
@@ -124,7 +174,7 @@ def _split_deca_parameters(parameters: Any, param_sizes: dict[str, int]) -> dict
             f"expected [B, {expected_size}], got {tuple(parameters.shape)}"
         )
     values = torch.split(parameters, tuple(param_sizes[name] for name in ordered_names), dim=1)
-    return dict(zip(ordered_names, values, strict=True))
+    return dict(zip(ordered_names, values))
 
 
 class DecaFlameExtractor:
@@ -166,6 +216,7 @@ class DecaFlameExtractor:
             "light": int(cfg.model.n_light),
         }
         self.encoder = ResnetEncoder(outsize=sum(self._param_sizes.values())).to(self.device)
+        _enable_chumpy_compatibility()
         self.flame = FLAME(cfg.model).to(self.device)
 
         checkpoint = torch.load(str(checkpoint_path), map_location="cpu")

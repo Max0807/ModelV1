@@ -63,6 +63,12 @@ DEFAULT_PNP_MAPPING = (
     PnpPointMapping("chin", 8),
 )
 
+# These are image-space eye sides, matching the labels in DEFAULT_PNP_MAPPING.
+# A canthus midpoint is a stable eye-opening reference, not an anatomical eyeball
+# centre. The legacy mesh vertices 3933/3930 are intentionally not used for PnP.
+FLAME_LEFT_EYE_CANTHUS_INDICES = (36, 39)
+FLAME_RIGHT_EYE_CANTHUS_INDICES = (42, 45)
+
 
 @dataclass(frozen=True)
 class PnpCamera:
@@ -152,7 +158,7 @@ class ScaleEstimate:
 
 @dataclass(frozen=True)
 class PnpFaceDepthResult:
-    """Camera-space face and eye geometry plus PnP quality indicators."""
+    """Camera-space face and canthus-midpoint geometry plus PnP quality."""
 
     rotation_matrix: Any
     rvec: Any
@@ -286,37 +292,59 @@ def _compute_pnp_confidence(
     return float(min(1.0, max(0.0, reprojection_quality * inlier_ratio * scale_quality)))
 
 
+def compute_eye_canthus_midpoints(landmarks3d: Any) -> tuple[Any, Any]:
+    """Return image-left and image-right FLAME eye-canthus midpoints.
+
+    The returned points are FLAME-local coordinates. They are derived from the
+    same semantic 68 landmarks used by the PnP eye-corner correspondences.
+    """
+
+    landmarks = _as_points("landmarks3d", landmarks3d, minimum_count=1)
+    required_index = max(
+        *FLAME_LEFT_EYE_CANTHUS_INDICES,
+        *FLAME_RIGHT_EYE_CANTHUS_INDICES,
+    )
+    if required_index >= len(landmarks):
+        raise ValueError(
+            "landmarks3d does not contain the FLAME eye-canthus indices "
+            f"up to {required_index}"
+        )
+    left_midpoint = 0.5 * (
+        landmarks[FLAME_LEFT_EYE_CANTHUS_INDICES[0]]
+        + landmarks[FLAME_LEFT_EYE_CANTHUS_INDICES[1]]
+    )
+    right_midpoint = 0.5 * (
+        landmarks[FLAME_RIGHT_EYE_CANTHUS_INDICES[0]]
+        + landmarks[FLAME_RIGHT_EYE_CANTHUS_INDICES[1]]
+    )
+    return left_midpoint, right_midpoint
+
+
 def solve_pnp_face_depth(
     image_points_by_label: Mapping[str, Sequence[float]],
     landmarks3d: Any,
-    vertices: Any,
     camera: PnpCamera,
     *,
     scale_mm_per_flame_unit: float | None = None,
     outer_eye_distance_mm: float = 105.0,
     inner_eye_distance_mm: float = 38.0,
-    left_eye_vertex_index: int = 3933,
-    right_eye_vertex_index: int = 3930,
     mapping: Sequence[PnpPointMapping] = DEFAULT_PNP_MAPPING,
     config: PnpConfig | None = None,
 ) -> PnpFaceDepthResult:
-    """Estimate camera-space eye centres from DECA-FLAME and 2D landmarks.
+    """Estimate camera-space eye-canthus midpoints from FLAME and 2D landmarks.
 
     The function implements OpenCV's ``s p = K [R|t] P`` model.  It first
     converts the FLAME local geometry into millimetres, estimates ``R,t`` with
-    ``solvePnP``, and finally transforms both eye-centre vertices into camera
-    coordinates.
+    ``solvePnP``, and finally transforms both 3D eye-canthus midpoints into
+    camera coordinates. The legacy ``left_eye_camera_*`` / ``right_eye_camera_*``
+    field names are retained for dataset compatibility.
     """
 
     np = _require_numpy()
     cv2 = _require_cv2()
     active_config = config or PnpConfig()
     landmarks = _as_points("landmarks3d", landmarks3d, minimum_count=1)
-    mesh_vertices = _as_points("vertices", vertices, minimum_count=1)
-    if left_eye_vertex_index < 0 or right_eye_vertex_index < 0:
-        raise ValueError("eye vertex indices must be non-negative")
-    if max(left_eye_vertex_index, right_eye_vertex_index) >= len(mesh_vertices):
-        raise ValueError("eye vertex index is outside the provided FLAME mesh")
+    left_eye_midpoint, right_eye_midpoint = compute_eye_canthus_midpoints(landmarks)
 
     measured_scale = compute_scale_estimate(
         landmarks,
@@ -385,14 +413,12 @@ def solve_pnp_face_depth(
 
     rotation_matrix, _ = cv2.Rodrigues(rvec)
     tvec_mm = tvec.reshape(3)
-    left_eye_camera = (
-        rotation_matrix @ (mesh_vertices[left_eye_vertex_index] * scale.scale_mm_per_flame_unit)
-        + tvec_mm
-    )
-    right_eye_camera = (
-        rotation_matrix @ (mesh_vertices[right_eye_vertex_index] * scale.scale_mm_per_flame_unit)
-        + tvec_mm
-    )
+    left_eye_camera = rotation_matrix @ (
+        left_eye_midpoint * scale.scale_mm_per_flame_unit
+    ) + tvec_mm
+    right_eye_camera = rotation_matrix @ (
+        right_eye_midpoint * scale.scale_mm_per_flame_unit
+    ) + tvec_mm
     face_depth_z_mm = float(tvec_mm[2])
     inlier_ratio = inlier_count / len(image_points)
 
