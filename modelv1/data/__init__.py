@@ -1,18 +1,55 @@
 from .dataset import (
     DEFAULT_DECA_CACHE_PATH,
+    DEFAULT_DEPTH_PRIOR_PATH,
     ModelV1Dataset,
+    build_scene_input_vector,
     build_modelv1_dataloaders,
+    get_eye_geometry_normalizer,
+    get_eye_geometry_quality_normalizer,
     get_uv_target_normalizer,
 )
-from .normalization import UVTargetNormalizer, fit_uv_target_normalizer
+from .depth_prior import (
+    EYE_GEOMETRY_REPRESENTATIONS,
+    EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D,
+    EYE_GEOMETRY_REPRESENTATION_RAW_EYE6D,
+    DepthPriorTable,
+    build_eye_geometry_representation,
+    build_eye_geometry_quality_vector,
+    build_eye_geometry_vector,
+    build_raw_eye_geometry_vector,
+    canonical_eye_geometry_representation,
+    eye_geometry_representation_dim,
+)
+from .normalization import (
+    EyeGeometryNormalizer,
+    EyeGeometryQualityNormalizer,
+    UVTargetNormalizer,
+    fit_uv_target_normalizer,
+)
 from modelv1.deca_cache import DecaFeatureCache
 
 __all__ = [
     "DEFAULT_DECA_CACHE_PATH",
+    "DEFAULT_DEPTH_PRIOR_PATH",
     "DecaFeatureCache",
+    "DepthPriorTable",
+    "EYE_GEOMETRY_REPRESENTATIONS",
+    "EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D",
+    "EYE_GEOMETRY_REPRESENTATION_RAW_EYE6D",
+    "EyeGeometryNormalizer",
+    "EyeGeometryQualityNormalizer",
     "ModelV1Dataset",
     "UVTargetNormalizer",
     "build_modelv1_dataloaders",
+    "build_scene_input_vector",
+    "build_eye_geometry_representation",
+    "build_eye_geometry_quality_vector",
+    "build_eye_geometry_vector",
+    "build_raw_eye_geometry_vector",
+    "canonical_eye_geometry_representation",
+    "eye_geometry_representation_dim",
     "fit_uv_target_normalizer",
+    "get_eye_geometry_normalizer",
+    "get_eye_geometry_quality_normalizer",
     "get_uv_target_normalizer",
 ]

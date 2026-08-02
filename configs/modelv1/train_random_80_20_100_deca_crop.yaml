@@ -1,5 +1,8 @@
 experiment:
   run_name: null
+  description: "DECA默认裁剪基线：不使用双眼6D几何先验。"
+  diary_enabled: true
+  diary_path: experiments/experiment_diary.md
   output_dir: outputs
   seed: 42
   deterministic: true
@@ -8,6 +11,7 @@ data:
   csv_path: data/processed/modelv1_dataset.csv
   # Build this cache with --face-preprocess deca --deca-crop-scale 1.25.
   deca_cache_path: data/processed/deca_features_deca_crop_v1.npz
+  depth_prior_csv_path: data/processed/depth_priors_deca_crop_v1.csv
   deca_face_preprocess: deca
   deca_crop_scale: 1.25
   split_mode: random_80_20
@@ -24,7 +28,12 @@ data:
 model:
   deca_feature_dim: 236
   crop_cam_dim: 36
+  use_crop_cam: true
   scene_dim: 25
+  scene_representation: full25
+  eye_geometry_dim: 6
+  use_eye_geometry: false
+  eye_geometry_gate_mode: none
   uv_dim: 2
   face_embedding_dim: 128
   face_hidden_dims: [256]

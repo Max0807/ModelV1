@@ -13,13 +13,26 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from modelv1.data import (
     DEFAULT_DECA_CACHE_PATH,
+    DEFAULT_DEPTH_PRIOR_PATH,
     build_modelv1_dataloaders,
+    get_eye_geometry_normalizer,
+    get_eye_geometry_quality_normalizer,
     get_uv_target_normalizer,
 )
+from modelv1.geometry_gate import EYE_GEOMETRY_GATE_MODES
+from modelv1.data.depth_prior import EYE_GEOMETRY_REPRESENTATIONS
+from modelv1.scene import SCENE_REPRESENTATIONS
+from modelv1.deca_cache import DECA_FEATURE_REPRESENTATIONS
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--deca-feature-representation",
+        choices=DECA_FEATURE_REPRESENTATIONS,
+        default="full236",
+        help="full236=all coarse DECA parameters; geometry156=shape+exp+pose.",
+    )
     parser.add_argument(
         "--split-mode",
         choices=["random_80_20", "dataset_5"],
@@ -38,17 +51,58 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DECA_CACHE_PATH,
         help="DECA .npz cache produced by cache_deca_features.py.",
     )
+    parser.add_argument(
+        "--use-eye-geometry",
+        action="store_true",
+        help="Load and normalize the V2.1 binocular geometry input.",
+    )
+    parser.add_argument(
+        "--eye-geometry-representation",
+        choices=EYE_GEOMETRY_REPRESENTATIONS,
+        default="normalized6d",
+        help="normalized6d=center/baseline geometry; raw_eye6d=[Lx,Ly,Lz,Rx,Ry,Rz] in mm.",
+    )
+    parser.add_argument(
+        "--depth-prior",
+        type=Path,
+        default=DEFAULT_DEPTH_PRIOR_PATH,
+        help="Offline depth-prior CSV keyed by sample_id.",
+    )
+    parser.add_argument(
+        "--eye-geometry-gate-mode",
+        choices=EYE_GEOMETRY_GATE_MODES,
+        default="none",
+        help="none=V2.1, fixed=analytical gate, learned_residual=V2.2.",
+    )
+    parser.add_argument(
+        "--scene-representation",
+        choices=SCENE_REPRESENTATIONS,
+        default="full25",
+        help=(
+            "full25=legacy scene vector; table_frame7=orientation plus distance; "
+            "orientation6d=table orientation only."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    use_eye_geometry = (
+        args.use_eye_geometry or args.eye_geometry_gate_mode != "none"
+    )
     train_loader, val_loader = build_modelv1_dataloaders(
         batch_size=4,
         split_mode=args.split_mode,
         split_seed=args.split_seed,
         deca_cache_path=args.deca_cache,
         require_deca_features=True,
+        use_eye_geometry=use_eye_geometry,
+        depth_prior_csv_path=args.depth_prior,
+        eye_geometry_gate_mode=args.eye_geometry_gate_mode,
+        eye_geometry_representation=args.eye_geometry_representation,
+        scene_representation=args.scene_representation,
+        deca_feature_representation=args.deca_feature_representation,
     )
     batch = next(iter(train_loader))
 
@@ -62,10 +116,33 @@ def main() -> int:
     print("right_eye:", tuple(batch["right_eye"].shape))
     print("crop_cam_vec:", tuple(batch["crop_cam_vec"].shape))
     print("scene_vec:", tuple(batch["scene_vec"].shape))
+    print("scene representation:", args.scene_representation)
+    print("DECA feature representation:", args.deca_feature_representation)
+    print("eye geometry representation:", args.eye_geometry_representation)
     print("uv_gt:", tuple(batch["uv_gt"].shape))
     print("uv_target:", tuple(batch["uv_target"].shape))
     if "deca_feat" in batch:
         print("deca_feat:", tuple(batch["deca_feat"].shape))
+    if "eye_geometry_vec" in batch:
+        print("eye_geometry_vec:", tuple(batch["eye_geometry_vec"].shape))
+        geometry_normalizer = get_eye_geometry_normalizer(train_loader.dataset)
+        if geometry_normalizer is None:
+            raise RuntimeError("Expected an eye geometry normalizer.")
+        print("eye geometry mean:", geometry_normalizer.mean.tolist())
+        print("eye geometry std:", geometry_normalizer.std.tolist())
+    for key in (
+        "eye_geometry_confidence",
+        "eye_geometry_valid_mask",
+        "eye_geometry_quality_vec",
+    ):
+        if key in batch:
+            print(f"{key}:", tuple(batch[key].shape))
+    quality_normalizer = get_eye_geometry_quality_normalizer(
+        train_loader.dataset
+    )
+    if quality_normalizer is not None:
+        print("eye quality mean:", quality_normalizer.mean.tolist())
+        print("eye quality std:", quality_normalizer.std.tolist())
     normalizer = get_uv_target_normalizer(train_loader.dataset)
     if normalizer is None:
         raise RuntimeError("Expected a UV target normalizer on the training dataset.")

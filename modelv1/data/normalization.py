@@ -11,6 +11,8 @@ from torch import Tensor
 
 UV_DIM = 2
 UV_TARGET_COLUMNS = ("uv_gt_u_mm", "uv_gt_v_mm")
+EYE_GEOMETRY_DIM = 6
+EYE_GEOMETRY_QUALITY_DIM = 4
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,150 @@ class UVTargetNormalizer:
         )
 
 
+@dataclass(frozen=True)
+class EyeGeometryNormalizer:
+    """Per-dimension z-score transform fitted on training eye geometry only."""
+
+    mean: Tensor
+    std: Tensor
+
+    def __post_init__(self) -> None:
+        mean = torch.as_tensor(self.mean, dtype=torch.float32).flatten().clone()
+        std = torch.as_tensor(self.std, dtype=torch.float32).flatten().clone()
+        expected = (EYE_GEOMETRY_DIM,)
+        if mean.shape != expected or std.shape != expected:
+            raise ValueError(
+                "Eye geometry normalization tensors must have shape "
+                f"{expected}, got mean={tuple(mean.shape)}, std={tuple(std.shape)}"
+            )
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+            raise ValueError("Eye geometry normalization statistics must be finite.")
+        if torch.any(std <= 0):
+            raise ValueError("Eye geometry normalization std must be strictly positive.")
+        object.__setattr__(self, "mean", mean)
+        object.__setattr__(self, "std", std)
+
+    @classmethod
+    def fit(
+        cls,
+        geometry: Tensor,
+        min_std: float = 1e-6,
+    ) -> "EyeGeometryNormalizer":
+        """Fit from an ``[N, 6]`` tensor of training samples only."""
+
+        geometry = torch.as_tensor(geometry, dtype=torch.float32)
+        if (
+            geometry.ndim != 2
+            or geometry.shape[-1] != EYE_GEOMETRY_DIM
+            or geometry.shape[0] == 0
+        ):
+            raise ValueError(
+                f"geometry must have shape [N, {EYE_GEOMETRY_DIM}] with N > 0"
+            )
+        if not torch.isfinite(geometry).all():
+            raise ValueError("Cannot fit eye geometry normalizer from non-finite values.")
+        if min_std <= 0:
+            raise ValueError("min_std must be positive.")
+        return cls(
+            mean=geometry.mean(dim=0),
+            std=geometry.std(dim=0, unbiased=False).clamp_min(min_std),
+        )
+
+    def normalize(self, geometry: Tensor) -> Tensor:
+        geometry = validate_eye_geometry_tensor(geometry, "geometry")
+        mean = self.mean.to(device=geometry.device, dtype=geometry.dtype)
+        std = self.std.to(device=geometry.device, dtype=geometry.dtype)
+        return (geometry - mean) / std
+
+    def state_dict(self) -> dict[str, Tensor]:
+        return {"mean": self.mean.clone(), "std": self.std.clone()}
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Tensor]) -> "EyeGeometryNormalizer":
+        try:
+            return cls(mean=state["mean"], std=state["std"])
+        except KeyError as exc:
+            raise KeyError("Eye geometry normalizer state requires mean and std.") from exc
+
+
+@dataclass(frozen=True)
+class EyeGeometryQualityNormalizer:
+    """Per-dimension z-score transform fitted on training PnP quality only."""
+
+    mean: Tensor
+    std: Tensor
+
+    def __post_init__(self) -> None:
+        mean = torch.as_tensor(self.mean, dtype=torch.float32).flatten().clone()
+        std = torch.as_tensor(self.std, dtype=torch.float32).flatten().clone()
+        expected = (EYE_GEOMETRY_QUALITY_DIM,)
+        if mean.shape != expected or std.shape != expected:
+            raise ValueError(
+                "Eye geometry quality normalization tensors must have shape "
+                f"{expected}, got mean={tuple(mean.shape)}, std={tuple(std.shape)}"
+            )
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+            raise ValueError(
+                "Eye geometry quality normalization statistics must be finite."
+            )
+        if torch.any(std <= 0):
+            raise ValueError(
+                "Eye geometry quality normalization std must be strictly positive."
+            )
+        object.__setattr__(self, "mean", mean)
+        object.__setattr__(self, "std", std)
+
+    @classmethod
+    def fit(
+        cls,
+        quality: Tensor,
+        min_std: float = 1e-6,
+    ) -> "EyeGeometryQualityNormalizer":
+        """Fit from an ``[N, 4]`` tensor of valid training samples only."""
+
+        quality = torch.as_tensor(quality, dtype=torch.float32)
+        if (
+            quality.ndim != 2
+            or quality.shape[-1] != EYE_GEOMETRY_QUALITY_DIM
+            or quality.shape[0] == 0
+        ):
+            raise ValueError(
+                "quality must have shape "
+                f"[N, {EYE_GEOMETRY_QUALITY_DIM}] with N > 0"
+            )
+        if not torch.isfinite(quality).all():
+            raise ValueError(
+                "Cannot fit eye geometry quality normalizer from non-finite values."
+            )
+        if min_std <= 0:
+            raise ValueError("min_std must be positive.")
+        return cls(
+            mean=quality.mean(dim=0),
+            std=quality.std(dim=0, unbiased=False).clamp_min(min_std),
+        )
+
+    def normalize(self, quality: Tensor) -> Tensor:
+        quality = validate_eye_geometry_quality_tensor(quality, "quality")
+        mean = self.mean.to(device=quality.device, dtype=quality.dtype)
+        std = self.std.to(device=quality.device, dtype=quality.dtype)
+        return (quality - mean) / std
+
+    def state_dict(self) -> dict[str, Tensor]:
+        return {"mean": self.mean.clone(), "std": self.std.clone()}
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state: Mapping[str, Tensor],
+    ) -> "EyeGeometryQualityNormalizer":
+        try:
+            return cls(mean=state["mean"], std=state["std"])
+        except KeyError as exc:
+            raise KeyError(
+                "Eye geometry quality normalizer state requires mean and std."
+            ) from exc
+
+
 def fit_uv_target_normalizer(rows: list[dict[str, str]]) -> UVTargetNormalizer:
     """Fit from CSV rows without loading images or DECA features."""
 
@@ -112,3 +258,25 @@ def validate_uv_tensor(uv: Tensor, name: str) -> Tensor:
     if uv.ndim < 1 or uv.shape[-1] != UV_DIM:
         raise ValueError(f"{name} must end with dimension {UV_DIM}, got {tuple(uv.shape)}")
     return uv
+
+
+def validate_eye_geometry_tensor(geometry: Tensor, name: str) -> Tensor:
+    if not torch.is_tensor(geometry):
+        raise TypeError(f"{name} must be a torch.Tensor.")
+    if geometry.ndim < 1 or geometry.shape[-1] != EYE_GEOMETRY_DIM:
+        raise ValueError(
+            f"{name} must end with dimension {EYE_GEOMETRY_DIM}, "
+            f"got {tuple(geometry.shape)}"
+        )
+    return geometry
+
+
+def validate_eye_geometry_quality_tensor(quality: Tensor, name: str) -> Tensor:
+    if not torch.is_tensor(quality):
+        raise TypeError(f"{name} must be a torch.Tensor.")
+    if quality.ndim < 1 or quality.shape[-1] != EYE_GEOMETRY_QUALITY_DIM:
+        raise ValueError(
+            f"{name} must end with dimension {EYE_GEOMETRY_QUALITY_DIM}, "
+            f"got {tuple(quality.shape)}"
+        )
+    return quality

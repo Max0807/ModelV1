@@ -54,8 +54,8 @@ python scripts/generate_depth_priors.py --face-preprocess legacy
 默认输出：
 
 ```text
-data/processed/depth_prior_v1.csv
-data/processed/depth_prior_v1.csv.metadata.json
+data/processed/depth_priors_deca_crop_v1.csv
+data/processed/depth_priors_deca_crop_v1.csv.metadata.json
 ```
 
 默认使用固定尺度 `1010.0 mm/FLAME unit`，与当前 CrossGaze 基线最终选定的
@@ -81,7 +81,7 @@ python scripts/generate_depth_priors.py --device auto --overwrite
 
 ## CSV 保存字段与类型
 
-`depth_prior_v1.csv` 每个样本一行，主要字段如下：
+`depth_priors_deca_crop_v1.csv` 每个样本一行，主要字段如下：
 
 | 字段组 | 类型 | 含义 |
 |---|---|---|
@@ -100,7 +100,7 @@ python scripts/generate_depth_priors.py --device auto --overwrite
 | `*_scale_mm_per_flame_unit` | float | 固定尺度及内、外眼角诊断尺度 |
 | `scale_disagreement_ratio` | float | 内外眼角尺度之间的相对差异 |
 
-`depth_prior_v1.csv.metadata.json` 保存字段类型、相机参数、尺度策略、DECA
+`depth_priors_deca_crop_v1.csv.metadata.json` 保存字段类型、相机参数、尺度策略、DECA
 来源、处理时间、样本状态计数和坐标系约定。
 
 ## 与训练数据的关系

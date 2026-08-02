@@ -39,7 +39,9 @@ from modelv1.depth_prior.face_preprocess import (
 
 
 DEFAULT_CSV_PATH = PROJECT_ROOT / "data" / "processed" / "modelv1_dataset.csv"
-DEFAULT_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "deca_features_v1.npz"
+DEFAULT_CACHE_PATH = (
+    PROJECT_ROOT / "data" / "processed" / "deca_features_deca_crop_v1.npz"
+)
 DEFAULT_DECA_ROOT = PROJECT_ROOT / "DECA-master"
 DECA_PREPROCESS_VERSION = "deca_bbox_crop_v1"
 
@@ -59,10 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--face-preprocess",
         choices=FACE_PREPROCESS_CHOICES,
-        default=FACE_PREPROCESS_LEGACY,
+        default=FACE_PREPROCESS_DECA,
         help=(
-            "DECA input crop. 'legacy' reproduces the existing saved face crop; "
-            "'deca' renders the official square bbox crop from source_image_path."
+            "DECA input crop. 'deca' (default) renders the official square bbox "
+            "crop from source_image_path; 'legacy' reproduces the old saved crop."
         ),
     )
     parser.add_argument(

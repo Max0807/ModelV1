@@ -1,6 +1,7 @@
 """ModelV1 package."""
 
 __all__ = [
+    "FaceImageEncoder",
     "ModelV1",
     "ModelV1Config",
     "UVLossConfig",
@@ -18,10 +19,11 @@ def __getattr__(name: str):
     cache files before a training environment has been installed.
     """
 
-    if name in {"ModelV1", "ModelV1Config", "build_modelv1"}:
-        from .model import ModelV1, ModelV1Config, build_modelv1
+    if name in {"FaceImageEncoder", "ModelV1", "ModelV1Config", "build_modelv1"}:
+        from .model import FaceImageEncoder, ModelV1, ModelV1Config, build_modelv1
 
         exports = {
+            "FaceImageEncoder": FaceImageEncoder,
             "ModelV1": ModelV1,
             "ModelV1Config": ModelV1Config,
             "build_modelv1": build_modelv1,

@@ -31,13 +31,47 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from modelv1 import ModelV1, ModelV1Config, UVLossConfig, UVRegressionLoss
 from modelv1.deca_cache import DecaFeatureCache
-from modelv1.data import build_modelv1_dataloaders, get_uv_target_normalizer
-from modelv1.data.normalization import UVTargetNormalizer
+from modelv1.data import (
+    build_modelv1_dataloaders,
+    get_eye_geometry_normalizer,
+    get_eye_geometry_quality_normalizer,
+    get_uv_target_normalizer,
+)
+from modelv1.data.normalization import (
+    EyeGeometryNormalizer,
+    EyeGeometryQualityNormalizer,
+    UVTargetNormalizer,
+)
 from modelv1.depth_prior.face_preprocess import (
     DEFAULT_DECA_CROP_SCALE,
     FACE_PREPROCESS_CHOICES,
     FACE_PREPROCESS_DECA,
     FACE_PREPROCESS_LEGACY,
+)
+from modelv1.experiment_diary import append_completed_experiment
+from modelv1.geometry_gate import (
+    EYE_GEOMETRY_GATE_LEARNED_RESIDUAL,
+    EYE_GEOMETRY_GATE_NONE,
+    canonical_eye_geometry_gate_mode,
+)
+from modelv1.deca_cache import (
+    DECA_FEATURE_REPRESENTATION_FULL236,
+    canonical_deca_feature_representation,
+    deca_feature_representation_dim,
+)
+from modelv1.model import (
+    DECA_BRANCH_MODE_FACTORIZED_GEOMETRY,
+    canonical_deca_branch_mode,
+)
+from modelv1.data.depth_prior import (
+    EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D,
+    canonical_eye_geometry_representation,
+    eye_geometry_representation_dim,
+)
+from modelv1.scene import (
+    SCENE_REPRESENTATION_FULL25,
+    canonical_scene_representation,
+    scene_representation_dim,
 )
 
 
@@ -60,7 +94,9 @@ METRIC_FIELDS = [
     "best_val_epe_mm",
 ]
 TUPLE_CONFIG_KEYS = (
+    "deca_factor_hidden_dims",
     "face_hidden_dims",
+    "visual_fusion_hidden_dims",
     "crop_cam_hidden_dims",
     "scene_hidden_dims",
     "fusion_hidden_dims",
@@ -87,6 +123,11 @@ def load_config(path: Path) -> dict[str, Any]:
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
         raise ValueError("Top-level training config must be a mapping.")
+    data_section = config.get("data")
+    if isinstance(data_section, dict):
+        data_section["deca_face_preprocess"] = str(
+            data_section.get("deca_face_preprocess", FACE_PREPROCESS_DECA)
+        ).strip().lower()
     validate_config(config)
     return config
 
@@ -103,9 +144,35 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("data.val_ratio must be positive.")
     if float(config["training"]["optimizer"].get("lr", 0.0)) <= 0:
         raise ValueError("training.optimizer.lr must be positive.")
+    experiment_config = config["experiment"]
+    if not isinstance(experiment_config.get("description"), str):
+        raise ValueError("experiment.description must be a string.")
+    if not isinstance(experiment_config.get("diary_enabled"), bool):
+        raise ValueError("experiment.diary_enabled must be true or false.")
+    if (
+        experiment_config["diary_enabled"]
+        and not str(experiment_config.get("diary_path", "")).strip()
+    ):
+        raise ValueError(
+            "experiment.diary_path is required when diary_enabled=true."
+        )
+    wandb_config = config["logging"].get("wandb")
+    if not isinstance(wandb_config, dict):
+        raise ValueError("logging.wandb must be a mapping.")
+    for key in ("enabled", "project", "entity", "mode", "tags"):
+        if key not in wandb_config:
+            raise ValueError(f"logging.wandb requires {key!r} in the config file.")
+    if not isinstance(wandb_config["enabled"], bool):
+        raise ValueError("logging.wandb.enabled must be true or false.")
+    if not str(wandb_config["project"]).strip():
+        raise ValueError("logging.wandb.project must be a non-empty name.")
+    if not str(wandb_config["mode"]).strip():
+        raise ValueError("logging.wandb.mode must be non-empty.")
+    if not isinstance(wandb_config["tags"], list):
+        raise ValueError("logging.wandb.tags must be a list.")
     face_preprocess = str(
-        config["data"].get("deca_face_preprocess", FACE_PREPROCESS_LEGACY)
-    )
+        config["data"].get("deca_face_preprocess", FACE_PREPROCESS_DECA)
+    ).strip().lower()
     if face_preprocess not in FACE_PREPROCESS_CHOICES:
         raise ValueError(
             "data.deca_face_preprocess must be one of "
@@ -113,6 +180,92 @@ def validate_config(config: Mapping[str, Any]) -> None:
         )
     if float(config["data"].get("deca_crop_scale", DEFAULT_DECA_CROP_SCALE)) <= 0:
         raise ValueError("data.deca_crop_scale must be positive.")
+    use_eye_geometry = config["model"].get("use_eye_geometry", False)
+    if not isinstance(use_eye_geometry, bool):
+        raise ValueError("model.use_eye_geometry must be true or false.")
+    use_crop_cam = config["model"].get("use_crop_cam", True)
+    if not isinstance(use_crop_cam, bool):
+        raise ValueError("model.use_crop_cam must be true or false.")
+    use_face_image = config["model"].get("use_face_image", False)
+    if not isinstance(use_face_image, bool):
+        raise ValueError("model.use_face_image must be true or false.")
+    load_face_image = config["data"].get("load_face_image", False)
+    if not isinstance(load_face_image, bool):
+        raise ValueError("data.load_face_image must be true or false.")
+    if use_face_image and not load_face_image:
+        raise ValueError(
+            "data.load_face_image must be true when model.use_face_image=true."
+        )
+    deca_feature_representation = canonical_deca_feature_representation(
+        config["model"].get(
+            "deca_feature_representation",
+            DECA_FEATURE_REPRESENTATION_FULL236,
+        )
+    )
+    expected_deca_feature_dim = deca_feature_representation_dim(
+        deca_feature_representation
+    )
+    if int(config["model"].get("deca_feature_dim", 236)) != expected_deca_feature_dim:
+        raise ValueError(
+            f"model.deca_feature_representation={deca_feature_representation!r} "
+            f"requires model.deca_feature_dim={expected_deca_feature_dim}."
+        )
+    deca_branch_mode = canonical_deca_branch_mode(
+        config["model"].get("deca_branch_mode", "flat")
+    )
+    if (
+        deca_branch_mode == DECA_BRANCH_MODE_FACTORIZED_GEOMETRY
+        and deca_feature_representation != "geometry156"
+    ):
+        raise ValueError(
+            "model.deca_branch_mode='factorized_geometry' requires "
+            "model.deca_feature_representation='geometry156'."
+        )
+    scene_representation = canonical_scene_representation(
+        config["model"].get(
+            "scene_representation",
+            SCENE_REPRESENTATION_FULL25,
+        )
+    )
+    expected_scene_dim = scene_representation_dim(scene_representation)
+    if int(config["model"].get("scene_dim", 25)) != expected_scene_dim:
+        raise ValueError(
+            f"model.scene_representation={scene_representation!r} requires "
+            f"model.scene_dim={expected_scene_dim}."
+        )
+    eye_geometry_representation = canonical_eye_geometry_representation(
+        config["model"].get(
+            "eye_geometry_representation",
+            EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D,
+        )
+    )
+    expected_eye_geometry_dim = eye_geometry_representation_dim(
+        eye_geometry_representation
+    )
+    if int(config["model"].get("eye_geometry_dim", 6)) != expected_eye_geometry_dim:
+        raise ValueError(
+            f"model.eye_geometry_representation={eye_geometry_representation!r} "
+            f"requires model.eye_geometry_dim={expected_eye_geometry_dim}."
+        )
+    gate_mode = canonical_eye_geometry_gate_mode(
+        config["model"].get("eye_geometry_gate_mode", EYE_GEOMETRY_GATE_NONE)
+    )
+    if not use_eye_geometry and gate_mode != EYE_GEOMETRY_GATE_NONE:
+        raise ValueError(
+            "model.eye_geometry_gate_mode must be 'none' when "
+            "model.use_eye_geometry=false."
+        )
+    if int(config["model"].get("eye_geometry_quality_dim", 4)) != 4:
+        raise ValueError("model.eye_geometry_quality_dim must be 4 for V2.2.")
+    if use_eye_geometry and not config["data"].get("depth_prior_csv_path"):
+        raise ValueError(
+            "data.depth_prior_csv_path is required when model.use_eye_geometry=true."
+        )
+    gate_regularization_weight = float(
+        config["loss"].get("gate_regularization_weight", 0.0)
+    )
+    if gate_regularization_weight < 0:
+        raise ValueError("loss.gate_regularization_weight must be non-negative.")
 
 
 def resolve_project_path(value: str | Path) -> Path:
@@ -127,14 +280,16 @@ def validate_deca_cache_preprocess(
     """Reject a feature cache rendered with different DECA image preprocessing."""
 
     expected_mode = str(
-        data_config.get("deca_face_preprocess", FACE_PREPROCESS_LEGACY)
-    )
+        data_config.get("deca_face_preprocess", FACE_PREPROCESS_DECA)
+    ).strip().lower()
     expected_scale = float(
         data_config.get("deca_crop_scale", DEFAULT_DECA_CROP_SCALE)
     )
     cache = DecaFeatureCache.load(cache_path)
     # Caches produced before this field existed were necessarily legacy crops.
-    cache_mode = str(cache.metadata.get("face_preprocess", FACE_PREPROCESS_LEGACY))
+    cache_mode = str(
+        cache.metadata.get("face_preprocess", FACE_PREPROCESS_LEGACY)
+    ).strip().lower()
     if cache_mode != expected_mode:
         raise ValueError(
             "DECA cache preprocessing mismatch: "
@@ -158,7 +313,9 @@ def make_run_dir(config: dict[str, Any], resume: Path | None) -> Path:
             raise FileNotFoundError(f"Resume checkpoint does not exist: {checkpoint}")
         if checkpoint.parent.name != "checkpoints":
             raise ValueError("Resume checkpoint must live in a run's checkpoints directory.")
-        return checkpoint.parent.parent
+        run_dir = checkpoint.parent.parent
+        config["experiment"]["run_name"] = run_dir.name
+        return run_dir
 
     project = str(config["logging"]["wandb"]["project"])
     run_name = config["experiment"].get("run_name")
@@ -221,7 +378,11 @@ class NoOpTracker:
         pass
 
 
-def start_tracker(config: Mapping[str, Any], run_dir: Path) -> Any:
+def start_tracker(
+    config: Mapping[str, Any],
+    run_dir: Path,
+    static_metadata: Mapping[str, Any] | None = None,
+) -> Any:
     wandb_config = config["logging"]["wandb"]
     if not bool(wandb_config["enabled"]):
         return NoOpTracker()
@@ -232,14 +393,18 @@ def start_tracker(config: Mapping[str, Any], run_dir: Path) -> Any:
             "W&B logging is enabled, but wandb is not installed. Run pip install -r requirements.txt."
         ) from exc
 
+    run_config = to_jsonable(config)
+    if static_metadata is not None:
+        run_config["model_statistics"] = to_jsonable(static_metadata)
+
     run = wandb.init(
         project=wandb_config["project"],
-        entity=wandb_config.get("entity"),
-        mode=wandb_config.get("mode", "online"),
+        entity=wandb_config["entity"],
+        mode=wandb_config["mode"],
         name=config["experiment"]["run_name"],
-        tags=wandb_config.get("tags", []),
+        tags=wandb_config["tags"],
         dir=str(run_dir),
-        config=to_jsonable(config),
+        config=run_config,
     )
     run.define_metric("epoch")
     for split in ("train", "val"):
@@ -302,6 +467,7 @@ def run_epoch(
     scaler: torch.cuda.amp.GradScaler,
     amp_enabled: bool,
     grad_clip_norm: float | None,
+    gate_regularization_weight: float,
 ) -> tuple[dict[str, float], int]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -320,8 +486,37 @@ def run_epoch(
         grad_context = torch.enable_grad() if is_train else torch.no_grad()
         with grad_context:
             with autocast_context(amp_enabled):
-                uv_pred = model(device_batch)
+                use_gate_regularization = (
+                    is_train and gate_regularization_weight > 0
+                )
+                model_output = model(
+                    device_batch,
+                    return_features=use_gate_regularization,
+                )
+                if isinstance(model_output, dict):
+                    uv_pred = model_output["uv"]
+                else:
+                    uv_pred = model_output
                 loss = criterion(uv_pred, device_batch["uv_target"])
+                if use_gate_regularization:
+                    gate_delta = model_output.get("eye_geometry_gate_delta")
+                    valid_mask = device_batch.get("eye_geometry_valid_mask")
+                    if gate_delta is None or not torch.is_tensor(valid_mask):
+                        raise RuntimeError(
+                            "Gate regularization requires learned gate delta "
+                            "and eye_geometry_valid_mask."
+                        )
+                    valid_mask = valid_mask.to(
+                        device=gate_delta.device,
+                        dtype=gate_delta.dtype,
+                    )
+                    gate_regularization = (
+                        gate_delta.square() * valid_mask
+                    ).sum() / valid_mask.sum().clamp_min(1.0)
+                    loss = (
+                        loss
+                        + gate_regularization_weight * gate_regularization
+                    )
             if is_train:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -376,6 +571,8 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.cuda.amp.GradScaler,
     normalizer: UVTargetNormalizer,
+    eye_geometry_normalizer: EyeGeometryNormalizer | None,
+    eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None,
     config: Mapping[str, Any],
 ) -> None:
     torch.save(
@@ -388,6 +585,16 @@ def save_checkpoint(
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "normalizer": normalizer.state_dict(),
+            "eye_geometry_normalizer": (
+                eye_geometry_normalizer.state_dict()
+                if eye_geometry_normalizer is not None
+                else None
+            ),
+            "eye_geometry_quality_normalizer": (
+                eye_geometry_quality_normalizer.state_dict()
+                if eye_geometry_quality_normalizer is not None
+                else None
+            ),
             "config": to_jsonable(config),
             "rng_state": capture_rng_state(),
         },
@@ -403,6 +610,8 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.cuda.amp.GradScaler,
     normalizer: UVTargetNormalizer,
+    eye_geometry_normalizer: EyeGeometryNormalizer | None,
+    eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None,
     device: torch.device,
 ) -> tuple[int, int, float]:
     checkpoint = torch.load(path, map_location=device)
@@ -418,6 +627,58 @@ def load_checkpoint(
             "Resume checkpoint uses different UV normalization statistics. "
             "Use the original split/config for this checkpoint."
         )
+    saved_eye_geometry_state = checkpoint.get("eye_geometry_normalizer")
+    if eye_geometry_normalizer is None:
+        if saved_eye_geometry_state is not None:
+            raise ValueError(
+                "Resume checkpoint uses eye geometry, but the current config disables it."
+            )
+    else:
+        if saved_eye_geometry_state is None:
+            raise ValueError(
+                "Resume checkpoint has no eye geometry normalization statistics."
+            )
+        saved_eye_geometry_normalizer = EyeGeometryNormalizer.from_state_dict(
+            saved_eye_geometry_state
+        )
+        if not torch.allclose(
+            saved_eye_geometry_normalizer.mean,
+            eye_geometry_normalizer.mean,
+        ) or not torch.allclose(
+            saved_eye_geometry_normalizer.std,
+            eye_geometry_normalizer.std,
+        ):
+            raise ValueError(
+                "Resume checkpoint uses different eye geometry normalization "
+                "statistics. Use the original split and depth-prior CSV."
+            )
+    saved_quality_state = checkpoint.get("eye_geometry_quality_normalizer")
+    if eye_geometry_quality_normalizer is None:
+        if saved_quality_state is not None:
+            raise ValueError(
+                "Resume checkpoint uses eye geometry quality normalization, "
+                "but the current config does not."
+            )
+    else:
+        if saved_quality_state is None:
+            raise ValueError(
+                "Resume checkpoint has no eye geometry quality normalization "
+                "statistics."
+            )
+        saved_quality_normalizer = EyeGeometryQualityNormalizer.from_state_dict(
+            saved_quality_state
+        )
+        if not torch.allclose(
+            saved_quality_normalizer.mean,
+            eye_geometry_quality_normalizer.mean,
+        ) or not torch.allclose(
+            saved_quality_normalizer.std,
+            eye_geometry_quality_normalizer.std,
+        ):
+            raise ValueError(
+                "Resume checkpoint uses different eye geometry quality "
+                "normalization statistics."
+            )
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -509,8 +770,14 @@ def main() -> int:
     device = resolve_device(str(config["training"]["device"]))
     amp_enabled = bool(config["training"]["amp"]) and device.type == "cuda"
     data_config = config["data"]
+    model_config = make_model_config(config["model"])
     deca_cache_path = resolve_project_path(data_config["deca_cache_path"])
     validate_deca_cache_preprocess(deca_cache_path, data_config)
+    depth_prior_csv_path = (
+        resolve_project_path(data_config["depth_prior_csv_path"])
+        if model_config.use_eye_geometry
+        else None
+    )
     train_loader, val_loader = build_modelv1_dataloaders(
         csv_path=resolve_project_path(data_config["csv_path"]),
         split_mode=data_config["split_mode"],
@@ -524,13 +791,44 @@ def main() -> int:
         load_face_image=bool(data_config["load_face_image"]),
         deca_cache_path=deca_cache_path,
         require_deca_features=True,
+        use_eye_geometry=model_config.use_eye_geometry,
+        depth_prior_csv_path=depth_prior_csv_path,
+        eye_geometry_gate_mode=model_config.eye_geometry_gate_mode,
+        eye_geometry_representation=model_config.eye_geometry_representation,
+        scene_representation=model_config.scene_representation,
+        deca_feature_representation=model_config.deca_feature_representation,
     )
     normalizer = get_uv_target_normalizer(train_loader.dataset)
     if normalizer is None:
         raise RuntimeError("Training requires normalized UV targets.")
+    eye_geometry_normalizer = get_eye_geometry_normalizer(train_loader.dataset)
+    if model_config.use_eye_geometry and eye_geometry_normalizer is None:
+        raise RuntimeError(
+            "Eye geometry is enabled but its training normalizer is unavailable."
+        )
+    eye_geometry_quality_normalizer = get_eye_geometry_quality_normalizer(
+        train_loader.dataset
+    )
+    if (
+        model_config.eye_geometry_gate_mode
+        == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+        and eye_geometry_quality_normalizer is None
+    ):
+        raise RuntimeError(
+            "Learned eye geometry gate requires a training quality normalizer."
+        )
 
-    model = ModelV1(make_model_config(config["model"])).to(device)
-    criterion = UVRegressionLoss(normalizer, UVLossConfig(**config["loss"]))
+    model = ModelV1(model_config).to(device)
+    loss_config = dict(config["loss"])
+    gate_regularization_weight = float(
+        loss_config.pop("gate_regularization_weight", 0.0)
+    )
+    if (
+        model_config.eye_geometry_gate_mode
+        != EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+    ):
+        gate_regularization_weight = 0.0
+    criterion = UVRegressionLoss(normalizer, UVLossConfig(**loss_config))
     optimizer_config = config["training"]["optimizer"]
     if optimizer_config["name"].lower() != "adamw":
         raise ValueError("Only AdamW is supported by the V1 training config.")
@@ -560,19 +858,41 @@ def main() -> int:
             scheduler=scheduler,
             scaler=scaler,
             normalizer=normalizer,
+            eye_geometry_normalizer=eye_geometry_normalizer,
+            eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
             device=device,
         )
 
-    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    total_parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameter_count = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
     setup_text = (
         f"run_dir={run_dir} device={device} amp={amp_enabled} "
         f"train_samples={len(train_loader.dataset)} val_samples={len(val_loader.dataset)} "
-        f"parameters={parameter_count:,} start_epoch={start_epoch}"
+        f"use_face_image={model_config.use_face_image} "
+        f"face_image_backbone={model_config.face_image_backbone} "
+        f"eye_backbone={model_config.eye_backbone} "
+        f"use_crop_cam={model_config.use_crop_cam} "
+        f"scene_representation={model_config.scene_representation} "
+        f"eye_geometry_gate_mode={model_config.eye_geometry_gate_mode} "
+        f"parameters_total={total_parameter_count:,} "
+        f"parameters_trainable={trainable_parameter_count:,} start_epoch={start_epoch}"
     )
     logger.info(setup_text)
     print(setup_text)
 
-    tracker = start_tracker(config, run_dir)
+    tracker = start_tracker(
+        config,
+        run_dir,
+        static_metadata={
+            "use_face_image": model_config.use_face_image,
+            "face_image_backbone": model_config.face_image_backbone,
+            "eye_backbone": model_config.eye_backbone,
+            "parameters_total": total_parameter_count,
+            "parameters_trainable": trainable_parameter_count,
+        },
+    )
     metrics_writer = MetricsCsvWriter(run_dir / "metrics.csv")
     started_at = time.perf_counter()
     epochs = int(config["training"]["epochs"])
@@ -593,6 +913,7 @@ def main() -> int:
                 scaler=scaler,
                 amp_enabled=amp_enabled,
                 grad_clip_norm=grad_clip_norm,
+                gate_regularization_weight=gate_regularization_weight,
             )
             global_step += len(train_loader)
             val_metrics, _ = run_epoch(
@@ -604,6 +925,7 @@ def main() -> int:
                 scaler=scaler,
                 amp_enabled=amp_enabled,
                 grad_clip_norm=None,
+                gate_regularization_weight=0.0,
             )
             scheduler.step()
 
@@ -635,6 +957,8 @@ def main() -> int:
                     scheduler=scheduler,
                     scaler=scaler,
                     normalizer=normalizer,
+                    eye_geometry_normalizer=eye_geometry_normalizer,
+                    eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
                     config=config,
                 )
             if improved:
@@ -648,6 +972,8 @@ def main() -> int:
                     scheduler=scheduler,
                     scaler=scaler,
                     normalizer=normalizer,
+                    eye_geometry_normalizer=eye_geometry_normalizer,
+                    eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
                     config=config,
                 )
 
@@ -662,6 +988,24 @@ def main() -> int:
     finally:
         metrics_writer.close()
         tracker.finish()
+
+    if bool(config["experiment"]["diary_enabled"]) and not args.dry_run:
+        diary_path = resolve_project_path(config["experiment"]["diary_path"])
+        diary_updated = append_completed_experiment(
+            config=config,
+            run_dir=run_dir,
+            diary_path=diary_path,
+            parameter_count=total_parameter_count,
+            train_sample_count=len(train_loader.dataset),
+            val_sample_count=len(val_loader.dataset),
+        )
+        diary_text = (
+            f"experiment diary updated: {diary_path}"
+            if diary_updated
+            else f"experiment diary already contains this run: {diary_path}"
+        )
+        logger.info(diary_text)
+        print(diary_text)
 
     completed_text = (
         f"completed epochs={epochs} best_val_epe_mm={best_val_epe_mm:.4f} "

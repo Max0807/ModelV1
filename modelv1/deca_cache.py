@@ -1,8 +1,8 @@
 """Schema and reader for frozen DECA face features.
 
-The cache deliberately stores only DECA's coarse ``E_flame`` output.  This is
-the 236-D parameter vector expected by :class:`modelv1.ModelV1` and does not
-require the FLAME decoder or DECA renderer at training time.
+The cache deliberately stores only DECA's coarse 236-D ``E_flame`` output.
+Training can select either the complete vector or its geometry-only
+``shape + exp + pose`` subset without regenerating the cache.
 """
 
 from __future__ import annotations
@@ -28,6 +28,67 @@ DECA_PARAMETER_LAYOUT = {
     "cam": [206, 209],
     "light": [209, 236],
 }
+DECA_FEATURE_REPRESENTATION_FULL236 = "full236"
+DECA_FEATURE_REPRESENTATION_GEOMETRY156 = "geometry156"
+DECA_FEATURE_REPRESENTATIONS = (
+    DECA_FEATURE_REPRESENTATION_FULL236,
+    DECA_FEATURE_REPRESENTATION_GEOMETRY156,
+)
+DECA_GEOMETRY_PARAMETER_NAMES = ("shape", "exp", "pose")
+
+
+def canonical_deca_feature_representation(value: str) -> str:
+    """Validate and normalize a configured DECA feature representation."""
+
+    representation = str(value).strip().lower()
+    if representation not in DECA_FEATURE_REPRESENTATIONS:
+        supported = ", ".join(DECA_FEATURE_REPRESENTATIONS)
+        raise ValueError(
+            f"Unknown deca_feature_representation={value!r}; expected one of: "
+            f"{supported}."
+        )
+    return representation
+
+
+def deca_feature_representation_dim(value: str) -> int:
+    """Return the required feature width for one DECA representation."""
+
+    representation = canonical_deca_feature_representation(value)
+    if representation == DECA_FEATURE_REPRESENTATION_FULL236:
+        return DECA_FEATURE_DIM
+    if representation == DECA_FEATURE_REPRESENTATION_GEOMETRY156:
+        return sum(
+            DECA_PARAMETER_LAYOUT[name][1] - DECA_PARAMETER_LAYOUT[name][0]
+            for name in DECA_GEOMETRY_PARAMETER_NAMES
+        )
+    raise AssertionError(f"Unhandled DECA feature representation: {representation}")
+
+
+def select_deca_feature_representation(feature: np.ndarray, representation: str) -> np.ndarray:
+    """Select one model input representation from a cached 236-D vector."""
+
+    numpy = require_numpy()
+    representation = canonical_deca_feature_representation(representation)
+    feature = numpy.asarray(feature, dtype=numpy.float32).reshape(-1)
+    if feature.shape != (DECA_FEATURE_DIM,):
+        raise ValueError(
+            f"Cached DECA feature must have shape ({DECA_FEATURE_DIM},), "
+            f"got {feature.shape}."
+        )
+    if representation == DECA_FEATURE_REPRESENTATION_FULL236:
+        return feature
+    if representation == DECA_FEATURE_REPRESENTATION_GEOMETRY156:
+        return numpy.concatenate(
+            [
+                feature[start:end]
+                for start, end in (
+                    DECA_PARAMETER_LAYOUT[name]
+                    for name in DECA_GEOMETRY_PARAMETER_NAMES
+                )
+            ],
+            axis=0,
+        )
+    raise AssertionError(f"Unhandled DECA feature representation: {representation}")
 
 
 def require_numpy() -> Any:
@@ -115,7 +176,7 @@ class DecaFeatureCache:
         return cls(path, features, sample_ids, image_sha256, metadata)
 
     def lookup(self, sample_id: str) -> np.ndarray:
-        """Return one immutable 236-D float32 vector by dataset sample id."""
+        """Return one immutable cached 236-D float32 vector by sample id."""
 
         try:
             return self.features[self._index[sample_id]]

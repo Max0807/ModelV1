@@ -40,7 +40,9 @@ from modelv1.depth_prior import (
 
 
 DEFAULT_CSV_PATH = PROJECT_ROOT / "data" / "processed" / "modelv1_dataset.csv"
-DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "depth_prior_v1.csv"
+DEFAULT_OUTPUT_PATH = (
+    PROJECT_ROOT / "data" / "processed" / "depth_priors_deca_crop_v1.csv"
+)
 DEFAULT_FIXED_SCALE_MM_PER_FLAME_UNIT = 1010.0
 
 PNP_LABELS = (
