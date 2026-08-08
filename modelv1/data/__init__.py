@@ -4,9 +4,14 @@ from .dataset import (
     ModelV1Dataset,
     build_scene_input_vector,
     build_modelv1_dataloaders,
+    get_depth_correction_geometry_normalizer,
     get_eye_geometry_normalizer,
     get_eye_geometry_quality_normalizer,
     get_uv_target_normalizer,
+)
+from .augmentation import (
+    EyeAppearanceAugmentationConfig,
+    PairedEyeAppearanceAugmentation,
 )
 from .depth_prior import (
     EYE_GEOMETRY_REPRESENTATIONS,
@@ -26,6 +31,14 @@ from .normalization import (
     UVTargetNormalizer,
     fit_uv_target_normalizer,
 )
+from .virtual_camera_manifest import (
+    IMAGE_SOURCE_LEGACY,
+    IMAGE_SOURCE_VIRTUAL_CAMERA,
+    VirtualCameraManifest,
+    VirtualCameraRecord,
+    canonical_image_source,
+    merge_virtual_camera_manifests,
+)
 from modelv1.deca_cache import DecaFeatureCache
 
 __all__ = [
@@ -38,8 +51,14 @@ __all__ = [
     "EYE_GEOMETRY_REPRESENTATION_RAW_EYE6D",
     "EyeGeometryNormalizer",
     "EyeGeometryQualityNormalizer",
+    "EyeAppearanceAugmentationConfig",
+    "IMAGE_SOURCE_LEGACY",
+    "IMAGE_SOURCE_VIRTUAL_CAMERA",
     "ModelV1Dataset",
+    "PairedEyeAppearanceAugmentation",
     "UVTargetNormalizer",
+    "VirtualCameraManifest",
+    "VirtualCameraRecord",
     "build_modelv1_dataloaders",
     "build_scene_input_vector",
     "build_eye_geometry_representation",
@@ -47,9 +66,11 @@ __all__ = [
     "build_eye_geometry_vector",
     "build_raw_eye_geometry_vector",
     "canonical_eye_geometry_representation",
+    "canonical_image_source",
     "eye_geometry_representation_dim",
     "fit_uv_target_normalizer",
     "get_eye_geometry_normalizer",
     "get_eye_geometry_quality_normalizer",
+    "get_depth_correction_geometry_normalizer",
     "get_uv_target_normalizer",
 ]

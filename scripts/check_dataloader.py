@@ -22,7 +22,10 @@ from modelv1.data import (
 from modelv1.geometry_gate import EYE_GEOMETRY_GATE_MODES
 from modelv1.data.depth_prior import EYE_GEOMETRY_REPRESENTATIONS
 from modelv1.scene import SCENE_REPRESENTATIONS
-from modelv1.deca_cache import DECA_FEATURE_REPRESENTATIONS
+from modelv1.deca_cache import (
+    DECA_FEATURE_REPRESENTATIONS,
+    DECA_FEATURE_REPRESENTATION_NONE,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,9 +38,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--split-mode",
-        choices=["random_80_20", "dataset_5"],
+        choices=["random_80_20", "dataset_5", "explicit_datasets"],
         default="dataset_5",
         help="Dataset split strategy to smoke-test.",
+    )
+    parser.add_argument(
+        "--train-datasets",
+        nargs="+",
+        default=["3", "4"],
+        help="Training dataset names/indices for explicit_datasets.",
+    )
+    parser.add_argument(
+        "--val-datasets",
+        nargs="+",
+        default=["5"],
+        help="Validation dataset names/indices for explicit_datasets.",
     )
     parser.add_argument(
         "--split-seed",
@@ -93,10 +108,20 @@ def main() -> int:
     )
     train_loader, val_loader = build_modelv1_dataloaders(
         batch_size=4,
+        train_datasets=args.train_datasets,
+        val_datasets=args.val_datasets,
         split_mode=args.split_mode,
         split_seed=args.split_seed,
-        deca_cache_path=args.deca_cache,
-        require_deca_features=True,
+        deca_cache_path=(
+            None
+            if args.deca_feature_representation
+            == DECA_FEATURE_REPRESENTATION_NONE
+            else args.deca_cache
+        ),
+        require_deca_features=(
+            args.deca_feature_representation
+            != DECA_FEATURE_REPRESENTATION_NONE
+        ),
         use_eye_geometry=use_eye_geometry,
         depth_prior_csv_path=args.depth_prior,
         eye_geometry_gate_mode=args.eye_geometry_gate_mode,

@@ -14,16 +14,23 @@ from .data.normalization import UVTargetNormalizer
 def predict_uv_mm(
     model: nn.Module,
     batch: Mapping[str, object],
-    normalizer: UVTargetNormalizer,
+    normalizer: UVTargetNormalizer | None = None,
 ) -> Tensor:
     """Run one batch and return table-local UV predictions in millimeters."""
 
     was_training = model.training
     model.eval()
     try:
-        uv_normalized = model(batch)
-        if not torch.is_tensor(uv_normalized):
-            raise TypeError("Model inference must return a UV tensor.")
-        return normalizer.denormalize(uv_normalized)
+        output = model(batch)
+        if isinstance(output, Mapping):
+            uv_mm = output.get("uv_mean_mm", output.get("uv"))
+            if not torch.is_tensor(uv_mm):
+                raise TypeError("V4 model output must contain tensor uv_mean_mm.")
+            return uv_mm
+        if not torch.is_tensor(output):
+            raise TypeError("Model inference must return a UV tensor or V4 mapping.")
+        if normalizer is None:
+            raise ValueError("Legacy direct_uv inference requires a UV normalizer.")
+        return normalizer.denormalize(output)
     finally:
         model.train(was_training)

@@ -27,7 +27,9 @@ IMAGE_H = 1080.0
 W_REF = 1920.0
 H_REF = 1080.0
 
-FACE_CROP_SIZE = (224.0, 224.0)
+# RGB face-encoder input size. The DataLoader applies the same resize before
+# VGGFace2 Inception-ResNet inference; DECA uses its own independent 224 size.
+FACE_CROP_SIZE = (160.0, 160.0)
 EYE_CROP_SIZE = (60.0, 36.0)
 
 FX = 1367.8584
@@ -79,6 +81,10 @@ BASE_COLUMNS = [
     "gaze_cam_csv_y_mm",
     "gaze_cam_csv_z_mm",
     "gaze_cam_error_mm",
+    "gaze_cam_csv_raw_x_mm",
+    "gaze_cam_csv_raw_y_mm",
+    "gaze_cam_csv_raw_z_mm",
+    "gaze_cam_raw_error_mm",
     "t_wc_x_mm",
     "t_wc_y_mm",
     "t_wc_z_mm",
@@ -136,6 +142,11 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Optional dataset names or numbers, for example: 2 3 4.",
+    )
+    parser.add_argument(
+        "--dataset-id",
+        default=None,
+        help="Build exactly one collection dataset and name the output modelv1_dataset<ID>.csv.",
     )
     parser.add_argument(
         "--pnp-csv",
@@ -462,6 +473,42 @@ def old_gaze_cam(row: dict[str, str]) -> list[float] | None:
     return [float(value) for value in values]
 
 
+def corrected_gaze_camera_fields(
+    gaze_cam_recomputed: list[float],
+    gaze_cam_csv_raw: list[float] | None,
+) -> dict[str, float | None]:
+    """Expose only corrected camera coordinates through legacy active fields.
+
+    The original recorder combined millimetre Vicon translations with the
+    metre-valued hand-eye translation without converting the latter. Keep that
+    source value under explicit ``*_raw_*`` provenance columns, while the
+    backward-compatible ``gaze_cam_csv_*`` fields now alias the authoritative
+    recomputation made with ``handeye_translation_scale=1000``.
+    """
+
+    raw_error = (
+        norm(vec_sub(gaze_cam_recomputed, gaze_cam_csv_raw))
+        if gaze_cam_csv_raw is not None
+        else None
+    )
+    return {
+        "gaze_cam_csv_x_mm": gaze_cam_recomputed[0],
+        "gaze_cam_csv_y_mm": gaze_cam_recomputed[1],
+        "gaze_cam_csv_z_mm": gaze_cam_recomputed[2],
+        "gaze_cam_error_mm": 0.0,
+        "gaze_cam_csv_raw_x_mm": (
+            gaze_cam_csv_raw[0] if gaze_cam_csv_raw is not None else None
+        ),
+        "gaze_cam_csv_raw_y_mm": (
+            gaze_cam_csv_raw[1] if gaze_cam_csv_raw is not None else None
+        ),
+        "gaze_cam_csv_raw_z_mm": (
+            gaze_cam_csv_raw[2] if gaze_cam_csv_raw is not None else None
+        ),
+        "gaze_cam_raw_error_mm": raw_error,
+    }
+
+
 def existing_image_paths(dataset_dir: Path, image_name: str) -> dict[str, Path]:
     return {
         "source": dataset_dir / "insightface_img" / image_name,
@@ -486,14 +533,18 @@ def pnp_fields(row: dict[str, str] | None) -> dict[str, float | str | None]:
             "right_eye_camera_y_mm": None,
             "right_eye_camera_z_mm": None,
         }
+    # The legacy CrossGaze PnP CSV calls the image-left eye ``left``. The
+    # InsightFace folders used by ModelV1 use anatomical left/right, so swap
+    # the legacy fields while importing them. The binocular midpoint is
+    # unchanged, but this prevents future per-eye models from mixing sides.
     return {
         "pnp_status": row.get("status", ""),
-        "left_eye_camera_x_mm": as_float(row, "left_eye_camera_x_mm"),
-        "left_eye_camera_y_mm": as_float(row, "left_eye_camera_y_mm"),
-        "left_eye_camera_z_mm": as_float(row, "left_eye_camera_z_mm"),
-        "right_eye_camera_x_mm": as_float(row, "right_eye_camera_x_mm"),
-        "right_eye_camera_y_mm": as_float(row, "right_eye_camera_y_mm"),
-        "right_eye_camera_z_mm": as_float(row, "right_eye_camera_z_mm"),
+        "left_eye_camera_x_mm": as_float(row, "right_eye_camera_x_mm"),
+        "left_eye_camera_y_mm": as_float(row, "right_eye_camera_y_mm"),
+        "left_eye_camera_z_mm": as_float(row, "right_eye_camera_z_mm"),
+        "right_eye_camera_x_mm": as_float(row, "left_eye_camera_x_mm"),
+        "right_eye_camera_y_mm": as_float(row, "left_eye_camera_y_mm"),
+        "right_eye_camera_z_mm": as_float(row, "left_eye_camera_z_mm"),
     }
 
 
@@ -562,7 +613,7 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
         "datasets": [],
         "overall": {},
     }
-    all_errors: list[float] = []
+    all_raw_errors: list[float] = []
 
     for dataset_dir in dataset_dirs:
         dataset_report: dict[str, Any] = {
@@ -598,6 +649,7 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
                 "right_eye": 0,
             },
             "gaze_cam_error_mm": {},
+            "gaze_cam_raw_error_mm": {},
         }
 
         data_log = choose_one(dataset_dir.glob("data_log_*.csv"))
@@ -643,7 +695,7 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
 
         insight_by_name = index_by(insight_rows, "image_name")
         pnp_by_name = index_by(pnp_rows, "image_name")
-        dataset_errors: list[float] = []
+        dataset_raw_errors: list[float] = []
 
         for data_row in data_rows:
             image_name = data_row.get("image_filename", "").strip()
@@ -705,12 +757,15 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
             scene_vec, scene_meta = build_scene_vec(r_cw, t_cw, t_wc, z_table)  # type: ignore[arg-type]
 
             gaze_cam_recomputed = vec_add(matvec(r_cw, gaze_target_w), t_cw)  # type: ignore[arg-type]
-            gaze_cam_csv = old_gaze_cam(data_row)
-            gaze_cam_error = None
-            if gaze_cam_csv is not None:
-                gaze_cam_error = norm(vec_sub(gaze_cam_recomputed, gaze_cam_csv))
-                dataset_errors.append(gaze_cam_error)
-                all_errors.append(gaze_cam_error)
+            gaze_cam_csv_raw = old_gaze_cam(data_row)
+            gaze_camera_columns = corrected_gaze_camera_fields(
+                gaze_cam_recomputed,
+                gaze_cam_csv_raw,
+            )
+            raw_error = gaze_camera_columns["gaze_cam_raw_error_mm"]
+            if raw_error is not None:
+                dataset_raw_errors.append(raw_error)
+                all_raw_errors.append(raw_error)
 
             o_table_w = scene_meta["o_table_w"]
             uv_gt = [
@@ -747,10 +802,7 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
                 "gaze_cam_recomputed_x_mm": gaze_cam_recomputed[0],
                 "gaze_cam_recomputed_y_mm": gaze_cam_recomputed[1],
                 "gaze_cam_recomputed_z_mm": gaze_cam_recomputed[2],
-                "gaze_cam_csv_x_mm": gaze_cam_csv[0] if gaze_cam_csv else None,
-                "gaze_cam_csv_y_mm": gaze_cam_csv[1] if gaze_cam_csv else None,
-                "gaze_cam_csv_z_mm": gaze_cam_csv[2] if gaze_cam_csv else None,
-                "gaze_cam_error_mm": gaze_cam_error,
+                **gaze_camera_columns,
                 "t_wc_x_mm": t_wc[0],  # type: ignore[index]
                 "t_wc_y_mm": t_wc[1],  # type: ignore[index]
                 "t_wc_z_mm": t_wc[2],  # type: ignore[index]
@@ -776,14 +828,18 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
             output_rows.append(row)
             dataset_report["counts"]["written_rows"] += 1
 
-        dataset_report["gaze_cam_error_mm"] = stats(dataset_errors)
+        dataset_report["gaze_cam_error_mm"] = stats(
+            [0.0] * len(dataset_raw_errors)
+        )
+        dataset_report["gaze_cam_raw_error_mm"] = stats(dataset_raw_errors)
         report["datasets"].append(dataset_report)
 
     report["overall"] = {
         "dataset_count": len(dataset_dirs),
         "sample_count": len(output_rows),
         "global_z_table_mm": global_z_table,
-        "gaze_cam_error_mm": stats(all_errors),
+        "gaze_cam_error_mm": stats([0.0] * len(all_raw_errors)),
+        "gaze_cam_raw_error_mm": stats(all_raw_errors),
         "crop_cam_dim": 36,
         "scene_dim": 25,
     }
@@ -828,6 +884,12 @@ def write_npz(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.dataset_id is not None:
+        dataset_id = str(args.dataset_id).strip()
+        if not dataset_id.isdigit():
+            raise ValueError("--dataset-id must be a numeric collection dataset ID.")
+        args.datasets = [str(int(dataset_id))]
+        args.output_name = f"modelv1_dataset{int(dataset_id)}"
     rows, report = build_dataset(args)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

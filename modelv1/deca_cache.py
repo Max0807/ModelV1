@@ -1,8 +1,8 @@
 """Schema and reader for frozen DECA face features.
 
 The cache deliberately stores only DECA's coarse 236-D ``E_flame`` output.
-Training can select either the complete vector or its geometry-only
-``shape + exp + pose`` subset without regenerating the cache.
+Training can select either the complete vector, its geometry-only
+``shape + exp + pose`` subset, or disable DECA features entirely.
 """
 
 from __future__ import annotations
@@ -30,9 +30,11 @@ DECA_PARAMETER_LAYOUT = {
 }
 DECA_FEATURE_REPRESENTATION_FULL236 = "full236"
 DECA_FEATURE_REPRESENTATION_GEOMETRY156 = "geometry156"
+DECA_FEATURE_REPRESENTATION_NONE = "none"
 DECA_FEATURE_REPRESENTATIONS = (
     DECA_FEATURE_REPRESENTATION_FULL236,
     DECA_FEATURE_REPRESENTATION_GEOMETRY156,
+    DECA_FEATURE_REPRESENTATION_NONE,
 )
 DECA_GEOMETRY_PARAMETER_NAMES = ("shape", "exp", "pose")
 
@@ -61,6 +63,8 @@ def deca_feature_representation_dim(value: str) -> int:
             DECA_PARAMETER_LAYOUT[name][1] - DECA_PARAMETER_LAYOUT[name][0]
             for name in DECA_GEOMETRY_PARAMETER_NAMES
         )
+    if representation == DECA_FEATURE_REPRESENTATION_NONE:
+        return 0
     raise AssertionError(f"Unhandled DECA feature representation: {representation}")
 
 
@@ -88,6 +92,8 @@ def select_deca_feature_representation(feature: np.ndarray, representation: str)
             ],
             axis=0,
         )
+    if representation == DECA_FEATURE_REPRESENTATION_NONE:
+        return numpy.empty((0,), dtype=numpy.float32)
     raise AssertionError(f"Unhandled DECA feature representation: {representation}")
 
 

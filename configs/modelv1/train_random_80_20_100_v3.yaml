@@ -1,6 +1,6 @@
 experiment:
   run_name: null
-  description: "V3：在V2.2基础上增加RGB人脸ResNet18编码器；face与双眼特征先融合为128D视觉特征，再与DECA、TableFrame和质量门控双眼几何拼接。"
+  description: "V3：使用VGGFace2预训练Inception-ResNet V1提取人脸空间特征，并以双眼token为Query、人脸token为Key/Value进行交叉注意力融合。"
   diary_enabled: true
   diary_path: experiments/experiment_diary.md
   output_dir: outputs
@@ -22,7 +22,7 @@ data:
   num_workers: 0
   pin_memory: true
   normalize_images: true
-  # V3必须读取CSV中的224x224 face_path图像。
+  # V3必须读取CSV中的face_path图像；DataLoader会缩放到160x160。
   load_face_image: true
 
 model:
@@ -36,23 +36,23 @@ model:
   face_hidden_dims: [256]
 
   # V3新增的RGB face image分支。
-  use_face_image: False
-  face_image_embedding_dim: 128
-  face_image_backbone: resnet18
-  face_image_backbone_weights: DEFAULT
-  # 冻结stem到layer3，只微调layer4和128D投影头。
-  face_image_freeze_until: layer3
+  use_face_image: true
+  # VGGFace2预训练的Inception-ResNet V1固定作为人脸骨干。
+  freeze_face_image_backbone: false
 
   # 双眼图像分支，保持V2.2设置。
   eye_embedding_dim: 128
   per_eye_embedding_dim: 96
   eye_backbone: resnet18
-  eye_backbone_weights: null
+  eye_backbone_weights: DEFAULT
   share_eye_encoder: true
 
-  # concat(f_face_image, f_eye) -> MLP -> f_visual。
+  # CrossAttention(Q=双眼token, K/V=人脸token) -> mean pooling -> f_visual。
   visual_embedding_dim: 128
-  visual_fusion_hidden_dims: [256]
+  visual_attention_dim: 128
+  visual_attention_heads: 8
+  visual_attention_ffn_dim: 256
+  visual_attention_dropout: 0.1
 
   crop_cam_dim: 36
   use_crop_cam: false
@@ -109,4 +109,4 @@ logging:
     project: ModelV1_random_80_20_V3
     entity: null
     mode: online
-    tags: [ModelV1, V3, deca_geometry156, deca_factorized_geometry, face_image_resnet18, face_eye_visual_fusion, scene_table_frame7, no_crop_cam, eye_geometry_raw_eye6d, quality_gate, random_80_20]
+    tags: [ModelV1, V3, deca_geometry156, deca_factorized_geometry, face_image_inception_resnet_v1_vggface2, face_eye_cross_attention, scene_table_frame7, no_crop_cam, eye_geometry_raw_eye6d, quality_gate, random_80_20]

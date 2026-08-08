@@ -26,8 +26,8 @@ data:
 
 model:
   # DECA factorized branch requires this selected geometry-only cache representation.
-  deca_feature_representation: geometry156
-  deca_feature_dim: 156
+  deca_feature_representation: full236
+  deca_feature_dim: 236
   # flat = one MLP over the selected DECA vector; factorized_geometry = shape/exp/pose MLPs then fusion.
   deca_branch_mode: flat
   deca_factor_embedding_dim: 64

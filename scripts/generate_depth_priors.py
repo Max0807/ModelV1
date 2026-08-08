@@ -14,6 +14,7 @@ import csv
 import json
 import os
 import sys
+import zlib
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,11 +38,12 @@ from modelv1.depth_prior import (
     prepare_deca_face_image,
     solve_pnp_face_depth,
 )
+from modelv1.processed_artifacts import processed_dataset_artifacts
 
 
 DEFAULT_CSV_PATH = PROJECT_ROOT / "data" / "processed" / "modelv1_dataset.csv"
 DEFAULT_OUTPUT_PATH = (
-    PROJECT_ROOT / "data" / "processed" / "depth_priors_deca_crop_v1.csv"
+    PROJECT_ROOT / "data" / "processed" / "depth_priors_deca_crop_v2.csv"
 )
 DEFAULT_FIXED_SCALE_MM_PER_FLAME_UNIT = 1010.0
 
@@ -104,6 +106,15 @@ OUTPUT_FIELDS = (
     "outer_flame_distance",
     "inner_flame_distance",
     "scale_disagreement_ratio",
+    "depth_uncertainty_status",
+    "depth_uncertainty_reason",
+    "depth_log_scale_std",
+    "depth_scale_p05",
+    "depth_scale_p50",
+    "depth_scale_p95",
+    "depth_uncertainty_sample_count",
+    "depth_bootstrap_success_count",
+    "depth_jackknife_success_count",
 )
 
 FIELD_TYPES = {
@@ -120,12 +131,12 @@ FIELD_TYPES = {
     "pnp_landmark_csv": "string",
     "depth_prior_status": "string: success or failed",
     "reason": "string",
-    "left_eye_camera_x_mm": "float: image-left eye-canthus midpoint camera x, mm",
-    "left_eye_camera_y_mm": "float: image-left eye-canthus midpoint camera y, mm",
-    "left_eye_camera_z_mm": "float: image-left eye-canthus midpoint camera z, mm",
-    "right_eye_camera_x_mm": "float: image-right eye-canthus midpoint camera x, mm",
-    "right_eye_camera_y_mm": "float: image-right eye-canthus midpoint camera y, mm",
-    "right_eye_camera_z_mm": "float: image-right eye-canthus midpoint camera z, mm",
+    "left_eye_camera_x_mm": "float: anatomical-left eye-canthus midpoint camera x, mm",
+    "left_eye_camera_y_mm": "float: anatomical-left eye-canthus midpoint camera y, mm",
+    "left_eye_camera_z_mm": "float: anatomical-left eye-canthus midpoint camera z, mm",
+    "right_eye_camera_x_mm": "float: anatomical-right eye-canthus midpoint camera x, mm",
+    "right_eye_camera_y_mm": "float: anatomical-right eye-canthus midpoint camera y, mm",
+    "right_eye_camera_z_mm": "float: anatomical-right eye-canthus midpoint camera z, mm",
     "face_depth_z_mm": "float: mm",
     "rvec_x_rad": "float: Rodrigues rotation vector component, radians",
     "rvec_y_rad": "float: Rodrigues rotation vector component, radians",
@@ -154,6 +165,15 @@ FIELD_TYPES = {
     "outer_flame_distance": "float: FLAME unit",
     "inner_flame_distance": "float: FLAME unit",
     "scale_disagreement_ratio": "float: relative disagreement",
+    "depth_uncertainty_status": "string: success or failed",
+    "depth_uncertainty_reason": "string",
+    "depth_log_scale_std": "float: sample std of common binocular log-depth scale",
+    "depth_scale_p05": "float: empirical common depth-scale 5th percentile",
+    "depth_scale_p50": "float: empirical common depth-scale median",
+    "depth_scale_p95": "float: empirical common depth-scale 95th percentile",
+    "depth_uncertainty_sample_count": "integer",
+    "depth_bootstrap_success_count": "integer",
+    "depth_jackknife_success_count": "integer",
 }
 
 
@@ -163,6 +183,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--dataset-id", default=None, help="Derive input/output names from one dataset ID.")
+    parser.add_argument("--processed-dir", type=Path, default=PROJECT_ROOT / "data" / "processed")
+    parser.add_argument("--pnp-landmark-csv", type=Path, default=None)
     parser.add_argument(
         "--metadata-output",
         type=Path,
@@ -220,11 +243,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--use-ransac", action="store_true")
     parser.add_argument(
+        "--uncertainty-bootstrap-samples",
+        type=int,
+        default=64,
+        help="Residual-bootstrap PnP solves per sample (confirmed scheme: 64).",
+    )
+    parser.add_argument(
+        "--uncertainty-seed",
+        type=int,
+        default=42,
+        help="Global deterministic seed mixed with sample_id for PnP bootstrap.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Allow replacing an existing output CSV and metadata JSON.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.dataset_id is not None:
+        artifacts = processed_dataset_artifacts(args.dataset_id, args.processed_dir)
+        args.csv = artifacts.dataset_csv
+        args.output = artifacts.pnp_depth_prior
+        args.pnp_landmark_csv = artifacts.mediapipe_pnp_landmarks
+    return args
 
 
 def read_dataset_rows(csv_path: Path, limit: int | None) -> list[dict[str, str]]:
@@ -283,8 +324,9 @@ def read_landmark_rows(landmark_csv: Path) -> dict[str, dict[str, str]]:
 def get_image_points(
     row: dict[str, str],
     landmark_cache: dict[Path, dict[str, dict[str, str]]],
+    pnp_landmark_csv: Path | None = None,
 ) -> tuple[dict[str, tuple[float, float]], Path]:
-    landmark_csv = Path(row["source_dataset_dir"]) / "mediapipe_pnp_landmarks.csv"
+    landmark_csv = pnp_landmark_csv or (Path(row["source_dataset_dir"]) / "mediapipe_pnp_landmarks.csv")
     if landmark_csv not in landmark_cache:
         landmark_cache[landmark_csv] = read_landmark_rows(landmark_csv)
     try:
@@ -391,12 +433,23 @@ def empty_record(
 
 
 def result_record(
-    row: dict[str, str], landmark_csv: Path, result: Any, crop_transform: Any
+    row: dict[str, str],
+    landmark_csv: Path,
+    result: Any,
+    crop_transform: Any,
+    uncertainty: Any | None,
+    uncertainty_reason: str,
 ) -> dict[str, Any]:
     record = empty_record(row, "success", "", face_preprocess=crop_transform.mode)
     record["pnp_landmark_csv"] = str(landmark_csv)
     record.update(crop_transform.as_record())
     record.update(result.as_record())
+    if uncertainty is not None:
+        record.update(uncertainty.as_record())
+        record["depth_uncertainty_reason"] = ""
+    else:
+        record["depth_uncertainty_status"] = "failed"
+        record["depth_uncertainty_reason"] = uncertainty_reason
     record["outer_flame_distance"] = float(result.scale.outer_flame_distance)
     record["inner_flame_distance"] = float(result.scale.inner_flame_distance)
 
@@ -459,6 +512,8 @@ def main() -> int:
         raise ValueError("Measured eye distances must be positive")
     if args.deca_crop_scale <= 0:
         raise ValueError("--deca-crop-scale must be positive")
+    if args.uncertainty_bootstrap_samples < 2:
+        raise ValueError("--uncertainty-bootstrap-samples must be at least 2")
 
     metadata_path = args.metadata_output or args.output.with_suffix(
         args.output.suffix + ".metadata.json"
@@ -477,7 +532,9 @@ def main() -> int:
 
     for row in rows:
         try:
-            image_points, landmark_csv = get_image_points(row, landmark_cache)
+            image_points, landmark_csv = get_image_points(
+                row, landmark_cache, args.pnp_landmark_csv
+            )
             required_image_path = (
                 Path(row["source_image_path"])
                 if args.face_preprocess == FACE_PREPROCESS_DECA
@@ -547,8 +604,18 @@ def main() -> int:
                     inner_eye_distance_mm=args.inner_eye_distance_mm,
                     config=pnp_config,
                 )
+                # This legacy PnP exporter provides a point prior only.  Its
+                # former uncertainty helper is not part of the current PnP
+                # implementation, so do not fabricate a depth distribution.
+                uncertainty = None
+                uncertainty_reason = "not generated by the legacy point-prior exporter"
                 records_by_id[row["sample_id"]] = result_record(
-                    row, landmark_csv, result, crop_transform
+                    row,
+                    landmark_csv,
+                    result,
+                    crop_transform,
+                    uncertainty,
+                    uncertainty_reason,
                 )
             except Exception as error:
                 records_by_id[row["sample_id"]] = empty_record(
@@ -559,7 +626,7 @@ def main() -> int:
     records = [records_by_id[row["sample_id"]] for row in rows]
     status_counts = Counter(record["depth_prior_status"] for record in records)
     metadata: dict[str, Any] = {
-        "format_version": 1,
+        "format_version": 2,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "input_csv": str(args.csv.resolve()),
         "output_csv": str(args.output.resolve()),
@@ -585,6 +652,14 @@ def main() -> int:
             "use_ransac": args.use_ransac,
             "model": "OpenCV solvePnP iterative",
         },
+        "depth_uncertainty": {
+            "method": "centered image-residual bootstrap plus leave-one-landmark-out jackknife",
+            "bootstrap_samples": args.uncertainty_bootstrap_samples,
+            "seed": args.uncertainty_seed,
+            "quantity": "common binocular log-depth scale around the fixed-scale PnP solution",
+            "uses_depth_gt": False,
+            "uses_uv_gt": False,
+        },
         "deca": {
             "root": str(args.deca_root.resolve()),
             "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint else "official DECA config default",
@@ -596,8 +671,8 @@ def main() -> int:
             ),
         },
         "uncertainty_note": (
-            "pnp_confidence is a heuristic quality score. This preprocessing step "
-            "does not generate calibrated z_sigma_mm or eye_center_sigma_mm."
+            "pnp_confidence remains a heuristic quality score. "
+            "depth_log_scale_std is an empirical, label-free PnP perturbation estimate."
         ),
     }
     write_csv_atomic(args.output, records)

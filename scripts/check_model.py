@@ -17,7 +17,11 @@ from modelv1 import ModelV1, ModelV1Config
 from modelv1.model import DECA_BRANCH_MODES
 from modelv1.geometry_gate import EYE_GEOMETRY_GATE_MODES
 from modelv1.scene import SCENE_REPRESENTATIONS, scene_representation_dim
-from modelv1.deca_cache import DECA_FEATURE_REPRESENTATIONS, deca_feature_representation_dim
+from modelv1.deca_cache import (
+    DECA_FEATURE_REPRESENTATIONS,
+    DECA_FEATURE_REPRESENTATION_NONE,
+    deca_feature_representation_dim,
+)
 from modelv1.data.depth_prior import EYE_GEOMETRY_REPRESENTATIONS
 
 
@@ -51,22 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-face-image",
         action="store_true",
-        help="Enable the V3 RGB face encoder and face-eye visual fusion.",
+        help="Enable VGGFace2 face features and face-eye cross-attention fusion.",
     )
     parser.add_argument(
-        "--face-image-backbone",
-        default="resnet18",
-        help="Face image backbone: resnet18, resnet34, or resnet50.",
-    )
-    parser.add_argument(
-        "--face-image-backbone-weights",
-        default=None,
-        help="Use DEFAULT for ImageNet weights on the face ResNet; omit for scratch.",
-    )
-    parser.add_argument(
-        "--face-image-freeze-until",
-        default="none",
-        help="Freeze the face backbone through: none, stem, layer1, layer2, layer3, or layer4.",
+        "--freeze-face-image-backbone",
+        action="store_true",
+        help="Freeze the VGGFace2-pretrained Inception-ResNet face backbone.",
     )
     parser.add_argument(
         "--use-eye-geometry",
@@ -112,9 +106,7 @@ def main() -> int:
         deca_feature_representation=args.deca_feature_representation,
         deca_branch_mode=args.deca_branch_mode,
         use_face_image=args.use_face_image,
-        face_image_backbone=args.face_image_backbone,
-        face_image_backbone_weights=args.face_image_backbone_weights,
-        face_image_freeze_until=args.face_image_freeze_until,
+        freeze_face_image_backbone=args.freeze_face_image_backbone,
         eye_backbone=args.eye_backbone,
         eye_backbone_weights=args.eye_backbone_weights,
         use_crop_cam=not args.no_crop_cam,
@@ -129,13 +121,14 @@ def main() -> int:
 
     batch_size = 4
     batch = {
-        "deca_feat": torch.randn(batch_size, config.deca_feature_dim),
         "left_eye": torch.randn(batch_size, 3, 36, 60),
         "right_eye": torch.randn(batch_size, 3, 36, 60),
         "scene_vec": torch.randn(batch_size, config.scene_dim),
     }
+    if config.deca_feature_representation != DECA_FEATURE_REPRESENTATION_NONE:
+        batch["deca_feat"] = torch.randn(batch_size, config.deca_feature_dim)
     if config.use_face_image:
-        batch["face"] = torch.randn(batch_size, 3, 224, 224)
+        batch["face"] = torch.randn(batch_size, 3, 160, 160)
     if config.use_crop_cam:
         batch["crop_cam_vec"] = torch.randn(batch_size, config.crop_cam_dim)
     if config.use_eye_geometry:
@@ -161,6 +154,12 @@ def main() -> int:
     if "face_image_features" in features:
         print("face_image_features:", tuple(features["face_image_features"].shape))
         print("visual_features:", tuple(features["visual_features"].shape))
+        print("face_tokens:", tuple(features["face_tokens"].shape))
+        print("eye_tokens:", tuple(features["eye_tokens"].shape))
+        print(
+            "cross_attention_weights:",
+            tuple(features["cross_attention_weights"].shape),
+        )
     print("eye_backbone:", config.eye_backbone)
     print("use_crop_cam:", config.use_crop_cam)
     print("scene_representation:", config.scene_representation)

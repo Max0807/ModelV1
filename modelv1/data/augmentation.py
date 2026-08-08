@@ -1,0 +1,210 @@
+"""Train-only, label-preserving appearance augmentation for paired eye crops."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+
+
+@dataclass(frozen=True)
+class EyeAppearanceAugmentationConfig:
+    """Ranges and probabilities for safe eye-image appearance perturbations."""
+
+    photometric_probability: float
+    brightness_min: float
+    brightness_max: float
+    contrast_min: float
+    contrast_max: float
+    gamma_min: float
+    gamma_max: float
+    blur_probability: float
+    blur_kernel_size: int
+    blur_sigma_min: float
+    blur_sigma_max: float
+    noise_probability: float
+    noise_std_max: float
+    occlusion_probability: float
+    occlusion_area_min: float
+    occlusion_area_max: float
+    occlusion_aspect_min: float
+    occlusion_aspect_max: float
+
+    def __post_init__(self) -> None:
+        for name in (
+            "photometric_probability",
+            "blur_probability",
+            "noise_probability",
+            "occlusion_probability",
+        ):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must lie in [0, 1], got {value}.")
+        for lower_name, upper_name in (
+            ("brightness_min", "brightness_max"),
+            ("contrast_min", "contrast_max"),
+            ("gamma_min", "gamma_max"),
+            ("blur_sigma_min", "blur_sigma_max"),
+            ("occlusion_area_min", "occlusion_area_max"),
+            ("occlusion_aspect_min", "occlusion_aspect_max"),
+        ):
+            lower = float(getattr(self, lower_name))
+            upper = float(getattr(self, upper_name))
+            if lower <= 0 or upper < lower:
+                raise ValueError(
+                    f"Expected 0 < {lower_name} <= {upper_name}, got "
+                    f"{lower} and {upper}."
+                )
+        if self.blur_kernel_size <= 0 or self.blur_kernel_size % 2 == 0:
+            raise ValueError("blur_kernel_size must be a positive odd integer.")
+        if self.noise_std_max < 0:
+            raise ValueError("noise_std_max must be non-negative.")
+        if self.occlusion_area_max > 1:
+            raise ValueError("occlusion_area_max must not exceed 1.")
+
+
+class PairedEyeAppearanceAugmentation:
+    """Apply shared scene changes and independent local corruptions to two eyes.
+
+    Inputs and outputs are RGB ``CHW`` tensors in ``[0, 1]``. Brightness,
+    contrast, gamma, and blur use identical sampled parameters for the two eye
+    crops. Sensor noise and small mean-filled occlusions are sampled
+    independently, as requested for local sensor/visibility variation.
+    """
+
+    def __init__(self, config: EyeAppearanceAugmentationConfig) -> None:
+        self.config = config
+
+    def __call__(self, left: Tensor, right: Tensor) -> tuple[Tensor, Tensor]:
+        left = _validate_eye(left, "left")
+        right = _validate_eye(right, "right")
+        if left.shape != right.shape:
+            raise ValueError(
+                "Paired eye crops must have the same shape, got "
+                f"{tuple(left.shape)} and {tuple(right.shape)}."
+            )
+
+        if _bernoulli(self.config.photometric_probability):
+            brightness = _uniform(
+                self.config.brightness_min,
+                self.config.brightness_max,
+            )
+            contrast = _uniform(
+                self.config.contrast_min,
+                self.config.contrast_max,
+            )
+            gamma = _uniform(self.config.gamma_min, self.config.gamma_max)
+            left = _photometric(left, brightness, contrast, gamma)
+            right = _photometric(right, brightness, contrast, gamma)
+
+        if _bernoulli(self.config.blur_probability):
+            sigma = _uniform(
+                self.config.blur_sigma_min,
+                self.config.blur_sigma_max,
+            )
+            left = _gaussian_blur(left, self.config.blur_kernel_size, sigma)
+            right = _gaussian_blur(right, self.config.blur_kernel_size, sigma)
+
+        left = self._independent_local_corruptions(left)
+        right = self._independent_local_corruptions(right)
+        return left.clamp(0.0, 1.0), right.clamp(0.0, 1.0)
+
+    def _independent_local_corruptions(self, image: Tensor) -> Tensor:
+        if _bernoulli(self.config.noise_probability):
+            std = _uniform(0.0, self.config.noise_std_max)
+            image = image + torch.randn_like(image) * std
+        image = image.clamp(0.0, 1.0)
+        if _bernoulli(self.config.occlusion_probability):
+            image = _mean_occlusion(
+                image,
+                area_min=self.config.occlusion_area_min,
+                area_max=self.config.occlusion_area_max,
+                aspect_min=self.config.occlusion_aspect_min,
+                aspect_max=self.config.occlusion_aspect_max,
+            )
+        return image
+
+
+def _validate_eye(image: Tensor, name: str) -> Tensor:
+    image = torch.as_tensor(image, dtype=torch.float32)
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"{name} eye must be RGB CHW, got {tuple(image.shape)}.")
+    if not torch.isfinite(image).all():
+        raise ValueError(f"{name} eye contains non-finite values.")
+    if torch.any(image < 0) or torch.any(image > 1):
+        raise ValueError(f"{name} eye must lie in [0, 1] before augmentation.")
+    return image
+
+
+def _bernoulli(probability: float) -> bool:
+    return bool(torch.rand(()) < float(probability))
+
+
+def _uniform(lower: float, upper: float) -> float:
+    if upper == lower:
+        return float(lower)
+    return float(torch.empty(()).uniform_(float(lower), float(upper)))
+
+
+def _photometric(
+    image: Tensor,
+    brightness: float,
+    contrast: float,
+    gamma: float,
+) -> Tensor:
+    image = image * brightness
+    channel_mean = image.mean(dim=(-2, -1), keepdim=True)
+    image = (image - channel_mean) * contrast + channel_mean
+    return image.clamp(0.0, 1.0).pow(gamma)
+
+
+def _gaussian_blur(image: Tensor, kernel_size: int, sigma: float) -> Tensor:
+    radius = kernel_size // 2
+    coordinate = torch.arange(
+        -radius,
+        radius + 1,
+        device=image.device,
+        dtype=image.dtype,
+    )
+    kernel_1d = torch.exp(-0.5 * (coordinate / sigma).square())
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel_2d = torch.outer(kernel_1d, kernel_1d)
+    kernel = kernel_2d.expand(image.shape[0], 1, kernel_size, kernel_size)
+    padded = F.pad(
+        image.unsqueeze(0),
+        (radius, radius, radius, radius),
+        mode="reflect",
+    )
+    blurred = F.conv2d(
+        padded,
+        kernel,
+        groups=image.shape[0],
+    )
+    return blurred.squeeze(0)
+
+
+def _mean_occlusion(
+    image: Tensor,
+    *,
+    area_min: float,
+    area_max: float,
+    aspect_min: float,
+    aspect_max: float,
+) -> Tensor:
+    height, width = image.shape[-2:]
+    area = _uniform(area_min, area_max) * height * width
+    log_aspect = _uniform(math.log(aspect_min), math.log(aspect_max))
+    aspect = math.exp(log_aspect)
+    erase_width = max(1, min(width, int(round(math.sqrt(area * aspect)))))
+    erase_height = max(1, min(height, int(round(math.sqrt(area / aspect)))))
+    max_top = height - erase_height
+    max_left = width - erase_width
+    top = int(torch.randint(max_top + 1, ()).item())
+    left = int(torch.randint(max_left + 1, ()).item())
+    output = image.clone()
+    fill = image.mean(dim=(-2, -1), keepdim=True)
+    output[:, top : top + erase_height, left : left + erase_width] = fill
+    return output

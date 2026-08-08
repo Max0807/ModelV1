@@ -63,11 +63,12 @@ DEFAULT_PNP_MAPPING = (
     PnpPointMapping("chin", 8),
 )
 
-# These are image-space eye sides, matching the labels in DEFAULT_PNP_MAPPING.
-# A canthus midpoint is a stable eye-opening reference, not an anatomical eyeball
-# centre. The legacy mesh vertices 3933/3930 are intentionally not used for PnP.
-FLAME_LEFT_EYE_CANTHUS_INDICES = (36, 39)
-FLAME_RIGHT_EYE_CANTHUS_INDICES = (42, 45)
+# FLAME 68 landmark indices returned with anatomical subject-left/right
+# semantics. The PnP correspondence labels above intentionally retain the
+# legacy image-side convention, but output eye geometry must match ModelV1's
+# anatomical left/right image folders and tensors.
+FLAME_LEFT_EYE_CANTHUS_INDICES = (42, 45)
+FLAME_RIGHT_EYE_CANTHUS_INDICES = (36, 39)
 
 
 @dataclass(frozen=True)
@@ -124,12 +125,12 @@ class PnpCamera:
 class PnpConfig:
     """Numerical settings and basic validity thresholds for face PnP."""
 
-    use_ransac: bool = False
-    ransac_reprojection_error_px: float = 8.0
-    ransac_iterations_count: int = 100
-    ransac_confidence: float = 0.99
-    inlier_reprojection_error_px: float = 10.0
-    min_plausible_depth_mm: float = 100.0
+    use_ransac: bool = False  # True = 使用RANSAC迭代筛选内点，剔除错误匹配的关键点（更鲁棒，但慢一些）；False = 使用所有关键点做最小二乘求解（速度快，但对离群点敏感）
+    ransac_reprojection_error_px: float = 8.0  # RANSAC判定内点的重投影误差阈值（像素）
+    ransac_iterations_count: int = 100  # RANSAC迭代次数
+    ransac_confidence: float = 0.99  # RANSAC置信度
+    inlier_reprojection_error_px: float = 10.0  # RANSAC筛选完内点后，会用所有内点重新做一次最小二乘优化，此时判定哪些点算内点的误差阈值（通常略大于RANSAC阶段的阈值）
+    min_plausible_depth_mm: float = 100.0  # 用于有效性验证：求解出的相机平移量中的深度（Z轴，即相机到人脸的距离）如果 < 100mm（10厘米），则判定为不合理（人脸不可能贴相机这么近），结果被标记为无效
 
     def __post_init__(self) -> None:
         if self.ransac_reprojection_error_px <= 0:
@@ -158,7 +159,7 @@ class ScaleEstimate:
 
 @dataclass(frozen=True)
 class PnpFaceDepthResult:
-    """Camera-space face and canthus-midpoint geometry plus PnP quality."""
+    """Camera-space face and eye geometry plus PnP quality indicators."""
 
     rotation_matrix: Any
     rvec: Any
@@ -190,11 +191,11 @@ class PnpFaceDepthResult:
             "pnp_num_points": self.pnp_num_points,
             "pnp_inlier_count": self.pnp_inlier_count,
             "pnp_confidence": self.pnp_confidence,
-            "depth_is_plausible": self.depth_is_plausible,
-            "scale_mm_per_flame_unit": self.scale.scale_mm_per_flame_unit,
-            "outer_scale_mm_per_flame_unit": self.scale.outer_scale_mm_per_flame_unit,
-            "inner_scale_mm_per_flame_unit": self.scale.inner_scale_mm_per_flame_unit,
-            "scale_disagreement_ratio": self.scale.scale_disagreement_ratio,
+            "depth_is_plausible": self.depth_is_plausible,  # 深度是否合理
+            "scale_mm_per_flame_unit": self.scale.scale_mm_per_flame_unit,  # 测量的 FLAME 单位与毫米的比值
+            "outer_scale_mm_per_flame_unit": self.scale.outer_scale_mm_per_flame_unit,  # 测量的外眼角距离与毫米的比值
+            "inner_scale_mm_per_flame_unit": self.scale.inner_scale_mm_per_flame_unit,  # 测量的内眼角距离与毫米的比值
+            "scale_disagreement_ratio": self.scale.scale_disagreement_ratio,  # 测量的内外眼角距离与毫米的比值之间的差异比例
         }
 
 
@@ -238,13 +239,42 @@ def compute_scale_estimate(
     scale = 0.5 * (outer_scale + inner_scale)
     disagreement = abs(outer_scale - inner_scale) / max(scale, 1e-8)
     return ScaleEstimate(
-        scale_mm_per_flame_unit=scale,
-        outer_scale_mm_per_flame_unit=outer_scale,
-        inner_scale_mm_per_flame_unit=inner_scale,
-        outer_flame_distance=outer_flame_distance,
-        inner_flame_distance=inner_flame_distance,
-        scale_disagreement_ratio=float(disagreement),
+        scale_mm_per_flame_unit=scale,  # 测量的 FLAME 单位与毫米的比值
+        outer_scale_mm_per_flame_unit=outer_scale,  # 测量的外眼角距离与毫米的比值
+        inner_scale_mm_per_flame_unit=inner_scale,  # 测量的内眼角距离与毫米的比值
+        outer_flame_distance=outer_flame_distance,  # 测量的外眼角距离
+        inner_flame_distance=inner_flame_distance,  # 测量的内眼角距离
+        scale_disagreement_ratio=float(disagreement),  # 测量的内外眼角距离与毫米的比值之间的差异比例
     )
+
+
+def compute_eye_canthus_midpoints(landmarks3d: Any) -> tuple[Any, Any]:
+    """Return the two FLAME-local eye-canthus midpoints.
+
+    The pairs match the semantic 68-landmark correspondences in
+    :data:`DEFAULT_PNP_MAPPING`.  They are a geometric reference for iris-side
+    assignment, not a claim that a canthus midpoint is an eyeball centre.
+    """
+
+    landmarks = _as_points("landmarks3d", landmarks3d, minimum_count=1)
+    required_index = max(
+        *FLAME_LEFT_EYE_CANTHUS_INDICES,
+        *FLAME_RIGHT_EYE_CANTHUS_INDICES,
+    )
+    if required_index >= len(landmarks):
+        raise ValueError(
+            "landmarks3d does not contain the FLAME eye-canthus indices "
+            f"up to {required_index}"
+        )
+    left_midpoint = 0.5 * (
+        landmarks[FLAME_LEFT_EYE_CANTHUS_INDICES[0]]
+        + landmarks[FLAME_LEFT_EYE_CANTHUS_INDICES[1]]
+    )
+    right_midpoint = 0.5 * (
+        landmarks[FLAME_RIGHT_EYE_CANTHUS_INDICES[0]]
+        + landmarks[FLAME_RIGHT_EYE_CANTHUS_INDICES[1]]
+    )
+    return left_midpoint, right_midpoint
 
 
 def _select_pnp_correspondences(
@@ -252,7 +282,9 @@ def _select_pnp_correspondences(
     landmarks3d: Any,
     mapping: Sequence[PnpPointMapping],
 ) -> tuple[Any, Any]:
-    """Keep finite 2D observations and their corresponding FLAME landmarks."""
+    """Keep finite 2D observations and their corresponding FLAME landmarks.
+    选择PnP的3D-2D对应点对：保留有限的2D观测值及其对应的FLAME关键点。
+    """
 
     np = _require_numpy()
     landmarks = _as_points("landmarks3d", landmarks3d, minimum_count=1)
@@ -292,34 +324,6 @@ def _compute_pnp_confidence(
     return float(min(1.0, max(0.0, reprojection_quality * inlier_ratio * scale_quality)))
 
 
-def compute_eye_canthus_midpoints(landmarks3d: Any) -> tuple[Any, Any]:
-    """Return image-left and image-right FLAME eye-canthus midpoints.
-
-    The returned points are FLAME-local coordinates. They are derived from the
-    same semantic 68 landmarks used by the PnP eye-corner correspondences.
-    """
-
-    landmarks = _as_points("landmarks3d", landmarks3d, minimum_count=1)
-    required_index = max(
-        *FLAME_LEFT_EYE_CANTHUS_INDICES,
-        *FLAME_RIGHT_EYE_CANTHUS_INDICES,
-    )
-    if required_index >= len(landmarks):
-        raise ValueError(
-            "landmarks3d does not contain the FLAME eye-canthus indices "
-            f"up to {required_index}"
-        )
-    left_midpoint = 0.5 * (
-        landmarks[FLAME_LEFT_EYE_CANTHUS_INDICES[0]]
-        + landmarks[FLAME_LEFT_EYE_CANTHUS_INDICES[1]]
-    )
-    right_midpoint = 0.5 * (
-        landmarks[FLAME_RIGHT_EYE_CANTHUS_INDICES[0]]
-        + landmarks[FLAME_RIGHT_EYE_CANTHUS_INDICES[1]]
-    )
-    return left_midpoint, right_midpoint
-
-
 def solve_pnp_face_depth(
     image_points_by_label: Mapping[str, Sequence[float]],
     landmarks3d: Any,
@@ -331,13 +335,14 @@ def solve_pnp_face_depth(
     mapping: Sequence[PnpPointMapping] = DEFAULT_PNP_MAPPING,
     config: PnpConfig | None = None,
 ) -> PnpFaceDepthResult:
-    """Estimate camera-space eye-canthus midpoints from FLAME and 2D landmarks.
+    """Estimate camera-space eye-canthus references from FLAME and 2D landmarks.
 
     The function implements OpenCV's ``s p = K [R|t] P`` model.  It first
     converts the FLAME local geometry into millimetres, estimates ``R,t`` with
-    ``solvePnP``, and finally transforms both 3D eye-canthus midpoints into
-    camera coordinates. The legacy ``left_eye_camera_*`` / ``right_eye_camera_*``
-    field names are retained for dataset compatibility.
+    ``solvePnP``, and finally transforms both 68-landmark eye-canthus
+    midpoints into camera coordinates.  These points are not anatomical
+    eyeball centres; Iris-IPD reconstruction uses them only for direction and
+    left/right assignment.
     """
 
     np = _require_numpy()

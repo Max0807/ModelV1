@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import csv
+import copy
 from pathlib import Path
-from typing import Callable, Iterable, Literal
+from typing import Callable, Iterable, Literal, Tuple
 
 from modelv1.deca_cache import (
     DECA_FEATURE_REPRESENTATION_FULL236,
+    DECA_FEATURE_REPRESENTATION_NONE,
     DecaFeatureCache,
     canonical_deca_feature_representation,
     select_deca_feature_representation,
 )
 from modelv1.data.depth_prior import (
     EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D,
+    EYE_GEOMETRY_REPRESENTATION_RAW_EYE6D,
     DepthPriorTable,
+    build_eye_geometry_vector,
     canonical_eye_geometry_representation,
 )
 from modelv1.data.normalization import (
@@ -24,6 +28,12 @@ from modelv1.data.normalization import (
     EyeGeometryQualityNormalizer,
     UVTargetNormalizer,
     fit_uv_target_normalizer,
+)
+from modelv1.data.virtual_camera_manifest import (
+    IMAGE_SOURCE_LEGACY,
+    IMAGE_SOURCE_VIRTUAL_CAMERA,
+    VirtualCameraManifest,
+    canonical_image_source,
 )
 from modelv1.geometry_gate import (
     EYE_GEOMETRY_GATE_LEARNED_RESIDUAL,
@@ -66,14 +76,20 @@ DEFAULT_DEPTH_PRIOR_PATH = (
     PROJECT_ROOT / "data" / "processed" / "depth_priors_deca_crop_v1.csv"
 )
 
-FACE_SIZE = (224, 224)
+FACE_SIZE = (160, 160)
 EYE_SIZE = (60, 36)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+FACENET_MEAN = (0.5, 0.5, 0.5)
+FACENET_STD = (0.5, 0.5, 0.5)
 
 ImageTransform = Callable[[torch.Tensor], torch.Tensor]
-SplitMode = Literal["random_80_20", "dataset_5"]
+PairedImageTransform = Callable[
+    [torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor],
+]
+SplitMode = Literal["random_80_20", "dataset_5", "explicit_datasets"]
 
 
 class ModelV1Dataset(Dataset):
@@ -84,13 +100,17 @@ class ModelV1Dataset(Dataset):
     - `face` (optional), `left_eye`, `right_eye`: image tensors in CHW format.
     - `crop_cam_vec`: 36D crop/camera metadata tensor.
     - `scene_vec`: selected full25, TableFrame 7D, or Orientation 6D tensor.
-    - `deca_feat`: cached 236D frozen DECA face feature.
-      Its representation is selected as `full236` or `geometry156`.
+    - `deca_feat` (optional): cached frozen DECA face feature, selected as
+      `full236` or `geometry156`; omitted when the representation is `none`.
     - `eye_geometry_vec` (optional): selected, training-z-score-normalized 6D
       binocular camera geometry.
     - gated modes also return confidence/mask and, for learned mode, 4D quality.
+    - V4 returns raw binocular PnP coordinates in mm, label-free log-depth
+      uncertainty, TableFrame7, and optional train-normalized PnP quality.
     - `uv_gt`: 2D table-local gaze target in millimeters.
     - `uv_target`: z-score-normalized target used by the UV head.
+    - virtual-camera mode additionally returns `rotation_n_from_c` and its
+      transpose `rotation_c_from_n`, both as 3x3 tensors.
     - extra metadata for validation and debugging.
     """
 
@@ -101,6 +121,7 @@ class ModelV1Dataset(Dataset):
         normalize_images: bool = True,
         face_transform: ImageTransform | None = None,
         eye_transform: ImageTransform | None = None,
+        paired_eye_transform: PairedImageTransform | None = None,
         return_paths: bool = True,
         load_face_image: bool = True,
         deca_cache_path: str | Path | None = DEFAULT_DECA_CACHE_PATH,
@@ -108,22 +129,55 @@ class ModelV1Dataset(Dataset):
         target_normalizer: UVTargetNormalizer | None = None,
         fit_target_normalizer: bool = True,
         use_eye_geometry: bool = False,
+        use_gaze_geometry: bool = False,
+        require_depth_uncertainty: bool = False,
+        require_pnp_quality: bool = False,
+        use_depth_correction: bool = False,
+        filter_invalid_depth_prior_samples: bool = False,
         depth_prior_csv_path: str | Path | None = None,
         depth_prior_table: DepthPriorTable | None = None,
         eye_geometry_normalizer: EyeGeometryNormalizer | None = None,
         eye_geometry_gate_mode: str = EYE_GEOMETRY_GATE_NONE,
         eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None = None,
+        depth_correction_geometry_normalizer: EyeGeometryNormalizer | None = None,
         eye_geometry_representation: str = EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D,
         scene_representation: str = SCENE_REPRESENTATION_FULL25,
         deca_feature_representation: str = DECA_FEATURE_REPRESENTATION_FULL236,
+        image_source: str = IMAGE_SOURCE_LEGACY,
+        virtual_camera_manifest_path: str | Path | None = None,
+        virtual_camera_manifest: VirtualCameraManifest | None = None,
+        filter_invalid_virtual_camera_samples: bool = False,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.normalize_images = normalize_images
         self.face_transform = face_transform
         self.eye_transform = eye_transform
+        self.paired_eye_transform = paired_eye_transform
         self.return_paths = return_paths
         self.load_face_image = load_face_image
+        self.image_source = canonical_image_source(image_source)
+        self.filter_invalid_virtual_camera_samples = (
+            filter_invalid_virtual_camera_samples
+        )
         self.use_eye_geometry = use_eye_geometry
+        self.use_gaze_geometry = use_gaze_geometry
+        self.require_depth_uncertainty = require_depth_uncertainty
+        self.require_pnp_quality = require_pnp_quality
+        self.use_depth_correction = use_depth_correction
+        self.filter_invalid_depth_prior_samples = filter_invalid_depth_prior_samples
+        if self.use_depth_correction and not self.use_gaze_geometry:
+            raise ValueError(
+                "use_depth_correction=True requires use_gaze_geometry=True."
+            )
+        if self.use_depth_correction and not self.require_pnp_quality:
+            raise ValueError(
+                "use_depth_correction=True requires normalized PnP quality."
+            )
+        if self.use_eye_geometry and self.use_gaze_geometry:
+            raise ValueError(
+                "Legacy learned eye geometry and V4 geometric eye hypotheses "
+                "cannot be enabled together."
+            )
         self.eye_geometry_normalizer = eye_geometry_normalizer
         self.eye_geometry_representation = canonical_eye_geometry_representation(
             eye_geometry_representation
@@ -140,39 +194,98 @@ class ModelV1Dataset(Dataset):
             and self.eye_geometry_gate_mode != EYE_GEOMETRY_GATE_NONE
         )
         self.eye_geometry_quality_normalizer = eye_geometry_quality_normalizer
+        self.depth_correction_geometry_normalizer = (
+            depth_correction_geometry_normalizer
+        )
         self.scene_representation = canonical_scene_representation(
             scene_representation
         )
         self.deca_feature_representation = canonical_deca_feature_representation(
             deca_feature_representation
         )
+        self.uses_deca_features = (
+            self.deca_feature_representation
+            != DECA_FEATURE_REPRESENTATION_NONE
+        )
         if not load_face_image and face_transform is not None:
             raise ValueError("face_transform requires load_face_image=True.")
+        if eye_transform is not None and paired_eye_transform is not None:
+            raise ValueError(
+                "Provide either eye_transform or paired_eye_transform, not both."
+            )
         if depth_prior_csv_path is not None and depth_prior_table is not None:
             raise ValueError(
                 "Provide either depth_prior_csv_path or depth_prior_table, not both."
             )
+        if (
+            virtual_camera_manifest_path is not None
+            and virtual_camera_manifest is not None
+        ):
+            raise ValueError(
+                "Provide either virtual_camera_manifest_path or "
+                "virtual_camera_manifest, not both."
+            )
+        if self.image_source == IMAGE_SOURCE_VIRTUAL_CAMERA:
+            if virtual_camera_manifest is None:
+                if virtual_camera_manifest_path is None:
+                    raise ValueError(
+                        "image_source='virtual_camera' requires "
+                        "virtual_camera_manifest_path."
+                    )
+                virtual_camera_manifest = VirtualCameraManifest.load(
+                    virtual_camera_manifest_path
+                )
+        elif (
+            virtual_camera_manifest_path is not None
+            or virtual_camera_manifest is not None
+            or self.filter_invalid_virtual_camera_samples
+        ):
+            raise ValueError(
+                "Virtual-camera manifest options require "
+                "image_source='virtual_camera'."
+            )
+        self.virtual_camera_manifest = virtual_camera_manifest
 
         requested = normalize_dataset_names(datasets)
         self.rows = read_rows(self.csv_path)
         if requested is not None:
             self.rows = [row for row in self.rows if row["dataset"] in requested]
 
+        if self.image_source == IMAGE_SOURCE_VIRTUAL_CAMERA:
+            assert self.virtual_camera_manifest is not None
+            if self.filter_invalid_virtual_camera_samples:
+                before_count = len(self.rows)
+                self.rows = [
+                    row
+                    for row in self.rows
+                    if self.virtual_camera_manifest.contains(row["sample_id"])
+                ]
+                skipped_count = before_count - len(self.rows)
+                if skipped_count:
+                    print(
+                        "Filtered "
+                        f"{skipped_count} samples without valid virtual-camera "
+                        f"artifacts from {self.csv_path}.",
+                        flush=True,
+                    )
+            else:
+                self.virtual_camera_manifest.require_sample_ids(
+                    [row["sample_id"] for row in self.rows]
+                )
+
         if not self.rows:
             raise ValueError(f"No samples found in {self.csv_path}")
 
-        validate_required_columns(self.rows[0])
-        self.target_normalizer = target_normalizer
-        if self.target_normalizer is None and fit_target_normalizer:
-            self.target_normalizer = fit_uv_target_normalizer(self.rows)
-        if require_deca_features and deca_cache_path is None:
-            raise ValueError("require_deca_features=True requires deca_cache_path.")
-        self.deca_cache = (
-            DecaFeatureCache.load(deca_cache_path) if deca_cache_path is not None else None
+        validate_required_columns(
+            self.rows[0],
+            require_gaze_geometry=self.use_gaze_geometry,
         )
-        if self.deca_cache is not None:
-            self.deca_cache.require_sample_ids(row["sample_id"] for row in self.rows)
-        if self.use_eye_geometry:
+        if self.use_eye_geometry or self.use_gaze_geometry:
+            depth_representation = (
+                EYE_GEOMETRY_REPRESENTATION_RAW_EYE6D
+                if self.use_gaze_geometry
+                else self.eye_geometry_representation
+            )
             if depth_prior_table is None:
                 if depth_prior_csv_path is None:
                     raise ValueError(
@@ -180,52 +293,149 @@ class ModelV1Dataset(Dataset):
                     )
                 depth_prior_table = DepthPriorTable.load(
                     depth_prior_csv_path,
-                    self.eye_geometry_representation,
+                    depth_representation,
                 )
             if (
                 depth_prior_table.eye_geometry_representation
-                != self.eye_geometry_representation
+                != depth_representation
             ):
                 raise ValueError(
                     "depth_prior_table representation does not match "
                     "eye_geometry_representation."
                 )
+            if self.filter_invalid_depth_prior_samples:
+                before_count = len(self.rows)
+
+                def has_required_depth_prior(row: dict[str, str]) -> bool:
+                    sample_id = row["sample_id"]
+                    if sample_id not in depth_prior_table.geometry_by_sample_id:
+                        return False
+                    if (
+                        self.require_depth_uncertainty
+                        and sample_id
+                        not in depth_prior_table.depth_log_scale_std_by_sample_id
+                    ):
+                        return False
+                    return not (
+                        self.require_pnp_quality
+                        and sample_id not in depth_prior_table.quality_by_sample_id
+                    )
+
+                self.rows = [row for row in self.rows if has_required_depth_prior(row)]
+                skipped_count = before_count - len(self.rows)
+                if skipped_count:
+                    print(
+                        "Filtered "
+                        f"{skipped_count} samples without the required valid depth prior "
+                        f"from {self.csv_path}.",
+                        flush=True,
+                    )
+                if not self.rows:
+                    raise ValueError(
+                        "No samples remain after filtering invalid depth-prior geometry "
+                        f"from {self.csv_path}."
+                    )
             sample_ids = [row["sample_id"] for row in self.rows]
             if self.use_eye_geometry_quality_gate:
                 depth_prior_table.require_present_sample_ids(sample_ids)
             else:
                 depth_prior_table.require_sample_ids(sample_ids)
-        self.depth_prior_table = depth_prior_table if self.use_eye_geometry else None
+            if self.require_depth_uncertainty:
+                depth_prior_table.require_uncertainty_sample_ids(sample_ids)
+            if self.require_pnp_quality:
+                missing_quality = [
+                    sample_id
+                    for sample_id in sample_ids
+                    if sample_id not in depth_prior_table.quality_by_sample_id
+                ]
+                if missing_quality:
+                    raise ValueError(
+                        "Depth-prior CSV has no valid PnP quality for "
+                        f"{len(missing_quality)} required samples."
+                    )
+        self.target_normalizer = target_normalizer
+        if self.target_normalizer is None and fit_target_normalizer:
+            self.target_normalizer = fit_uv_target_normalizer(self.rows)
+        if require_deca_features and not self.uses_deca_features:
+            raise ValueError(
+                "require_deca_features must be False when "
+                "deca_feature_representation='none'."
+            )
+        if require_deca_features and deca_cache_path is None:
+            raise ValueError("require_deca_features=True requires deca_cache_path.")
+        self.deca_cache = (
+            DecaFeatureCache.load(deca_cache_path)
+            if self.uses_deca_features and deca_cache_path is not None
+            else None
+        )
+        if self.deca_cache is not None:
+            self.deca_cache.require_sample_ids(row["sample_id"] for row in self.rows)
+        self.depth_prior_table = (
+            depth_prior_table
+            if self.use_eye_geometry or self.use_gaze_geometry
+            else None
+        )
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> dict[str, object]:
         row = self.rows[index]
+        virtual_record = (
+            self.virtual_camera_manifest.lookup(row["sample_id"])
+            if self.virtual_camera_manifest is not None
+            else None
+        )
+        face_path = (
+            str(virtual_record.face_path)
+            if virtual_record is not None
+            else row["face_path"]
+        )
+        left_eye_path = (
+            str(virtual_record.left_eye_path)
+            if virtual_record is not None
+            else row["left_eye_path"]
+        )
+        right_eye_path = (
+            str(virtual_record.right_eye_path)
+            if virtual_record is not None
+            else row["right_eye_path"]
+        )
 
         face = (
-            self._load_image(row["face_path"], FACE_SIZE)
+            self._load_image(face_path, FACE_SIZE)
             if self.load_face_image
             else None
         )
-        left_eye = self._load_image(row["left_eye_path"], EYE_SIZE)
-        right_eye = self._load_image(row["right_eye_path"], EYE_SIZE)
+        left_eye = self._load_image(left_eye_path, EYE_SIZE)
+        right_eye = self._load_image(right_eye_path, EYE_SIZE)
 
         if face is not None and self.face_transform is not None:
             face = self.face_transform(face)
-        if self.eye_transform is not None:
+        if self.paired_eye_transform is not None:
+            left_eye, right_eye = self.paired_eye_transform(left_eye, right_eye)
+        elif self.eye_transform is not None:
             left_eye = self.eye_transform(left_eye)
             right_eye = self.eye_transform(right_eye)
 
+        # The VGGFace2-pretrained Inception-ResNet uses fixed image
+        # standardization (pixel values mapped from [0, 1] to [-1, 1]).
+        if face is not None:
+            face = self._normalize_image(face, FACENET_MEAN, FACENET_STD)
+        if self.normalize_images:
+            left_eye = self._normalize_image(left_eye)
+            right_eye = self._normalize_image(right_eye)
+
         uv_gt = float_tensor(row, ["uv_gt_u_mm", "uv_gt_v_mm"])
+        scene_vec = build_scene_input_vector(
+            float_tensor(row, SCENE_COLUMNS),
+            self.scene_representation,
+        )
         item: dict[str, object] = {
             "left_eye": left_eye,
             "right_eye": right_eye,
             "crop_cam_vec": float_tensor(row, CROP_CAM_COLUMNS),
-            "scene_vec": build_scene_input_vector(
-                float_tensor(row, SCENE_COLUMNS),
-                self.scene_representation,
-            ),
+            "scene_vec": scene_vec,
             "uv_gt": uv_gt,
             "uv_target": (
                 self.target_normalizer.normalize(uv_gt)
@@ -246,6 +456,9 @@ class ModelV1Dataset(Dataset):
         }
         if face is not None:
             item["face"] = face
+        if virtual_record is not None:
+            item["rotation_n_from_c"] = virtual_record.rotation_n_from_c.clone()
+            item["rotation_c_from_n"] = virtual_record.rotation_c_from_n.clone()
         if self.deca_cache is not None:
             item["deca_feat"] = torch.from_numpy(
                 select_deca_feature_representation(
@@ -253,7 +466,60 @@ class ModelV1Dataset(Dataset):
                     self.deca_feature_representation,
                 ).copy()
             )
-        if self.depth_prior_table is not None:
+        if self.use_gaze_geometry:
+            assert self.depth_prior_table is not None
+            sample_id = row["sample_id"]
+            item["table_frame7"] = scene_vec
+            item["raw_eye_geometry_mm"] = self.depth_prior_table.lookup(
+                sample_id
+            ).clone()
+            if self.use_depth_correction:
+                raw_eyes = item["raw_eye_geometry_mm"]
+                assert torch.is_tensor(raw_eyes)
+                pnp_geometry = build_eye_geometry_vector(
+                    raw_eyes[:3],
+                    raw_eyes[3:],
+                )
+                if self.depth_correction_geometry_normalizer is None:
+                    raise RuntimeError(
+                        "Depth correction requires a training-fitted PnP "
+                        "geometry normalizer."
+                    )
+                item["pnp_geometry_vec"] = (
+                    self.depth_correction_geometry_normalizer.normalize(
+                        pnp_geometry
+                    )
+                )
+            item["gaze_target_camera_mm"] = float_tensor(
+                row,
+                [
+                    "gaze_cam_recomputed_x_mm",
+                    "gaze_cam_recomputed_y_mm",
+                    "gaze_cam_recomputed_z_mm",
+                ],
+            )
+            uncertainty = (
+                self.depth_prior_table.lookup_depth_log_scale_std(sample_id)
+                if self.require_depth_uncertainty
+                else self.depth_prior_table.depth_log_scale_std_by_sample_id.get(
+                    sample_id,
+                    0.0,
+                )
+            )
+            item["depth_log_scale_sigma"] = torch.tensor(
+                [uncertainty],
+                dtype=torch.float32,
+            )
+            if self.require_pnp_quality:
+                quality = self.depth_prior_table.lookup_quality(sample_id).clone()
+                if self.eye_geometry_quality_normalizer is not None:
+                    quality = self.eye_geometry_quality_normalizer.normalize(quality)
+                item["pnp_quality_vec"] = quality
+                item["pnp_confidence"] = torch.tensor(
+                    [self.depth_prior_table.lookup_confidence(sample_id)],
+                    dtype=torch.float32,
+                )
+        elif self.depth_prior_table is not None:
             sample_id = row["sample_id"]
             require_quality = (
                 self.eye_geometry_gate_mode == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
@@ -301,16 +567,16 @@ class ModelV1Dataset(Dataset):
                 item["eye_geometry_quality_vec"] = quality
         if self.return_paths:
             item["paths"] = {
-                "face": row["face_path"],
-                "left_eye": row["left_eye_path"],
-                "right_eye": row["right_eye_path"],
+                "face": face_path,
+                "left_eye": left_eye_path,
+                "right_eye": right_eye_path,
                 "source": row["source_image_path"],
             }
         return item
 
     def _load_image(self, path_text: str, size: tuple[int, int]) -> torch.Tensor:
         path = Path(path_text)
-        if not path.exists():
+        if not path.is_file():
             raise FileNotFoundError(f"Missing image: {path}")
 
         image = Image.open(path).convert("RGB")
@@ -321,11 +587,17 @@ class ModelV1Dataset(Dataset):
         tensor = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
         tensor = tensor.view(height, width, 3).permute(2, 0, 1).float().div(255.0)
 
-        if self.normalize_images:
-            mean = tensor.new_tensor(IMAGENET_MEAN).view(3, 1, 1)
-            std = tensor.new_tensor(IMAGENET_STD).view(3, 1, 1)
-            tensor = (tensor - mean) / std
         return tensor
+
+    @staticmethod
+    def _normalize_image(
+        tensor: torch.Tensor,
+        mean_values: tuple[float, float, float] = IMAGENET_MEAN,
+        std_values: tuple[float, float, float] = IMAGENET_STD,
+    ) -> torch.Tensor:
+        mean = tensor.new_tensor(mean_values).view(3, 1, 1)
+        std = tensor.new_tensor(std_values).view(3, 1, 1)
+        return (tensor - mean) / std
 
     def raw_eye_geometry(self, index: int) -> torch.Tensor:
         if self.depth_prior_table is None:
@@ -338,6 +610,12 @@ class ModelV1Dataset(Dataset):
         return self.depth_prior_table.lookup_quality(
             self.rows[index]["sample_id"]
         ).clone()
+
+    def raw_depth_correction_geometry(self, index: int) -> torch.Tensor:
+        """Return the label-free normalized6d PnP representation before z-score."""
+
+        raw_eyes = self.raw_eye_geometry(index)
+        return build_eye_geometry_vector(raw_eyes[:3], raw_eyes[3:])
 
     def eye_geometry_is_valid(self, index: int) -> bool:
         if self.depth_prior_table is None:
@@ -366,18 +644,28 @@ def build_modelv1_dataloaders(
     pin_memory: bool | None = None,
     normalize_images: bool = True,
     load_face_image: bool = True,
+    train_paired_eye_transform: PairedImageTransform | None = None,
     deca_cache_path: str | Path | None = DEFAULT_DECA_CACHE_PATH,
     require_deca_features: bool = True,
     normalize_uv_targets: bool = True,
     target_normalizer: UVTargetNormalizer | None = None,
     use_eye_geometry: bool = False,
+    use_gaze_geometry: bool = False,
+    require_depth_uncertainty: bool = False,
+    require_pnp_quality: bool = False,
+    use_depth_correction: bool = False,
+    filter_invalid_depth_prior_samples: bool = False,
     depth_prior_csv_path: str | Path | None = DEFAULT_DEPTH_PRIOR_PATH,
     eye_geometry_normalizer: EyeGeometryNormalizer | None = None,
     eye_geometry_gate_mode: str = EYE_GEOMETRY_GATE_NONE,
     eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None = None,
+    depth_correction_geometry_normalizer: EyeGeometryNormalizer | None = None,
     eye_geometry_representation: str = EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D,
     scene_representation: str = SCENE_REPRESENTATION_FULL25,
     deca_feature_representation: str = DECA_FEATURE_REPRESENTATION_FULL236,
+    image_source: str = IMAGE_SOURCE_LEGACY,
+    virtual_camera_manifest_path: str | Path | None = None,
+    filter_invalid_virtual_camera_samples: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """Create train/validation loaders.
 
@@ -385,12 +673,14 @@ def build_modelv1_dataloaders(
     a deterministic random split using ``val_ratio`` and ``split_seed``.
     ``split_mode="dataset_5"`` keeps datasets 3 and 4 for training and
     dataset 5 for validation/test, which separates collection sessions.
+    ``split_mode="explicit_datasets"`` uses ``train_datasets`` and
+    ``val_datasets`` exactly as supplied, enabling arbitrary session holdouts.
     """
 
-    if split_mode not in {"random_80_20", "dataset_5"}:
+    if split_mode not in {"random_80_20", "dataset_5", "explicit_datasets"}:
         raise ValueError(
             f"Unknown split_mode={split_mode!r}; "
-            "expected 'random_80_20' or 'dataset_5'."
+            "expected 'random_80_20', 'dataset_5', or 'explicit_datasets'."
         )
     if not 0.0 < val_ratio < 1.0:
         raise ValueError(f"val_ratio must be between 0 and 1, got {val_ratio}")
@@ -407,19 +697,60 @@ def build_modelv1_dataloaders(
     deca_feature_representation = canonical_deca_feature_representation(
         deca_feature_representation
     )
+    image_source = canonical_image_source(image_source)
+    uses_deca_features = (
+        deca_feature_representation != DECA_FEATURE_REPRESENTATION_NONE
+    )
+    if require_deca_features and not uses_deca_features:
+        raise ValueError(
+            "require_deca_features must be False when "
+            "deca_feature_representation='none'."
+        )
+    if not uses_deca_features:
+        deca_cache_path = None
     if not use_eye_geometry and eye_geometry_gate_mode != EYE_GEOMETRY_GATE_NONE:
         raise ValueError(
             "eye_geometry_gate_mode must be 'none' when use_eye_geometry=False."
         )
+    if use_eye_geometry and use_gaze_geometry:
+        raise ValueError(
+            "use_eye_geometry and use_gaze_geometry cannot both be true."
+        )
+    if use_depth_correction and not use_gaze_geometry:
+        raise ValueError(
+            "use_depth_correction=True requires use_gaze_geometry=True."
+        )
+    if use_depth_correction and not require_pnp_quality:
+        raise ValueError(
+            "use_depth_correction=True requires require_pnp_quality=True."
+        )
     depth_prior_table = None
-    if use_eye_geometry:
+    if use_eye_geometry or use_gaze_geometry:
         if depth_prior_csv_path is None:
             raise ValueError(
                 "use_eye_geometry=True requires depth_prior_csv_path."
             )
         depth_prior_table = DepthPriorTable.load(
             depth_prior_csv_path,
-            eye_geometry_representation,
+            (
+                EYE_GEOMETRY_REPRESENTATION_RAW_EYE6D
+                if use_gaze_geometry
+                else eye_geometry_representation
+            ),
+        )
+    virtual_camera_manifest = None
+    if image_source == IMAGE_SOURCE_VIRTUAL_CAMERA:
+        if virtual_camera_manifest_path is None:
+            raise ValueError(
+                "image_source='virtual_camera' requires "
+                "virtual_camera_manifest_path."
+            )
+        virtual_camera_manifest = VirtualCameraManifest.load(
+            virtual_camera_manifest_path
+        )
+    elif virtual_camera_manifest_path is not None:
+        raise ValueError(
+            "virtual_camera_manifest_path requires image_source='virtual_camera'."
         )
 
     if split_mode == "random_80_20":
@@ -427,16 +758,27 @@ def build_modelv1_dataloaders(
             csv_path,
             datasets=all_datasets,
             normalize_images=normalize_images,
+            paired_eye_transform=train_paired_eye_transform,
             load_face_image=load_face_image,
             deca_cache_path=deca_cache_path,
             require_deca_features=require_deca_features,
             fit_target_normalizer=False,
             use_eye_geometry=use_eye_geometry,
+            use_gaze_geometry=use_gaze_geometry,
+            require_depth_uncertainty=require_depth_uncertainty,
+            require_pnp_quality=require_pnp_quality,
+            use_depth_correction=use_depth_correction,
+            filter_invalid_depth_prior_samples=filter_invalid_depth_prior_samples,
             depth_prior_table=depth_prior_table,
             eye_geometry_gate_mode=eye_geometry_gate_mode,
             eye_geometry_representation=eye_geometry_representation,
             scene_representation=scene_representation,
             deca_feature_representation=deca_feature_representation,
+            image_source=image_source,
+            virtual_camera_manifest=virtual_camera_manifest,
+            filter_invalid_virtual_camera_samples=(
+                filter_invalid_virtual_camera_samples
+            ),
         )
         val_count = int(round(len(all_set) * val_ratio))
         val_count = max(1, min(len(all_set) - 1, val_count))
@@ -456,10 +798,12 @@ def build_modelv1_dataloaders(
                 for index in train_indices
                 if all_set.eye_geometry_is_valid(index)
             ]
-            if use_eye_geometry
+            if use_eye_geometry or require_pnp_quality or use_depth_correction
             else []
         )
-        if use_eye_geometry and not valid_train_indices:
+        if (
+            use_eye_geometry or require_pnp_quality or use_depth_correction
+        ) and not valid_train_indices:
             raise ValueError("Training split has no valid eye geometry.")
         geometry_normalizer = eye_geometry_normalizer
         if use_eye_geometry and geometry_normalizer is None:
@@ -473,9 +817,24 @@ def build_modelv1_dataloaders(
                 )
             )
         all_set.eye_geometry_normalizer = geometry_normalizer
+        correction_normalizer = depth_correction_geometry_normalizer
+        if use_depth_correction and correction_normalizer is None:
+            correction_normalizer = EyeGeometryNormalizer.fit(
+                torch.stack(
+                    [
+                        all_set.raw_depth_correction_geometry(index)
+                        for index in valid_train_indices
+                    ],
+                    dim=0,
+                )
+            )
+        all_set.depth_correction_geometry_normalizer = correction_normalizer
         quality_normalizer = eye_geometry_quality_normalizer
         if (
-            eye_geometry_gate_mode == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+            (
+                eye_geometry_gate_mode == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+                or require_pnp_quality
+            )
             and quality_normalizer is None
         ):
             quality_normalizer = EyeGeometryQualityNormalizer.fit(
@@ -488,38 +847,76 @@ def build_modelv1_dataloaders(
                 )
             )
         all_set.eye_geometry_quality_normalizer = quality_normalizer
+        # A shallow validation view shares immutable rows/caches and fitted
+        # normalizers, but deliberately disables train-only augmentation.
+        val_base_set = copy.copy(all_set)
+        val_base_set.paired_eye_transform = None
         train_set = Subset(all_set, train_indices)
-        val_set = Subset(all_set, val_indices)
+        val_set = Subset(val_base_set, val_indices)
     else:
+        normalized_train_datasets = normalize_dataset_names(train_datasets)
+        normalized_val_datasets = normalize_dataset_names(val_datasets)
+        if not normalized_train_datasets or not normalized_val_datasets:
+            raise ValueError(
+                "Explicit/session holdout splits require non-empty "
+                "train_datasets and val_datasets."
+            )
+        overlap = normalized_train_datasets.intersection(normalized_val_datasets)
+        if overlap:
+            raise ValueError(
+                "Training and validation datasets must be disjoint; overlap: "
+                f"{sorted(overlap)}"
+            )
         train_set = ModelV1Dataset(
             csv_path,
-            datasets=train_datasets,
+            datasets=normalized_train_datasets,
             normalize_images=normalize_images,
+            paired_eye_transform=train_paired_eye_transform,
             load_face_image=load_face_image,
             deca_cache_path=deca_cache_path,
             require_deca_features=require_deca_features,
             fit_target_normalizer=False,
             use_eye_geometry=use_eye_geometry,
+            use_gaze_geometry=use_gaze_geometry,
+            require_depth_uncertainty=require_depth_uncertainty,
+            require_pnp_quality=require_pnp_quality,
+            use_depth_correction=use_depth_correction,
+            filter_invalid_depth_prior_samples=filter_invalid_depth_prior_samples,
             depth_prior_table=depth_prior_table,
             eye_geometry_gate_mode=eye_geometry_gate_mode,
             eye_geometry_representation=eye_geometry_representation,
             scene_representation=scene_representation,
             deca_feature_representation=deca_feature_representation,
+            image_source=image_source,
+            virtual_camera_manifest=virtual_camera_manifest,
+            filter_invalid_virtual_camera_samples=(
+                filter_invalid_virtual_camera_samples
+            ),
         )
         val_set = ModelV1Dataset(
             csv_path,
-            datasets=val_datasets,
+            datasets=normalized_val_datasets,
             normalize_images=normalize_images,
             load_face_image=load_face_image,
             deca_cache_path=deca_cache_path,
             require_deca_features=require_deca_features,
             fit_target_normalizer=False,
             use_eye_geometry=use_eye_geometry,
+            use_gaze_geometry=use_gaze_geometry,
+            require_depth_uncertainty=require_depth_uncertainty,
+            require_pnp_quality=require_pnp_quality,
+            use_depth_correction=use_depth_correction,
+            filter_invalid_depth_prior_samples=filter_invalid_depth_prior_samples,
             depth_prior_table=depth_prior_table,
             eye_geometry_gate_mode=eye_geometry_gate_mode,
             eye_geometry_representation=eye_geometry_representation,
             scene_representation=scene_representation,
             deca_feature_representation=deca_feature_representation,
+            image_source=image_source,
+            virtual_camera_manifest=virtual_camera_manifest,
+            filter_invalid_virtual_camera_samples=(
+                filter_invalid_virtual_camera_samples
+            ),
         )
         normalizer = target_normalizer
         if normalize_uv_targets and normalizer is None:
@@ -532,10 +929,12 @@ def build_modelv1_dataloaders(
                 for index in range(len(train_set))
                 if train_set.eye_geometry_is_valid(index)
             ]
-            if use_eye_geometry
+            if use_eye_geometry or require_pnp_quality or use_depth_correction
             else []
         )
-        if use_eye_geometry and not valid_train_indices:
+        if (
+            use_eye_geometry or require_pnp_quality or use_depth_correction
+        ) and not valid_train_indices:
             raise ValueError("Training split has no valid eye geometry.")
         geometry_normalizer = eye_geometry_normalizer
         if use_eye_geometry and geometry_normalizer is None:
@@ -550,9 +949,25 @@ def build_modelv1_dataloaders(
             )
         train_set.eye_geometry_normalizer = geometry_normalizer
         val_set.eye_geometry_normalizer = geometry_normalizer
+        correction_normalizer = depth_correction_geometry_normalizer
+        if use_depth_correction and correction_normalizer is None:
+            correction_normalizer = EyeGeometryNormalizer.fit(
+                torch.stack(
+                    [
+                        train_set.raw_depth_correction_geometry(index)
+                        for index in valid_train_indices
+                    ],
+                    dim=0,
+                )
+            )
+        train_set.depth_correction_geometry_normalizer = correction_normalizer
+        val_set.depth_correction_geometry_normalizer = correction_normalizer
         quality_normalizer = eye_geometry_quality_normalizer
         if (
-            eye_geometry_gate_mode == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+            (
+                eye_geometry_gate_mode == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+                or require_pnp_quality
+            )
             and quality_normalizer is None
         ):
             quality_normalizer = EyeGeometryQualityNormalizer.fit(
@@ -672,6 +1087,17 @@ def get_eye_geometry_quality_normalizer(
     return base_dataset.eye_geometry_quality_normalizer
 
 
+def get_depth_correction_geometry_normalizer(
+    dataset: Dataset,
+) -> EyeGeometryNormalizer | None:
+    """Return the train-fitted 6D PnP normalizer for DepthCorrectionHead."""
+
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    if not isinstance(base_dataset, ModelV1Dataset):
+        raise TypeError("Expected a ModelV1Dataset or a torch.utils.data.Subset of one.")
+    return base_dataset.depth_correction_geometry_normalizer
+
+
 def normalize_dataset_names(values: Iterable[str] | None) -> set[str] | None:
     if values is None:
         return None
@@ -694,7 +1120,11 @@ def read_rows(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def validate_required_columns(row: dict[str, str]) -> None:
+def validate_required_columns(
+    row: dict[str, str],
+    *,
+    require_gaze_geometry: bool = False,
+) -> None:
     required = [
         "sample_id",
         "dataset",
@@ -712,6 +1142,14 @@ def validate_required_columns(row: dict[str, str]) -> None:
         "table_origin_w_y_mm",
         "table_origin_w_z_mm",
     ]
+    if require_gaze_geometry:
+        required.extend(
+            [
+                "gaze_cam_recomputed_x_mm",
+                "gaze_cam_recomputed_y_mm",
+                "gaze_cam_recomputed_z_mm",
+            ]
+        )
     missing = [
         column
         for column in required + CROP_CAM_COLUMNS + SCENE_COLUMNS

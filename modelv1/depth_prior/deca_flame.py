@@ -135,7 +135,7 @@ def _enable_chumpy_compatibility() -> None:
         inspect.getargspec = getargspec  # type: ignore[attr-defined]
 
 
-def _import_official_deca(deca_root: Path) -> tuple[Any, Any, Any, Any]:
+def _import_official_deca(deca_root: Path) -> tuple[Any, Any, Any]:
     """Import DECA from the repository-local official checkout only."""
 
     decalib_root = deca_root / "decalib"
@@ -151,7 +151,6 @@ def _import_official_deca(deca_root: Path) -> tuple[Any, Any, Any, Any]:
     try:
         from decalib.models.FLAME import FLAME
         from decalib.models.encoders import ResnetEncoder
-        from decalib.utils import util as deca_util
         from decalib.utils.config import get_cfg_defaults
     except ImportError as error:  # pragma: no cover - external dependency
         raise DecaFlameDependencyError(
@@ -159,7 +158,36 @@ def _import_official_deca(deca_root: Path) -> tuple[Any, Any, Any, Any]:
             f"dependencies in DECA-master. Original import error: {error}"
         ) from error
 
-    return ResnetEncoder, FLAME, deca_util, get_cfg_defaults
+    return ResnetEncoder, FLAME, get_cfg_defaults
+
+
+def _copy_matching_state_dict(
+    current_state_dict: Any,
+    pretrained_state_dict: Any,
+) -> int:
+    """Copy matching DECA encoder tensors without importing ``decalib.utils.util``.
+
+    Official DECA's utility module imports SciPy and scikit-image at module
+    import time even though depth-prior generation only needs its small
+    ``copy_state_dict`` helper.  In environments where pip PyTorch bundles one
+    Intel OpenMP runtime and Conda MKL provides another, those unrelated imports
+    initialize both ``libiomp5md.dll`` copies and terminate the process with
+    OMP Error #15.  Keeping the equivalent tensor-copy operation local avoids
+    that binary dependency chain.
+    """
+
+    copied = 0
+    for name, destination in current_state_dict.items():
+        source = pretrained_state_dict.get(name)
+        if source is None or getattr(source, "shape", None) != destination.shape:
+            continue
+        destination.copy_(source)
+        copied += 1
+    if copied == 0:
+        raise ValueError(
+            "No matching DECA encoder tensors were found in checkpoint E_flame."
+        )
+    return copied
 
 
 def _split_deca_parameters(parameters: Any, param_sizes: dict[str, int]) -> dict[str, Any]:
@@ -187,7 +215,7 @@ class DecaFlameExtractor:
     def __init__(self, config: DecaFlameConfig | None = None) -> None:
         self.config = config or DecaFlameConfig()
         torch = _require_torch()
-        ResnetEncoder, FLAME, deca_util, get_cfg_defaults = _import_official_deca(
+        ResnetEncoder, FLAME, get_cfg_defaults = _import_official_deca(
             self.config.deca_root
         )
 
@@ -224,12 +252,20 @@ class DecaFlameExtractor:
             raise KeyError(
                 "The DECA checkpoint does not contain the required 'E_flame' weights."
             )
-        deca_util.copy_state_dict(self.encoder.state_dict(), checkpoint["E_flame"])
+        _copy_matching_state_dict(
+            self.encoder.state_dict(),
+            checkpoint["E_flame"],
+        )
 
         self.encoder.eval()
         self.flame.eval()
 
-    def extract(self, face_images: Any) -> DecaFlameOutput:
+    def extract(
+        self,
+        face_images: Any,
+        *,
+        fixed_shape_params: Any | None = None,
+    ) -> DecaFlameOutput:
         """Return FLAME mesh and landmarks for a batch of RGB face crops.
 
         Args:
@@ -257,6 +293,29 @@ class DecaFlameExtractor:
         with torch.no_grad():
             parameters = self.encoder(images)
             code_dict = _split_deca_parameters(parameters, self._param_sizes)
+            if fixed_shape_params is not None:
+                fixed_shape = torch.as_tensor(
+                    fixed_shape_params,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                shape_dim = self._param_sizes["shape"]
+                if fixed_shape.ndim == 1:
+                    fixed_shape = fixed_shape.unsqueeze(0)
+                if fixed_shape.ndim != 2 or fixed_shape.shape[1] != shape_dim:
+                    raise ValueError(
+                        "fixed_shape_params must have shape "
+                        f"[{shape_dim}] or [B, {shape_dim}], got "
+                        f"{tuple(fixed_shape.shape)}"
+                    )
+                if fixed_shape.shape[0] == 1:
+                    fixed_shape = fixed_shape.expand(images.shape[0], -1)
+                elif fixed_shape.shape[0] != images.shape[0]:
+                    raise ValueError(
+                        "fixed_shape_params batch dimension must be 1 or match "
+                        f"the image batch size {images.shape[0]}."
+                    )
+                code_dict["shape"] = fixed_shape
             vertices, landmarks2d, landmarks3d = self.flame(
                 shape_params=code_dict["shape"],
                 expression_params=code_dict["exp"],

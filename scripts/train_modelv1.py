@@ -1,4 +1,4 @@
-"""Train ModelV1 with offline DECA features and normalized UV targets.
+"""Train legacy direct-UV ModelV1 or V4 gaze-plus-geometry models.
 
 The script owns the complete training lifecycle: deterministic data split,
 model/optimizer/scheduler setup, AMP, validation, W&B and local logging,
@@ -12,7 +12,10 @@ import copy
 import csv
 import json
 import logging
+import math
+import os
 import random
+import shutil
 import sys
 import time
 from contextlib import nullcontext
@@ -29,13 +32,29 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from modelv1 import ModelV1, ModelV1Config, UVLossConfig, UVRegressionLoss
+from modelv1 import (
+    GazeGeometryLoss,
+    GazeGeometryLossConfig,
+    ModelV1,
+    ModelV1Config,
+    UVLossConfig,
+    UVRegressionLoss,
+)
+from modelv1.losses import compute_uv_metrics_mm
 from modelv1.deca_cache import DecaFeatureCache
+from modelv1.processed_artifacts import processed_dataset_artifacts
 from modelv1.data import (
+    EyeAppearanceAugmentationConfig,
+    IMAGE_SOURCE_LEGACY,
+    IMAGE_SOURCE_VIRTUAL_CAMERA,
+    PairedEyeAppearanceAugmentation,
     build_modelv1_dataloaders,
+    get_depth_correction_geometry_normalizer,
     get_eye_geometry_normalizer,
     get_eye_geometry_quality_normalizer,
     get_uv_target_normalizer,
+    canonical_image_source,
+    merge_virtual_camera_manifests,
 )
 from modelv1.data.normalization import (
     EyeGeometryNormalizer,
@@ -56,12 +75,23 @@ from modelv1.geometry_gate import (
 )
 from modelv1.deca_cache import (
     DECA_FEATURE_REPRESENTATION_FULL236,
+    DECA_FEATURE_REPRESENTATION_NONE,
     canonical_deca_feature_representation,
     deca_feature_representation_dim,
 )
 from modelv1.model import (
     DECA_BRANCH_MODE_FACTORIZED_GEOMETRY,
+    FACE_IMAGE_BACKBONE,
+    FACE_IMAGE_PRETRAINED_DATASET,
+    GAZE_PREDICTION_FRAME_CAMERA,
+    GAZE_PREDICTION_FRAME_VIRTUAL_CAMERA,
+    PREDICTION_MODE_GAZE_GEOMETRY,
     canonical_deca_branch_mode,
+    canonical_gaze_prediction_frame,
+)
+from modelv1.depth_distribution import (
+    DEPTH_DISTRIBUTION_LEARNED_REWEIGHT,
+    DEPTH_DISTRIBUTION_POINT,
 )
 from modelv1.data.depth_prior import (
     EYE_GEOMETRY_REPRESENTATION_NORMALIZED6D,
@@ -76,31 +106,127 @@ from modelv1.scene import (
 
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "modelv1" / "train_random_80_20_100.yaml"
-METRIC_NAMES = ("epe_mm", "median_epe_mm", "mae_u_mm", "mae_v_mm")
-METRIC_FIELDS = [
-    "epoch",
-    "global_step",
-    "lr",
-    "train_loss",
-    *(f"train_{name}" for name in METRIC_NAMES),
-    "train_seconds",
-    "train_samples_per_second",
-    "val_loss",
-    *(f"val_{name}" for name in METRIC_NAMES),
-    "val_seconds",
-    "val_samples_per_second",
-    "epoch_seconds",
-    "elapsed_seconds",
-    "best_val_epe_mm",
-]
+BASE_METRIC_NAMES = ("epe_mm", "median_epe_mm", "mae_u_mm", "mae_v_mm")
+V4_GEOMETRY_METRIC_NAMES = (
+    "physical_valid_rate",
+    "mean_lambda_mm",
+    "behind_ray_rate",
+    "parallel_ray_rate",
+    "gaze_axis_error_deg",
+    "directed_gaze_error_deg",
+)
+V4_LOSS_METRIC_NAMES = (
+    "pseudo_gaze_cosine_loss",
+    "weighted_pseudo_gaze_loss",
+    "uv_gaussian_nll",
+    "weighted_uv_gaussian_nll",
+)
+DEPTH_CORRECTION_METRIC_NAMES = (
+    "depth_shared_scale_mean",
+    "depth_log_correction_abs_mean",
+)
 TUPLE_CONFIG_KEYS = (
     "deca_factor_hidden_dims",
     "face_hidden_dims",
-    "visual_fusion_hidden_dims",
     "crop_cam_hidden_dims",
     "scene_hidden_dims",
     "fusion_hidden_dims",
+    "depth_reweighter_hidden_dims",
+    "depth_correction_hidden_dims",
 )
+EYE_BACKBONE_TRAIN_FROM_STAGES = (
+    "stem",
+    "layer1",
+    "layer2",
+    "layer3",
+    "layer4",
+)
+
+
+def metric_names_for_model(
+    config: ModelV1Config,
+    loss_config: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    if config.prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY:
+        names = (*BASE_METRIC_NAMES, *V4_GEOMETRY_METRIC_NAMES)
+        if config.use_depth_correction:
+            names = (*names, *DEPTH_CORRECTION_METRIC_NAMES)
+        if loss_config is not None and (
+            float(loss_config.get("gaze_angular_weight", 0.0)) > 0
+            or float(loss_config.get("uv_gaussian_nll_weight", 0.0)) > 0
+        ):
+            names = (*names, *V4_LOSS_METRIC_NAMES)
+        return names
+    return BASE_METRIC_NAMES
+
+
+def _split_identity(values: Any, fallback: str) -> str:
+    if not isinstance(values, (list, tuple)):
+        return fallback
+    normalized = [str(value).strip() for value in values if str(value).strip()]
+    return "_".join(normalized) if normalized else fallback
+
+
+def apply_numbered_experiment_identity(config: dict[str, Any]) -> None:
+    """Derive a unique run name and W&B metadata from numbered data splits."""
+
+    data_config = config["data"]
+    experiment_config = config["experiment"]
+    if not data_config.get("dataset_ids") or not bool(
+        experiment_config.get("auto_experiment_identity", True)
+    ):
+        return
+    train_id = _split_identity(data_config.get("train_datasets"), "random_train")
+    val_id = _split_identity(data_config.get("val_datasets"), "random_val")
+    prediction_mode = str(config["model"].get("prediction_mode", "direct_uv"))
+    model_stage = "v4" if prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY else prediction_mode
+    prior_kind = str(data_config.get("depth_prior_kind", "none")).lower()
+    depth_mode = str(config["model"].get("depth_distribution_mode", "point")).lower()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_stem = (
+        f"numbered_train{train_id}_val{val_id}_{model_stage}_{prior_kind}_{depth_mode}"
+    )
+    experiment_config["run_name"] = f"{run_stem}_{timestamp}"
+    experiment_config["description"] = (
+        f"Auto-generated numbered-artifact split: train={train_id}, val={val_id}, "
+        f"prior={prior_kind}, depth_mode={depth_mode}."
+    )
+    wandb_config = config["logging"]["wandb"]
+    wandb_config["project"] = str(
+        experiment_config.get("numbered_wandb_project", "ModelV1_numbered_V4")
+    )
+    wandb_config["tags"] = [
+        "ModelV1",
+        model_stage,
+        "numbered_artifacts",
+        prediction_mode,
+        prior_kind,
+        f"depth_{depth_mode}",
+        f"train_dataset_{train_id}",
+        f"val_dataset_{val_id}",
+        f"datasets_{_split_identity(data_config.get('dataset_ids'), 'unknown')}",
+        "imagenet_resnet18",
+        "eye_augmentation",
+    ]
+
+
+def metric_fields(metric_names: tuple[str, ...]) -> list[str]:
+    return [
+        "epoch",
+        "global_step",
+        "lr",
+        "train_loss",
+        *(f"train_{name}" for name in metric_names),
+        "train_seconds",
+        "train_samples_per_second",
+        "val_loss",
+        *(f"val_{name}" for name in metric_names),
+        "val_seconds",
+        "val_samples_per_second",
+        "epoch_seconds",
+        "elapsed_seconds",
+        "best_val_epe_mm",
+    ]
 
 
 def parse_args() -> argparse.Namespace:
@@ -257,7 +383,12 @@ def validate_config(config: Mapping[str, Any]) -> None:
         )
     if int(config["model"].get("eye_geometry_quality_dim", 4)) != 4:
         raise ValueError("model.eye_geometry_quality_dim must be 4 for V2.2.")
-    if use_eye_geometry and not config["data"].get("depth_prior_csv_path"):
+    has_numbered_dataset_ids = bool(config["data"].get("dataset_ids"))
+    if (
+        use_eye_geometry
+        and not has_numbered_dataset_ids
+        and not config["data"].get("depth_prior_csv_path")
+    ):
         raise ValueError(
             "data.depth_prior_csv_path is required when model.use_eye_geometry=true."
         )
@@ -266,11 +397,430 @@ def validate_config(config: Mapping[str, Any]) -> None:
     )
     if gate_regularization_weight < 0:
         raise ValueError("loss.gate_regularization_weight must be non-negative.")
+    prediction_mode = str(
+        config["model"].get("prediction_mode", "direct_uv")
+    ).strip().lower()
+    image_source = canonical_image_source(
+        config["data"].get("image_source", IMAGE_SOURCE_LEGACY)
+    )
+    gaze_prediction_frame = canonical_gaze_prediction_frame(
+        config["model"].get(
+            "gaze_prediction_frame",
+            GAZE_PREDICTION_FRAME_CAMERA,
+        )
+    )
+    virtual_manifest_path = config["data"].get("virtual_camera_manifest_path")
+    virtual_manifest_paths = config["data"].get("virtual_camera_manifest_paths")
+    if virtual_manifest_path and virtual_manifest_paths:
+        raise ValueError(
+            "Use either data.virtual_camera_manifest_path or "
+            "data.virtual_camera_manifest_paths, not both."
+        )
+    if virtual_manifest_paths is not None and (
+        not isinstance(virtual_manifest_paths, (list, tuple))
+        or not virtual_manifest_paths
+        or not all(str(path).strip() for path in virtual_manifest_paths)
+    ):
+        raise ValueError(
+            "data.virtual_camera_manifest_paths must be a non-empty YAML list."
+        )
+    if (
+        image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
+        and not virtual_manifest_path
+        and not virtual_manifest_paths
+    ):
+        raise ValueError(
+            "data.virtual_camera_manifest_path or "
+            "data.virtual_camera_manifest_paths is required when "
+            "data.image_source='virtual_camera'."
+        )
+    if image_source == IMAGE_SOURCE_LEGACY and (
+        virtual_manifest_path or virtual_manifest_paths
+    ):
+        raise ValueError(
+            "Virtual-camera manifest options require "
+            "data.image_source='virtual_camera'."
+        )
+    if prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY:
+        if (
+            image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
+            and gaze_prediction_frame
+            != GAZE_PREDICTION_FRAME_VIRTUAL_CAMERA
+        ):
+            raise ValueError(
+                "Virtual-camera images in gaze_geometry mode require "
+                "model.gaze_prediction_frame='virtual_camera'."
+            )
+        if (
+            gaze_prediction_frame == GAZE_PREDICTION_FRAME_VIRTUAL_CAMERA
+            and image_source != IMAGE_SOURCE_VIRTUAL_CAMERA
+        ):
+            raise ValueError(
+                "model.gaze_prediction_frame='virtual_camera' requires "
+                "data.image_source='virtual_camera'."
+            )
+    if (
+        prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY
+        and not has_numbered_dataset_ids
+        and not config["data"].get("depth_prior_csv_path")
+    ):
+        raise ValueError(
+            "data.depth_prior_csv_path is required for gaze_geometry mode."
+        )
+    trainable_components = str(
+        config["training"].get("trainable_components", "all")
+    ).strip().lower()
+    if trainable_components not in {
+        "all",
+        "gaze_model",
+        "depth_reweighter",
+        "depth_correction",
+    }:
+        raise ValueError(
+            "training.trainable_components must be all, gaze_model, "
+            "depth_reweighter, or depth_correction."
+        )
+    use_depth_correction = bool(
+        config["model"].get("use_depth_correction", False)
+    )
+    if trainable_components == "depth_correction" and not use_depth_correction:
+        raise ValueError(
+            "training.trainable_components='depth_correction' requires "
+            "model.use_depth_correction=true."
+        )
+    depth_correction_prior_weight = float(
+        config["loss"].get("depth_correction_prior_weight", 0.0)
+    )
+    if depth_correction_prior_weight < 0:
+        raise ValueError(
+            "loss.depth_correction_prior_weight must be non-negative."
+        )
+    if depth_correction_prior_weight > 0 and not use_depth_correction:
+        raise ValueError(
+            "loss.depth_correction_prior_weight requires "
+            "model.use_depth_correction=true."
+        )
+    make_eye_appearance_augmentation(config["data"])
+    validate_eye_backbone_schedule(config["training"], config["model"])
+
+
+def make_eye_appearance_augmentation(
+    data_config: Mapping[str, Any],
+) -> PairedEyeAppearanceAugmentation | None:
+    section = data_config.get("eye_augmentation")
+    if section is None:
+        return None
+    if not isinstance(section, Mapping):
+        raise ValueError("data.eye_augmentation must be a mapping.")
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("data.eye_augmentation.enabled must be true or false.")
+    if not enabled:
+        return None
+    required = (
+        "photometric_probability",
+        "brightness_min",
+        "brightness_max",
+        "contrast_min",
+        "contrast_max",
+        "gamma_min",
+        "gamma_max",
+        "blur_probability",
+        "blur_kernel_size",
+        "blur_sigma_min",
+        "blur_sigma_max",
+        "noise_probability",
+        "noise_std_max",
+        "occlusion_probability",
+        "occlusion_area_min",
+        "occlusion_area_max",
+        "occlusion_aspect_min",
+        "occlusion_aspect_max",
+    )
+    missing = [key for key in required if key not in section]
+    if missing:
+        raise ValueError(
+            "Enabled data.eye_augmentation is missing keys: "
+            f"{missing}."
+        )
+    values = {key: section[key] for key in required}
+    values["blur_kernel_size"] = int(values["blur_kernel_size"])
+    augmentation_config = EyeAppearanceAugmentationConfig(**values)
+    return PairedEyeAppearanceAugmentation(augmentation_config)
+
+
+def validate_eye_backbone_schedule(
+    training_config: Mapping[str, Any],
+    model_config: Mapping[str, Any],
+) -> None:
+    section = training_config.get("eye_backbone_schedule")
+    if section is None:
+        return
+    if not isinstance(section, Mapping):
+        raise ValueError("training.eye_backbone_schedule must be a mapping.")
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "training.eye_backbone_schedule.enabled must be true or false."
+        )
+    if not enabled:
+        return
+    required = ("frozen_epochs", "unfreeze_from", "lr_multiplier")
+    missing = [key for key in required if key not in section]
+    if missing:
+        raise ValueError(
+            "Enabled training.eye_backbone_schedule is missing keys: "
+            f"{missing}."
+        )
+    frozen_epochs = int(section["frozen_epochs"])
+    if frozen_epochs < 0:
+        raise ValueError("eye_backbone_schedule.frozen_epochs must be non-negative.")
+    unfreeze_from = str(section["unfreeze_from"]).strip().lower()
+    if unfreeze_from not in EYE_BACKBONE_TRAIN_FROM_STAGES:
+        raise ValueError(
+            "eye_backbone_schedule.unfreeze_from must be one of "
+            f"{EYE_BACKBONE_TRAIN_FROM_STAGES}, got {unfreeze_from!r}."
+        )
+    lr_multiplier = float(section["lr_multiplier"])
+    if not 0 < lr_multiplier <= 1:
+        raise ValueError(
+            "eye_backbone_schedule.lr_multiplier must lie in (0, 1]."
+        )
+    if str(training_config.get("trainable_components", "all")).lower() in {
+        "depth_reweighter",
+        "depth_correction",
+    }:
+        raise ValueError(
+            "Eye-backbone scheduling must be disabled while training only the "
+            "depth reweighter or depth correction head."
+        )
+    backbone = str(model_config.get("eye_backbone", "resnet18")).lower()
+    if not backbone.startswith("resnet"):
+        raise ValueError(
+            "Eye-backbone scheduling requires a ResNet eye backbone, got "
+            f"{backbone!r}."
+        )
 
 
 def resolve_project_path(value: str | Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _read_csv_records(path: Path) -> tuple[list[dict[str, str]], list[str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header: {path}")
+        return list(reader), list(reader.fieldnames)
+
+
+def _merge_csv_files(paths: list[Path], output: Path, *, label: str) -> Path:
+    """Merge records and reject duplicate sample IDs early.
+
+    Dataset CSVs must retain an identical schema.  Numbered depth-prior CSVs
+    may legitimately span preprocessing revisions, for example after adding
+    per-sample depth uncertainty.  Those are merged using the ordered union of
+    columns; absent fields are written as empty and are later treated as
+    unavailable by :class:`DepthPriorTable`.
+    """
+
+    expected_fields: list[str] | None = None
+    seen_ids: set[str] = set()
+    merged: list[dict[str, str]] = []
+    for path in paths:
+        rows, fields = _read_csv_records(path)
+        if "sample_id" not in fields:
+            raise ValueError(f"{label} CSV has no sample_id column: {path}")
+        if expected_fields is None:
+            expected_fields = fields
+        elif fields != expected_fields:
+            if label != "depth-prior":
+                raise ValueError(
+                    f"Cannot merge {label} CSV files with different columns: "
+                    f"{paths[0]} and {path}"
+                )
+            expected_fields.extend(
+                field for field in fields if field not in expected_fields
+            )
+        for row in rows:
+            sample_id = row["sample_id"]
+            if sample_id in seen_ids:
+                raise ValueError(
+                    f"Duplicate sample_id={sample_id!r} while merging {label} files."
+                )
+            seen_ids.add(sample_id)
+            merged.append(row)
+    assert expected_fields is not None
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=expected_fields)
+        writer.writeheader()
+        writer.writerows(merged)
+    return output
+
+
+def _merge_deca_caches(paths: list[Path], output: Path) -> Path:
+    """Create a run-local, auditable union of independently cached datasets."""
+
+    caches = [DecaFeatureCache.load(path) for path in paths]
+    base_metadata = dict(caches[0].metadata)
+    for cache in caches[1:]:
+        for key in ("face_preprocess", "deca_crop_scale"):
+            if cache.metadata.get(key) != base_metadata.get(key):
+                raise ValueError(
+                    f"Cannot merge DECA caches with different {key}: "
+                    f"{paths[0]} and {cache.path}"
+                )
+    sample_ids = [sample_id for cache in caches for sample_id in cache.sample_ids]
+    if len(sample_ids) != len(set(sample_ids)):
+        raise ValueError("Duplicate sample_id values while merging DECA caches.")
+    metadata = dict(base_metadata)
+    metadata["merged_from"] = [str(path) for path in paths]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output,
+        deca_feat=np.concatenate([cache.features for cache in caches], axis=0),
+        sample_id=np.asarray(sample_ids),
+        image_sha256=np.asarray(
+            [digest for cache in caches for digest in cache.image_sha256]
+        ),
+        metadata_json=json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+    )
+    return output
+
+
+def resolve_numbered_dataset_artifacts(
+    data_config: Mapping[str, Any],
+    run_dir: Path,
+    *,
+    require_deca_features: bool,
+    require_depth_prior: bool,
+) -> tuple[Path, Path | None, Path | None]:
+    """Resolve ``data.dataset_ids`` into one or several numbered artifacts.
+
+    A single ID is used directly.  Multiple IDs are merged under the run
+    directory, so the exact data union is retained with the experiment instead
+    of creating or mutating a global combined CSV/cache.
+    """
+
+    raw_ids = data_config.get("dataset_ids")
+    if raw_ids is None:
+        dataset_csv = resolve_project_path(data_config["csv_path"])
+        deca_cache = (
+            resolve_project_path(data_config["deca_cache_path"])
+            if require_deca_features
+            else None
+        )
+        depth_prior = (
+            resolve_project_path(data_config["depth_prior_csv_path"])
+            if require_depth_prior
+            else None
+        )
+        return dataset_csv, deca_cache, depth_prior
+    if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+        raise ValueError("data.dataset_ids must be a non-empty YAML list when provided.")
+    processed_dir = resolve_project_path(
+        data_config.get("processed_data_dir", "data/processed")
+    )
+    artifacts = [processed_dataset_artifacts(value, processed_dir) for value in raw_ids]
+    # Iris/PnP geometry training must not load rows whose depth reconstruction
+    # failed.  The end-to-end preparation workflow writes this filtered CSV.
+    use_trainable_depth_subset = bool(
+        data_config.get("use_trainable_depth_subset", require_depth_prior)
+    )
+    dataset_paths = [
+        item.common_depth_prior_dataset_csv
+        if use_trainable_depth_subset
+        else item.dataset_csv
+        for item in artifacts
+    ]
+    deca_paths = [item.deca_cache for item in artifacts]
+    prior_kind = str(data_config.get("depth_prior_kind", "iris_ipd_65mm")).strip().lower()
+    if prior_kind not in {"iris_ipd_65mm", "pnp1010"}:
+        raise ValueError(
+            "data.depth_prior_kind must be 'iris_ipd_65mm' or 'pnp1010'."
+        )
+    prior_paths = [
+        item.iris_ipd_depth_prior if prior_kind == "iris_ipd_65mm" else item.pnp_depth_prior
+        for item in artifacts
+    ]
+    required_paths = [
+        *dataset_paths,
+        *(deca_paths if require_deca_features else []),
+        *(prior_paths if require_depth_prior else []),
+    ]
+    missing = [path for path in required_paths if not path.is_file()]
+    if missing:
+        preview = "\n  ".join(str(path) for path in missing)
+        raise FileNotFoundError(f"Missing numbered processed artifact(s):\n  {preview}")
+    if len(artifacts) == 1:
+        return (
+            dataset_paths[0],
+            deca_paths[0] if require_deca_features else None,
+            prior_paths[0] if require_depth_prior else None,
+        )
+
+    merged_dir = run_dir / "resolved_numbered_data"
+    dataset_csv = _merge_csv_files(dataset_paths, merged_dir / "dataset.csv", label="dataset")
+    deca_cache = (
+        _merge_deca_caches(deca_paths, merged_dir / "deca_features.npz")
+        if require_deca_features
+        else None
+    )
+    depth_prior = (
+        _merge_csv_files(prior_paths, merged_dir / "depth_prior.csv", label="depth-prior")
+        if require_depth_prior
+        else None
+    )
+    (merged_dir / "sources.json").write_text(
+        json.dumps(
+            {
+                "dataset_ids": [item.dataset_id for item in artifacts],
+                "use_trainable_depth_subset": use_trainable_depth_subset,
+                "dataset_csvs": [str(path) for path in dataset_paths],
+                "deca_caches": (
+                    [str(path) for path in deca_paths]
+                    if require_deca_features
+                    else []
+                ),
+                "depth_prior_kind": prior_kind if require_depth_prior else None,
+                "depth_prior_csvs": [str(path) for path in prior_paths]
+                if require_depth_prior
+                else [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return dataset_csv, deca_cache, depth_prior
+
+
+def resolve_virtual_camera_manifest_path(
+    data_config: Mapping[str, Any],
+    run_dir: Path,
+) -> Path | None:
+    """Resolve one manifest or merge configured manifests inside ``run_dir``."""
+
+    singular = data_config.get("virtual_camera_manifest_path")
+    plural = data_config.get("virtual_camera_manifest_paths")
+    if singular and plural:
+        raise ValueError(
+            "Use either virtual_camera_manifest_path or "
+            "virtual_camera_manifest_paths, not both."
+        )
+    if singular is not None:
+        return resolve_project_path(singular)
+    if plural is None:
+        return None
+    if not isinstance(plural, (list, tuple)) or not plural:
+        raise ValueError("virtual_camera_manifest_paths must be a non-empty list.")
+    source_paths = [resolve_project_path(path) for path in plural]
+    if len(source_paths) == 1:
+        return source_paths[0]
+    merged_path = run_dir / "resolved_virtual_camera" / "manifest.csv"
+    return merge_virtual_camera_manifests(source_paths, merged_path)
 
 
 def validate_deca_cache_preprocess(
@@ -346,24 +896,25 @@ def save_config(config: Mapping[str, Any], run_dir: Path) -> None:
 
 
 class MetricsCsvWriter:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, metric_names: tuple[str, ...]) -> None:
+        self.fields = metric_fields(metric_names)
         exists = path.exists() and path.stat().st_size > 0
         if exists:
             with path.open("r", encoding="utf-8", newline="") as existing_handle:
                 existing_fields = next(csv.reader(existing_handle), [])
-            if existing_fields != METRIC_FIELDS:
+            if existing_fields != self.fields:
                 raise ValueError(
                     f"Existing metrics file uses a different schema: {path}. "
                     "Start a new run instead of resuming this run."
                 )
         self.handle = path.open("a", encoding="utf-8", newline="")
-        self.writer = csv.DictWriter(self.handle, fieldnames=METRIC_FIELDS)
+        self.writer = csv.DictWriter(self.handle, fieldnames=self.fields)
         if not exists:
             self.writer.writeheader()
             self.handle.flush()
 
     def write(self, metrics: Mapping[str, float | int]) -> None:
-        self.writer.writerow({key: metrics[key] for key in METRIC_FIELDS})
+        self.writer.writerow({key: metrics[key] for key in self.fields})
         self.handle.flush()
 
     def close(self) -> None:
@@ -381,6 +932,7 @@ class NoOpTracker:
 def start_tracker(
     config: Mapping[str, Any],
     run_dir: Path,
+    metric_names: tuple[str, ...],
     static_metadata: Mapping[str, Any] | None = None,
 ) -> Any:
     wandb_config = config["logging"]["wandb"]
@@ -409,10 +961,17 @@ def start_tracker(
     run.define_metric("epoch")
     for split in ("train", "val"):
         run.define_metric(f"{split}/loss", step_metric="epoch", summary="min")
-        run.define_metric(f"{split}/epe_mm", step_metric="epoch", summary="min")
-        run.define_metric(f"{split}/median_epe_mm", step_metric="epoch", summary="min")
-        run.define_metric(f"{split}/mae_u_mm", step_metric="epoch", summary="min")
-        run.define_metric(f"{split}/mae_v_mm", step_metric="epoch", summary="min")
+        for name in metric_names:
+            summary = (
+                "max"
+                if name in {"physical_valid_rate", "mean_lambda_mm"}
+                else "min"
+            )
+            run.define_metric(
+                f"{split}/{name}",
+                step_metric="epoch",
+                summary=summary,
+            )
     run.define_metric("checkpoint/best_val_epe_mm", step_metric="epoch", summary="min")
     return run
 
@@ -444,6 +1003,177 @@ def make_model_config(section: Mapping[str, Any]) -> ModelV1Config:
     return ModelV1Config(**values)
 
 
+def configure_trainable_components(model: ModelV1, mode: str) -> None:
+    """Apply the explicit V4 stage policy before optimizer construction."""
+
+    mode = str(mode).strip().lower()
+    model._trainable_components = mode
+    if mode == "all":
+        return
+    if mode == "gaze_model":
+        if model.depth_reweighter is not None:
+            for parameter in model.depth_reweighter.parameters():
+                parameter.requires_grad_(False)
+        if model.depth_correction_head is not None:
+            for parameter in model.depth_correction_head.parameters():
+                parameter.requires_grad_(False)
+        return
+    if mode == "depth_reweighter":
+        if model.depth_reweighter is None:
+            raise ValueError(
+                "depth_reweighter stage requires depth_distribution_mode="
+                "'learned_reweight'."
+            )
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.depth_reweighter.parameters():
+            parameter.requires_grad_(True)
+        return
+    if mode == "depth_correction":
+        if model.depth_correction_head is None:
+            raise ValueError(
+                "depth_correction stage requires model.use_depth_correction=true."
+            )
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in model.depth_correction_head.parameters():
+            parameter.requires_grad_(True)
+        return
+    raise ValueError(f"Unknown trainable_components={mode!r}.")
+
+
+def enabled_eye_backbone_schedule(
+    training_config: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    section = training_config.get("eye_backbone_schedule")
+    if isinstance(section, Mapping) and bool(section.get("enabled", False)):
+        return section
+    return None
+
+
+def apply_eye_backbone_schedule(
+    model: ModelV1,
+    training_config: Mapping[str, Any],
+    epoch: int,
+) -> str | None:
+    """Apply the configured freeze boundary and describe a state transition."""
+
+    section = enabled_eye_backbone_schedule(training_config)
+    if section is None:
+        return None
+    frozen_epochs = int(section["frozen_epochs"])
+    target = (
+        None
+        if epoch <= frozen_epochs
+        else str(section["unfreeze_from"]).strip().lower()
+    )
+    encoders = model.eye_resnet_encoders()
+    previous = tuple(encoder.backbone_train_from for encoder in encoders)
+    if previous and all(value == target for value in previous):
+        return None
+    model.set_eye_backbone_train_from(target)
+    state = "fully frozen" if target is None else f"trainable from {target}"
+    return f"epoch={epoch} eye ResNet backbone is now {state}"
+
+
+def optimizer_parameter_groups(
+    model: ModelV1,
+    training_config: Mapping[str, Any],
+) -> list[dict[str, object]] | list[nn.Parameter]:
+    """Build stable parameter groups, including later-unfrozen backbone tensors."""
+
+    section = enabled_eye_backbone_schedule(training_config)
+    if section is None:
+        return [parameter for parameter in model.parameters() if parameter.requires_grad]
+    backbone_parameters = model.eye_backbone_parameters()
+    if not backbone_parameters:
+        raise ValueError("Enabled eye-backbone schedule found no ResNet parameters.")
+    backbone_ids = {id(parameter) for parameter in backbone_parameters}
+    non_backbone_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in backbone_ids
+    ]
+    if not non_backbone_parameters:
+        raise ValueError("Eye-backbone schedule found no trainable non-backbone parameters.")
+    base_lr = float(training_config["optimizer"]["lr"])
+    return [
+        {
+            "params": non_backbone_parameters,
+            "lr": base_lr,
+            "group_name": "gaze_and_fusion",
+        },
+        {
+            "params": list(backbone_parameters),
+            "lr": base_lr * float(section["lr_multiplier"]),
+            "group_name": "eye_resnet_backbone",
+        },
+    ]
+
+
+def build_training_scheduler(
+    optimizer: torch.optim.Optimizer,
+    training_config: Mapping[str, Any],
+) -> torch.optim.lr_scheduler.LRScheduler:
+    scheduler_config = training_config["scheduler"]
+    if scheduler_config["name"].lower() != "cosine":
+        raise ValueError("Only cosine scheduler is supported by the V1 training config.")
+    epochs = int(training_config["epochs"])
+    eta_min = float(scheduler_config["eta_min"])
+    if enabled_eye_backbone_schedule(training_config) is None:
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=epochs,
+            eta_min=eta_min,
+        )
+
+    # A shared multiplicative cosine preserves the confirmed 0.1 backbone LR
+    # ratio all the way to eta_min; CosineAnnealingLR accepts only one absolute
+    # eta_min and would otherwise destroy that ratio near the end of training.
+    base_lr = float(training_config["optimizer"]["lr"])
+    eta_ratio = eta_min / base_lr
+
+    def cosine_multiplier(step: int) -> float:
+        progress = min(max(step, 0), epochs) / epochs
+        return eta_ratio + (1.0 - eta_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=[cosine_multiplier for _ in optimizer.param_groups],
+    )
+
+
+def initialize_compatible_model_weights(
+    model: ModelV1,
+    checkpoint_path: Path,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Load shape-compatible weights for point -> prior -> reweight stages."""
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state = checkpoint.get("model", checkpoint)
+    if not isinstance(state, Mapping):
+        raise ValueError(
+            f"Initialization checkpoint has no model state: {checkpoint_path}"
+        )
+    current = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in state.items()
+        if key in current
+        and torch.is_tensor(value)
+        and current[key].shape == value.shape
+    }
+    if not compatible:
+        raise ValueError(
+            f"No shape-compatible weights found in {checkpoint_path}."
+        )
+    model.load_state_dict(compatible, strict=False)
+    return len(compatible), len(current) - len(compatible)
+
+
 def move_batch_to_device(batch: Mapping[str, object], device: torch.device) -> dict[str, object]:
     return {
         key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
@@ -461,7 +1191,7 @@ def run_epoch(
     *,
     model: nn.Module,
     loader: Any,
-    criterion: UVRegressionLoss,
+    criterion: nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
     scaler: torch.cuda.amp.GradScaler,
@@ -471,11 +1201,42 @@ def run_epoch(
 ) -> tuple[dict[str, float], int]:
     is_train = optimizer is not None
     model.train(is_train)
+    if (
+        is_train
+        and getattr(model, "_trainable_components", "all")
+        in {"depth_reweighter", "depth_correction"}
+    ):
+        # Frozen gaze features must be deterministic: keep their BatchNorm
+        # running statistics and dropout state fixed while training the scorer.
+        model.eval()
+        component = getattr(model, "_trainable_components")
+        trainable_module = (
+            getattr(model, "depth_reweighter", None)
+            if component == "depth_reweighter"
+            else getattr(model, "depth_correction_head", None)
+        )
+        if trainable_module is None:
+            raise RuntimeError(
+                f"Frozen-gaze stage has no module for {component!r}."
+            )
+        trainable_module.train()
     start = time.perf_counter()
     total_loss = 0.0
     sample_count = 0
     predictions: list[Tensor] = []
     targets_mm: list[Tensor] = []
+    geometry_metric_sums = {
+        name: 0.0 for name in V4_GEOMETRY_METRIC_NAMES
+    }
+    if getattr(getattr(model, "config", None), "use_depth_correction", False):
+        geometry_metric_sums.update(
+            {name: 0.0 for name in DEPTH_CORRECTION_METRIC_NAMES}
+        )
+    v4_loss_metric_sums = {
+        name: 0.0 for name in V4_LOSS_METRIC_NAMES
+    }
+    optimizer_steps = 0
+    optimizer_skipped_steps = 0
 
     for batch in loader:
         device_batch = move_batch_to_device(batch, device)
@@ -493,11 +1254,108 @@ def run_epoch(
                     device_batch,
                     return_features=use_gate_regularization,
                 )
-                if isinstance(model_output, dict):
-                    uv_pred = model_output["uv"]
+                if isinstance(criterion, GazeGeometryLoss):
+                    if not isinstance(model_output, Mapping):
+                        raise TypeError("V4 model must return a geometry output mapping.")
+                    loss_outputs = criterion(model_output, device_batch)
+                    loss = loss_outputs["loss"]
+                    uv_pred_mm = model_output["uv_mean_mm"]
+                    pseudo_gaze_cosine_loss = loss_outputs["gaze_angular"]
+                    v4_loss_metric_sums["pseudo_gaze_cosine_loss"] += (
+                        float(pseudo_gaze_cosine_loss) * batch_size
+                    )
+                    v4_loss_metric_sums["weighted_pseudo_gaze_loss"] += (
+                        float(pseudo_gaze_cosine_loss)
+                        * criterion.config.gaze_angular_weight
+                        * batch_size
+                    )
+                    uv_gaussian_nll = loss_outputs["uv_gaussian_nll"]
+                    v4_loss_metric_sums["uv_gaussian_nll"] += (
+                        float(uv_gaussian_nll) * batch_size
+                    )
+                    v4_loss_metric_sums["weighted_uv_gaussian_nll"] += (
+                        float(uv_gaussian_nll)
+                        * criterion.config.uv_gaussian_nll_weight
+                        * batch_size
+                    )
+                    with torch.no_grad():
+                        ray_valid = model_output["ray_valid_mask"].float()
+                        lambdas = model_output["lambda_hypotheses_mm"].float()
+                        normal_dot = model_output["normal_dot_gaze"].abs().float()
+                        raw_eyes = device_batch["raw_eye_geometry_mm"]
+                        gaze_target = device_batch["gaze_target_camera_mm"]
+                        if not torch.is_tensor(raw_eyes) or not torch.is_tensor(
+                            gaze_target
+                        ):
+                            raise TypeError(
+                                "V4 physical metrics require tensor eye and gaze target data."
+                            )
+                        eye_midpoint = 0.5 * (
+                            raw_eyes[:, :3] + raw_eyes[:, 3:]
+                        )
+                        gaze_gt = torch.nn.functional.normalize(
+                            gaze_target - eye_midpoint,
+                            dim=-1,
+                            eps=1e-8,
+                        )
+                        gaze_pred = torch.nn.functional.normalize(
+                            model_output["gaze_direction_c"],
+                            dim=-1,
+                            eps=1e-8,
+                        )
+                        direction_cosine = (
+                            gaze_pred * gaze_gt
+                        ).sum(dim=-1).clamp(-1.0, 1.0)
+                        directed_error = torch.rad2deg(
+                            torch.acos(direction_cosine)
+                        )
+                        axis_error = torch.rad2deg(
+                            torch.acos(direction_cosine.abs())
+                        )
+                        geometry_metric_sums["physical_valid_rate"] += float(
+                            ray_valid.mean(dim=-1).sum()
+                        )
+                        geometry_metric_sums["mean_lambda_mm"] += float(
+                            lambdas.mean(dim=-1).sum()
+                        )
+                        geometry_metric_sums["behind_ray_rate"] += float(
+                            (
+                                lambdas
+                                <= model.config.geometry_min_lambda_mm
+                            ).float().mean(dim=-1).sum()
+                        )
+                        geometry_metric_sums["parallel_ray_rate"] += float(
+                            (
+                                normal_dot.squeeze(-1)
+                                < model.config.geometry_min_abs_normal_dot_gaze
+                            ).float().mean(dim=-1).sum()
+                        )
+                        geometry_metric_sums["gaze_axis_error_deg"] += float(
+                            axis_error.sum()
+                        )
+                        geometry_metric_sums[
+                            "directed_gaze_error_deg"
+                        ] += float(directed_error.sum())
+                        if model.config.use_depth_correction:
+                            shared_scale = model_output["depth_shared_scale"].float()
+                            log_correction = model_output[
+                                "depth_log_scale_correction"
+                            ].float()
+                            geometry_metric_sums[
+                                "depth_shared_scale_mean"
+                            ] += float(shared_scale.sum())
+                            geometry_metric_sums[
+                                "depth_log_correction_abs_mean"
+                            ] += float(log_correction.abs().sum())
                 else:
-                    uv_pred = model_output
-                loss = criterion(uv_pred, device_batch["uv_target"])
+                    if isinstance(model_output, dict):
+                        uv_pred = model_output["uv"]
+                    else:
+                        uv_pred = model_output
+                    if not isinstance(criterion, UVRegressionLoss):
+                        raise TypeError("Legacy training requires UVRegressionLoss.")
+                    loss = criterion(uv_pred, device_batch["uv_target"])
+                    uv_pred_mm = criterion.normalizer.denormalize(uv_pred)
                 if use_gate_regularization:
                     gate_delta = model_output.get("eye_geometry_gate_delta")
                     valid_mask = device_batch.get("eye_geometry_valid_mask")
@@ -522,20 +1380,44 @@ def run_epoch(
                 scaler.unscale_(optimizer)
                 if grad_clip_norm is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                scale_before_step = float(scaler.get_scale())
                 scaler.step(optimizer)
                 scaler.update()
+                if amp_enabled and float(scaler.get_scale()) < scale_before_step:
+                    optimizer_skipped_steps += 1
+                else:
+                    optimizer_steps += 1
 
         total_loss += float(loss.detach()) * batch_size
         sample_count += batch_size
-        predictions.append(uv_pred.detach().cpu())
+        predictions.append(uv_pred_mm.detach().cpu())
         targets_mm.append(device_batch["uv_gt"].detach().cpu())
 
     if sample_count == 0:
         raise RuntimeError("DataLoader yielded no samples.")
-    metric_tensors = criterion.metrics(torch.cat(predictions), torch.cat(targets_mm))
+    metric_tensors = compute_uv_metrics_mm(
+        torch.cat(predictions),
+        torch.cat(targets_mm),
+    )
     elapsed = time.perf_counter() - start
     metrics = {"loss": total_loss / sample_count}
+    if is_train:
+        metrics["optimizer_steps"] = float(optimizer_steps)
+        metrics["optimizer_skipped_steps"] = float(optimizer_skipped_steps)
     metrics.update({name: float(value) for name, value in metric_tensors.items()})
+    if isinstance(criterion, GazeGeometryLoss):
+        metrics.update(
+            {
+                name: total / sample_count
+                for name, total in geometry_metric_sums.items()
+            }
+        )
+        metrics.update(
+            {
+                name: total / sample_count
+                for name, total in v4_loss_metric_sums.items()
+            }
+        )
     metrics["seconds"] = elapsed
     metrics["samples_per_second"] = sample_count / elapsed if elapsed > 0 else 0.0
     return metrics, sample_count
@@ -555,9 +1437,17 @@ def capture_rng_state() -> dict[str, object]:
 def restore_rng_state(state: Mapping[str, object]) -> None:
     random.setstate(state["python"])  # type: ignore[arg-type]
     np.random.set_state(state["numpy"])  # type: ignore[arg-type]
-    torch.set_rng_state(state["torch"])  # type: ignore[arg-type]
+    torch_state = state["torch"]
+    if not torch.is_tensor(torch_state):
+        raise TypeError("Checkpoint torch RNG state must be a tensor.")
+    torch.set_rng_state(torch_state.cpu())
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])  # type: ignore[arg-type]
+        cuda_states = state["cuda"]
+        if not isinstance(cuda_states, (list, tuple)) or not all(
+            torch.is_tensor(value) for value in cuda_states
+        ):
+            raise TypeError("Checkpoint CUDA RNG state must be a tensor sequence.")
+        torch.cuda.set_rng_state_all([value.cpu() for value in cuda_states])
 
 
 def save_checkpoint(
@@ -570,36 +1460,91 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.cuda.amp.GradScaler,
-    normalizer: UVTargetNormalizer,
+    normalizer: UVTargetNormalizer | None,
     eye_geometry_normalizer: EyeGeometryNormalizer | None,
     eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None,
+    depth_correction_geometry_normalizer: EyeGeometryNormalizer | None,
     config: Mapping[str, Any],
 ) -> None:
-    torch.save(
-        {
-            "epoch": epoch,
-            "global_step": global_step,
-            "best_val_epe_mm": best_val_epe_mm,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-            "normalizer": normalizer.state_dict(),
-            "eye_geometry_normalizer": (
-                eye_geometry_normalizer.state_dict()
-                if eye_geometry_normalizer is not None
-                else None
-            ),
-            "eye_geometry_quality_normalizer": (
-                eye_geometry_quality_normalizer.state_dict()
-                if eye_geometry_quality_normalizer is not None
-                else None
-            ),
-            "config": to_jsonable(config),
-            "rng_state": capture_rng_state(),
-        },
-        path,
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
     )
+    payload = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_val_epe_mm": best_val_epe_mm,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "normalizer": normalizer.state_dict() if normalizer is not None else None,
+        "eye_geometry_normalizer": (
+            eye_geometry_normalizer.state_dict()
+            if eye_geometry_normalizer is not None
+            else None
+        ),
+        "eye_geometry_quality_normalizer": (
+            eye_geometry_quality_normalizer.state_dict()
+            if eye_geometry_quality_normalizer is not None
+            else None
+        ),
+        "depth_correction_geometry_normalizer": (
+            depth_correction_geometry_normalizer.state_dict()
+            if depth_correction_geometry_normalizer is not None
+            else None
+        ),
+        "config": to_jsonable(config),
+        "rng_state": capture_rng_state(),
+    }
+    try:
+        torch.save(payload, temporary_path)
+        if temporary_path.stat().st_size <= 0:
+            raise RuntimeError("temporary checkpoint is empty")
+        os.replace(temporary_path, path)
+    except Exception as exc:
+        temporary_path.unlink(missing_ok=True)
+        try:
+            free_mib = shutil.disk_usage(path.parent).free / (1024**2)
+            free_text = f"{free_mib:.1f} MiB free"
+        except OSError:
+            free_text = "free space unavailable"
+        raise RuntimeError(
+            f"Failed to save checkpoint atomically to {path} ({free_text}). "
+            "Any previously completed checkpoint at that path was preserved."
+        ) from exc
+
+
+def update_best_checkpoint_from_last(last_path: Path, best_path: Path) -> None:
+    """Atomically point ``best.pt`` at the just-written ``last.pt``.
+
+    NTFS hard links avoid storing the identical checkpoint twice when the
+    current epoch is both latest and best. A copy fallback keeps the training
+    script portable to filesystems without hard-link support.
+    """
+
+    if not last_path.is_file():
+        raise FileNotFoundError(f"Last checkpoint does not exist: {last_path}")
+    best_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = best_path.with_name(
+        f".{best_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        try:
+            os.link(last_path, temporary_path)
+        except OSError:
+            shutil.copy2(last_path, temporary_path)
+        os.replace(temporary_path, best_path)
+    except Exception as exc:
+        temporary_path.unlink(missing_ok=True)
+        try:
+            free_mib = shutil.disk_usage(best_path.parent).free / (1024**2)
+            free_text = f"{free_mib:.1f} MiB free"
+        except OSError:
+            free_text = "free space unavailable"
+        raise RuntimeError(
+            f"Failed to update best checkpoint at {best_path} ({free_text})."
+        ) from exc
 
 
 def load_checkpoint(
@@ -609,9 +1554,10 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.cuda.amp.GradScaler,
-    normalizer: UVTargetNormalizer,
+    normalizer: UVTargetNormalizer | None,
     eye_geometry_normalizer: EyeGeometryNormalizer | None,
     eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None,
+    depth_correction_geometry_normalizer: EyeGeometryNormalizer | None,
     device: torch.device,
 ) -> tuple[int, int, float]:
     checkpoint = torch.load(path, map_location=device)
@@ -619,14 +1565,25 @@ def load_checkpoint(
     missing = required.difference(checkpoint)
     if missing:
         raise ValueError(f"Resume checkpoint is missing keys: {sorted(missing)}")
-    saved_normalizer = UVTargetNormalizer.from_state_dict(checkpoint["normalizer"])
-    if not torch.allclose(saved_normalizer.mean_mm, normalizer.mean_mm) or not torch.allclose(
-        saved_normalizer.std_mm, normalizer.std_mm
-    ):
-        raise ValueError(
-            "Resume checkpoint uses different UV normalization statistics. "
-            "Use the original split/config for this checkpoint."
-        )
+    saved_normalizer_state = checkpoint["normalizer"]
+    if normalizer is None:
+        if saved_normalizer_state is not None:
+            raise ValueError(
+                "Resume checkpoint uses legacy UV normalization, but current "
+                "V4 config predicts millimetres through geometry."
+            )
+    else:
+        if saved_normalizer_state is None:
+            raise ValueError("Resume checkpoint has no UV normalization state.")
+        saved_normalizer = UVTargetNormalizer.from_state_dict(saved_normalizer_state)
+        if not torch.allclose(
+            saved_normalizer.mean_mm,
+            normalizer.mean_mm,
+        ) or not torch.allclose(saved_normalizer.std_mm, normalizer.std_mm):
+            raise ValueError(
+                "Resume checkpoint uses different UV normalization statistics. "
+                "Use the original split/config for this checkpoint."
+            )
     saved_eye_geometry_state = checkpoint.get("eye_geometry_normalizer")
     if eye_geometry_normalizer is None:
         if saved_eye_geometry_state is not None:
@@ -679,6 +1636,35 @@ def load_checkpoint(
                 "Resume checkpoint uses different eye geometry quality "
                 "normalization statistics."
             )
+    saved_correction_state = checkpoint.get(
+        "depth_correction_geometry_normalizer"
+    )
+    if depth_correction_geometry_normalizer is None:
+        if saved_correction_state is not None:
+            raise ValueError(
+                "Resume checkpoint uses depth correction geometry "
+                "normalization, but the current config does not."
+            )
+    else:
+        if saved_correction_state is None:
+            raise ValueError(
+                "Resume checkpoint has no depth correction geometry "
+                "normalization statistics."
+            )
+        saved_correction_normalizer = EyeGeometryNormalizer.from_state_dict(
+            saved_correction_state
+        )
+        if not torch.allclose(
+            saved_correction_normalizer.mean,
+            depth_correction_geometry_normalizer.mean,
+        ) or not torch.allclose(
+            saved_correction_normalizer.std,
+            depth_correction_geometry_normalizer.std,
+        ):
+            raise ValueError(
+                "Resume checkpoint uses different depth correction geometry "
+                "normalization statistics."
+            )
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
@@ -702,6 +1688,7 @@ def build_epoch_record(
     epoch_seconds: float,
     elapsed_seconds: float,
     best_val_epe_mm: float,
+    metric_names: tuple[str, ...],
 ) -> dict[str, float | int]:
     record: dict[str, float | int] = {
         "epoch": epoch,
@@ -713,14 +1700,17 @@ def build_epoch_record(
     }
     for prefix, values in (("train", train), ("val", val)):
         record[f"{prefix}_loss"] = values["loss"]
-        for name in METRIC_NAMES:
+        for name in metric_names:
             record[f"{prefix}_{name}"] = values[name]
         record[f"{prefix}_seconds"] = values["seconds"]
         record[f"{prefix}_samples_per_second"] = values["samples_per_second"]
     return record
 
 
-def wandb_metrics(record: Mapping[str, float | int]) -> dict[str, float | int]:
+def wandb_metrics(
+    record: Mapping[str, float | int],
+    metric_names: tuple[str, ...],
+) -> dict[str, float | int]:
     metrics: dict[str, float | int] = {
         "epoch": record["epoch"],
         "global_step": record["global_step"],
@@ -731,7 +1721,7 @@ def wandb_metrics(record: Mapping[str, float | int]) -> dict[str, float | int]:
     }
     for prefix in ("train", "val"):
         metrics[f"{prefix}/loss"] = record[f"{prefix}_loss"]
-        for name in METRIC_NAMES:
+        for name in metric_names:
             metrics[f"{prefix}/{name}"] = record[f"{prefix}_{name}"]
         metrics[f"time/{prefix}_seconds"] = record[f"{prefix}_seconds"]
         metrics[f"{prefix}/samples_per_second"] = record[f"{prefix}_samples_per_second"]
@@ -751,14 +1741,46 @@ def to_jsonable(value: Any) -> Any:
 def main() -> int:
     args = parse_args()
     config = load_config(resolve_project_path(args.config))
+    if args.resume is None and not args.dry_run:
+        apply_numbered_experiment_identity(config)
     if args.device is not None:
         config["training"]["device"] = args.device
     if args.dry_run:
         config["training"]["epochs"] = 1
+        config["training"]["checkpoint"]["enabled"] = False
         config["logging"]["wandb"]["enabled"] = False
         config["experiment"]["run_name"] = "dry_run_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
     resume_path = resolve_project_path(args.resume) if args.resume is not None else None
+    initialization_value = config["training"].get("initialization_checkpoint")
+    initialization_path = (
+        resolve_project_path(initialization_value)
+        if initialization_value
+        else None
+    )
+    if resume_path is not None and initialization_path is not None:
+        raise ValueError(
+            "Use either --resume or training.initialization_checkpoint, not both."
+        )
+    if initialization_path is not None and not initialization_path.is_file():
+        raise FileNotFoundError(
+            f"Initialization checkpoint does not exist: {initialization_path}"
+        )
+    trainable_components = (
+        str(config["training"].get("trainable_components", "all"))
+        .strip()
+        .lower()
+    )
+    if (
+        trainable_components in {"depth_reweighter", "depth_correction"}
+        and resume_path is None
+        and initialization_path is None
+    ):
+        raise ValueError(
+            f"{trainable_components} stage freezes gaze and therefore requires "
+            "either --resume or an explicit training.initialization_checkpoint "
+            "from a trained gaze stage."
+        )
     run_dir = make_run_dir(config, resume_path)
     checkpoints_dir = run_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
@@ -771,15 +1793,51 @@ def main() -> int:
     amp_enabled = bool(config["training"]["amp"]) and device.type == "cuda"
     data_config = config["data"]
     model_config = make_model_config(config["model"])
-    deca_cache_path = resolve_project_path(data_config["deca_cache_path"])
-    validate_deca_cache_preprocess(deca_cache_path, data_config)
-    depth_prior_csv_path = (
-        resolve_project_path(data_config["depth_prior_csv_path"])
-        if model_config.use_eye_geometry
-        else None
+    uses_deca_features = (
+        model_config.deca_feature_representation
+        != DECA_FEATURE_REPRESENTATION_NONE
+    )
+    eye_augmentation = make_eye_appearance_augmentation(data_config)
+    active_metric_names = metric_names_for_model(
+        model_config,
+        config["loss"],
+    )
+    uses_gaze_geometry = (
+        model_config.prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY
+    )
+    dataset_csv_path, deca_cache_path, depth_prior_csv_path = (
+        resolve_numbered_dataset_artifacts(
+            data_config,
+            run_dir,
+            require_deca_features=uses_deca_features,
+            require_depth_prior=model_config.use_eye_geometry or uses_gaze_geometry,
+        )
+    )
+    if deca_cache_path is not None:
+        validate_deca_cache_preprocess(deca_cache_path, data_config)
+    require_depth_uncertainty = (
+        uses_gaze_geometry
+        and (
+            model_config.depth_distribution_mode != DEPTH_DISTRIBUTION_POINT
+            or model_config.use_depth_correction
+        )
+    )
+    require_pnp_quality = (
+        uses_gaze_geometry
+        and (
+            model_config.depth_distribution_mode
+            == DEPTH_DISTRIBUTION_LEARNED_REWEIGHT
+            or model_config.use_depth_correction
+        )
+    )
+    virtual_camera_manifest_path = resolve_virtual_camera_manifest_path(
+        data_config,
+        run_dir,
     )
     train_loader, val_loader = build_modelv1_dataloaders(
-        csv_path=resolve_project_path(data_config["csv_path"]),
+        csv_path=dataset_csv_path,
+        train_datasets=data_config.get("train_datasets", ("3", "4")),
+        val_datasets=data_config.get("val_datasets", ("5",)),
         split_mode=data_config["split_mode"],
         all_datasets=data_config["all_datasets"],
         val_ratio=float(data_config["val_ratio"]),
@@ -789,17 +1847,33 @@ def main() -> int:
         pin_memory=bool(data_config["pin_memory"]),
         normalize_images=bool(data_config["normalize_images"]),
         load_face_image=bool(data_config["load_face_image"]),
+        train_paired_eye_transform=eye_augmentation,
         deca_cache_path=deca_cache_path,
-        require_deca_features=True,
+        require_deca_features=uses_deca_features,
+        normalize_uv_targets=not uses_gaze_geometry,
         use_eye_geometry=model_config.use_eye_geometry,
+        use_gaze_geometry=uses_gaze_geometry,
+        require_depth_uncertainty=require_depth_uncertainty,
+        require_pnp_quality=require_pnp_quality,
+        use_depth_correction=model_config.use_depth_correction,
+        filter_invalid_depth_prior_samples=bool(
+            data_config.get("skip_invalid_depth_prior_samples", True)
+        ),
         depth_prior_csv_path=depth_prior_csv_path,
         eye_geometry_gate_mode=model_config.eye_geometry_gate_mode,
         eye_geometry_representation=model_config.eye_geometry_representation,
         scene_representation=model_config.scene_representation,
         deca_feature_representation=model_config.deca_feature_representation,
+        image_source=str(
+            data_config.get("image_source", IMAGE_SOURCE_LEGACY)
+        ),
+        virtual_camera_manifest_path=virtual_camera_manifest_path,
+        filter_invalid_virtual_camera_samples=bool(
+            data_config.get("skip_invalid_virtual_camera_samples", False)
+        ),
     )
     normalizer = get_uv_target_normalizer(train_loader.dataset)
-    if normalizer is None:
+    if not uses_gaze_geometry and normalizer is None:
         raise RuntimeError("Training requires normalized UV targets.")
     eye_geometry_normalizer = get_eye_geometry_normalizer(train_loader.dataset)
     if model_config.use_eye_geometry and eye_geometry_normalizer is None:
@@ -809,9 +1883,23 @@ def main() -> int:
     eye_geometry_quality_normalizer = get_eye_geometry_quality_normalizer(
         train_loader.dataset
     )
+    depth_correction_geometry_normalizer = (
+        get_depth_correction_geometry_normalizer(train_loader.dataset)
+    )
     if (
-        model_config.eye_geometry_gate_mode
-        == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+        model_config.use_depth_correction
+        and depth_correction_geometry_normalizer is None
+    ):
+        raise RuntimeError(
+            "Depth correction is enabled but its training geometry normalizer "
+            "is unavailable."
+        )
+    if (
+        (
+            model_config.eye_geometry_gate_mode
+            == EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
+            or require_pnp_quality
+        )
         and eye_geometry_quality_normalizer is None
     ):
         raise RuntimeError(
@@ -819,6 +1907,27 @@ def main() -> int:
         )
 
     model = ModelV1(model_config).to(device)
+    if initialization_path is not None:
+        loaded_count, skipped_count = initialize_compatible_model_weights(
+            model,
+            initialization_path,
+            device,
+        )
+        initialization_text = (
+            f"initialized {loaded_count} tensors from {initialization_path}; "
+            f"left {skipped_count} tensors at configured initialization"
+        )
+        logger.info(initialization_text)
+        print(initialization_text)
+    configure_trainable_components(
+        model,
+        str(config["training"].get("trainable_components", "all")),
+    )
+    initial_schedule_message = apply_eye_backbone_schedule(
+        model,
+        config["training"],
+        epoch=1,
+    )
     loss_config = dict(config["loss"])
     gate_regularization_weight = float(
         loss_config.pop("gate_regularization_weight", 0.0)
@@ -828,23 +1937,23 @@ def main() -> int:
         != EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
     ):
         gate_regularization_weight = 0.0
-    criterion = UVRegressionLoss(normalizer, UVLossConfig(**loss_config))
+    if uses_gaze_geometry:
+        criterion: nn.Module = GazeGeometryLoss(
+            GazeGeometryLossConfig(**loss_config)
+        )
+        gate_regularization_weight = 0.0
+    else:
+        assert normalizer is not None
+        criterion = UVRegressionLoss(normalizer, UVLossConfig(**loss_config))
     optimizer_config = config["training"]["optimizer"]
     if optimizer_config["name"].lower() != "adamw":
         raise ValueError("Only AdamW is supported by the V1 training config.")
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        optimizer_parameter_groups(model, config["training"]),
         lr=float(optimizer_config["lr"]),
         weight_decay=float(optimizer_config["weight_decay"]),
     )
-    scheduler_config = config["training"]["scheduler"]
-    if scheduler_config["name"].lower() != "cosine":
-        raise ValueError("Only cosine scheduler is supported by the V1 training config.")
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=int(config["training"]["epochs"]),
-        eta_min=float(scheduler_config["eta_min"]),
-    )
+    scheduler = build_training_scheduler(optimizer, config["training"])
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     start_epoch = 1
@@ -860,8 +1969,16 @@ def main() -> int:
             normalizer=normalizer,
             eye_geometry_normalizer=eye_geometry_normalizer,
             eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
+            depth_correction_geometry_normalizer=(
+                depth_correction_geometry_normalizer
+            ),
             device=device,
         )
+    resumed_schedule_message = apply_eye_backbone_schedule(
+        model,
+        config["training"],
+        epoch=start_epoch,
+    )
 
     total_parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameter_count = sum(
@@ -870,9 +1987,18 @@ def main() -> int:
     setup_text = (
         f"run_dir={run_dir} device={device} amp={amp_enabled} "
         f"train_samples={len(train_loader.dataset)} val_samples={len(val_loader.dataset)} "
+        f"deca_feature_representation={model_config.deca_feature_representation} "
         f"use_face_image={model_config.use_face_image} "
-        f"face_image_backbone={model_config.face_image_backbone} "
+        f"face_image_backbone={FACE_IMAGE_BACKBONE} "
+        f"face_image_pretrained={FACE_IMAGE_PRETRAINED_DATASET} "
+        f"freeze_face_image_backbone={model_config.freeze_face_image_backbone} "
+        f"visual_attention={model_config.visual_attention_heads}x"
+        f"{model_config.visual_attention_dim} "
         f"eye_backbone={model_config.eye_backbone} "
+        f"eye_backbone_weights={model_config.eye_backbone_weights} "
+        f"eye_augmentation={eye_augmentation is not None} "
+        f"image_source={data_config.get('image_source', IMAGE_SOURCE_LEGACY)} "
+        f"gaze_prediction_frame={model_config.gaze_prediction_frame} "
         f"use_crop_cam={model_config.use_crop_cam} "
         f"scene_representation={model_config.scene_representation} "
         f"eye_geometry_gate_mode={model_config.eye_geometry_gate_mode} "
@@ -881,19 +2007,49 @@ def main() -> int:
     )
     logger.info(setup_text)
     print(setup_text)
+    schedule_message = (
+        resumed_schedule_message
+        if resume_path is not None
+        else initial_schedule_message
+    )
+    if schedule_message is not None:
+        logger.info(schedule_message)
+        print(schedule_message)
+    optimizer_group_text = ", ".join(
+        f"{group.get('group_name', f'group_{index}')}={float(group['lr']):.3e}"
+        for index, group in enumerate(optimizer.param_groups)
+    )
+    logger.info("optimizer learning rates: %s", optimizer_group_text)
+    print(f"optimizer learning rates: {optimizer_group_text}")
 
     tracker = start_tracker(
         config,
         run_dir,
+        active_metric_names,
         static_metadata={
             "use_face_image": model_config.use_face_image,
-            "face_image_backbone": model_config.face_image_backbone,
+            "face_image_backbone": FACE_IMAGE_BACKBONE,
+            "face_image_pretrained": FACE_IMAGE_PRETRAINED_DATASET,
+            "freeze_face_image_backbone": (
+                model_config.freeze_face_image_backbone
+            ),
+            "visual_attention_dim": model_config.visual_attention_dim,
+            "visual_attention_heads": model_config.visual_attention_heads,
             "eye_backbone": model_config.eye_backbone,
+            "eye_backbone_weights": model_config.eye_backbone_weights,
+            "eye_augmentation": eye_augmentation is not None,
+            "image_source": data_config.get(
+                "image_source", IMAGE_SOURCE_LEGACY
+            ),
+            "gaze_prediction_frame": model_config.gaze_prediction_frame,
             "parameters_total": total_parameter_count,
             "parameters_trainable": trainable_parameter_count,
         },
     )
-    metrics_writer = MetricsCsvWriter(run_dir / "metrics.csv")
+    metrics_writer = MetricsCsvWriter(
+        run_dir / "metrics.csv",
+        active_metric_names,
+    )
     started_at = time.perf_counter()
     epochs = int(config["training"]["epochs"])
     terminal_interval = int(config["logging"]["terminal_every_epochs"])
@@ -903,6 +2059,14 @@ def main() -> int:
     try:
         for epoch in range(start_epoch, epochs + 1):
             epoch_started_at = time.perf_counter()
+            schedule_transition = apply_eye_backbone_schedule(
+                model,
+                config["training"],
+                epoch=epoch,
+            )
+            if schedule_transition is not None:
+                logger.info(schedule_transition)
+                print(schedule_transition)
             lr = float(optimizer.param_groups[0]["lr"])
             train_metrics, train_samples = run_epoch(
                 model=model,
@@ -915,7 +2079,26 @@ def main() -> int:
                 grad_clip_norm=grad_clip_norm,
                 gate_regularization_weight=gate_regularization_weight,
             )
-            global_step += len(train_loader)
+            optimizer_steps = int(train_metrics.pop("optimizer_steps"))
+            optimizer_skipped_steps = int(
+                train_metrics.pop("optimizer_skipped_steps")
+            )
+            if optimizer_steps == 0:
+                raise RuntimeError(
+                    "Every optimizer step in this epoch was skipped because "
+                    "gradients were non-finite. Disable FP16 AMP for the "
+                    "gaze-geometry experiment or reduce the geometry loss "
+                    "gradient range."
+                )
+            if optimizer_skipped_steps > 0:
+                skipped_text = (
+                    f"epoch={epoch} skipped {optimizer_skipped_steps}/"
+                    f"{optimizer_steps + optimizer_skipped_steps} optimizer "
+                    "steps because AMP detected non-finite gradients"
+                )
+                logger.warning(skipped_text)
+                print(skipped_text)
+            global_step += optimizer_steps
             val_metrics, _ = run_epoch(
                 model=model,
                 loader=val_loader,
@@ -941,14 +2124,25 @@ def main() -> int:
                 epoch_seconds=time.perf_counter() - epoch_started_at,
                 elapsed_seconds=time.perf_counter() - started_at,
                 best_val_epe_mm=best_val_epe_mm,
+                metric_names=active_metric_names,
             )
             metrics_writer.write(record)
-            tracker.log(wandb_metrics(record), step=epoch)
+            tracker.log(
+                wandb_metrics(record, active_metric_names),
+                step=epoch,
+            )
             logger.info(json.dumps(record, ensure_ascii=True))
 
-            if bool(config["training"]["checkpoint"]["save_last"]):
+            checkpoint_enabled = bool(
+                config["training"]["checkpoint"].get("enabled", True)
+            )
+            save_last = checkpoint_enabled and bool(
+                config["training"]["checkpoint"]["save_last"]
+            )
+            last_checkpoint_path = checkpoints_dir / "last.pt"
+            if save_last:
                 save_checkpoint(
-                    checkpoints_dir / "last.pt",
+                    last_checkpoint_path,
                     epoch=epoch,
                     global_step=global_step,
                     best_val_epe_mm=best_val_epe_mm,
@@ -959,29 +2153,52 @@ def main() -> int:
                     normalizer=normalizer,
                     eye_geometry_normalizer=eye_geometry_normalizer,
                     eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
+                    depth_correction_geometry_normalizer=(
+                        depth_correction_geometry_normalizer
+                    ),
                     config=config,
                 )
-            if improved:
-                save_checkpoint(
-                    checkpoints_dir / "best.pt",
-                    epoch=epoch,
-                    global_step=global_step,
-                    best_val_epe_mm=best_val_epe_mm,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    normalizer=normalizer,
-                    eye_geometry_normalizer=eye_geometry_normalizer,
-                    eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
-                    config=config,
-                )
+            if improved and checkpoint_enabled:
+                best_checkpoint_path = checkpoints_dir / "best.pt"
+                if save_last:
+                    update_best_checkpoint_from_last(
+                        last_checkpoint_path,
+                        best_checkpoint_path,
+                    )
+                else:
+                    save_checkpoint(
+                        best_checkpoint_path,
+                        epoch=epoch,
+                        global_step=global_step,
+                        best_val_epe_mm=best_val_epe_mm,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        normalizer=normalizer,
+                        eye_geometry_normalizer=eye_geometry_normalizer,
+                        eye_geometry_quality_normalizer=(
+                            eye_geometry_quality_normalizer
+                        ),
+                        depth_correction_geometry_normalizer=(
+                            depth_correction_geometry_normalizer
+                        ),
+                        config=config,
+                    )
 
             if epoch % terminal_interval == 0 or epoch == epochs or epoch == start_epoch:
                 print(
                     f"epoch {epoch:03d}/{epochs} | lr={lr:.3e} | "
                     f"train_loss={train_metrics['loss']:.4f} | "
                     f"val_epe={val_metrics['epe_mm']:.2f} mm | "
+                    + (
+                        f"val_valid={val_metrics['physical_valid_rate']:.3f} | "
+                        f"val_lambda={val_metrics['mean_lambda_mm']:.1f} mm | "
+                        f"val_axis={val_metrics['gaze_axis_error_deg']:.2f} deg | "
+                        if uses_gaze_geometry
+                        else ""
+                    )
+                    +
                     f"best={best_val_epe_mm:.2f} mm | "
                     f"epoch_time={record['epoch_seconds']:.1f}s"
                 )

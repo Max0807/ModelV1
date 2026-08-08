@@ -36,6 +36,7 @@ from modelv1.depth_prior.face_preprocess import (
     FACE_PREPROCESS_LEGACY,
     prepare_deca_face_image,
 )
+from modelv1.processed_artifacts import processed_dataset_artifacts
 
 
 DEFAULT_CSV_PATH = PROJECT_ROOT / "data" / "processed" / "modelv1_dataset.csv"
@@ -50,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, default=DEFAULT_CSV_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_CACHE_PATH)
+    parser.add_argument(
+        "--dataset-id",
+        default=None,
+        help="Use modelv1_dataset<id>.csv and write deca_features_deca_crop_v1_<id>.npz.",
+    )
+    parser.add_argument("--processed-dir", type=Path, default=PROJECT_ROOT / "data" / "processed")
     parser.add_argument("--deca-root", type=Path, default=DEFAULT_DECA_ROOT)
     parser.add_argument(
         "--checkpoint",
@@ -91,7 +98,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Validate that --output covers every sample in --csv; do not run DECA.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.dataset_id is not None:
+        artifacts = processed_dataset_artifacts(args.dataset_id, args.processed_dir)
+        args.csv = artifacts.dataset_csv
+        args.output = artifacts.deca_cache
+    return args
 
 
 def read_rows(

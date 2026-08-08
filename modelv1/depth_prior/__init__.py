@@ -32,6 +32,11 @@ from .pnp import (
     compute_scale_estimate,
     solve_pnp_face_depth,
 )
+from .iris_ipd import (
+    IrisIpdReconstruction,
+    assign_iris_groups_to_anatomical_sides,
+    reconstruct_iris_centres_from_ipd,
+)
 
 __all__ = [
     "CROSSGAZE_CAMERA_MATRIX",
@@ -60,4 +65,7 @@ __all__ = [
     "build_face_crop_transform",
     "prepare_deca_face_image",
     "solve_pnp_face_depth",
+    "IrisIpdReconstruction",
+    "assign_iris_groups_to_anatomical_sides",
+    "reconstruct_iris_centres_from_ipd",
 ]

@@ -24,6 +24,21 @@ Default outputs:
 
 The script uses only the Python standard library by default. If `numpy` is installed, add `--write-npz` to also create `modelv1_dataset.npz`.
 
+### 清理低质量图像
+
+`scripts/delete_low_quality_images.py` 会依据帧号，同时清理原图、人脸图、左眼图和右眼图。先在脚本顶部修改 `DATASET` 和 `INDICES`；索引支持单个数字、范围，以及二者混用。默认仅预览；确认输出无误后再加 `--delete` 真正删除：
+
+```powershell
+# 在脚本中设置：DATASET = "3"、INDICES = "1-5,8,10-12"
+# 然后预览对应的四类图像
+python scripts\delete_low_quality_images.py
+
+# 确认预览后执行删除
+python scripts\delete_low_quality_images.py --delete
+```
+
+`DATASET` 也可写完整目录名，例如 `dataset_dual_rigid_body_4`。若数据集根目录不在默认位置，则修改脚本顶部的 `DEFAULT_SOURCE_ROOT`。
+
 ## DataLoader
 
 Install the runtime dependencies first:
@@ -45,6 +60,7 @@ Use `deca_cache_path` only when intentionally selecting a different cache.
 The split strategy is selected with `split_mode`:
 
 - `dataset_5` (default): train on `dataset_dual_rigid_body_3` + `dataset_dual_rigid_body_4`; use `dataset_dual_rigid_body_5` as validation/test.
+- `explicit_datasets`: use the requested `train_datasets` and `val_datasets` as a disjoint session/camera holdout.
 - `random_80_20`: merge datasets 3, 4, and 5, then split them into train/validation with a deterministic 4:1 ratio.
 
 Examples:
@@ -53,9 +69,9 @@ Examples:
 from modelv1.data import build_modelv1_dataloaders
 
 train_loader, val_loader = build_modelv1_dataloaders(
-    split_mode="random_80_20",
-    val_ratio=0.2,
-    split_seed=42,
+    split_mode="explicit_datasets",
+    train_datasets=("3",),
+    val_datasets=("4",),
 )
 ```
 
@@ -64,6 +80,7 @@ The smoke-test script supports the same selection:
 ```powershell
 python scripts\check_dataloader.py --split-mode random_80_20
 python scripts\check_dataloader.py --split-mode dataset_5
+python scripts\check_dataloader.py --split-mode explicit_datasets --train-datasets 3 --val-datasets 4
 ```
 
 ## Data Validation Notebook
@@ -75,14 +92,27 @@ Open [validate_modelv1_dataset.ipynb](notebooks/validate_modelv1_dataset.ipynb) 
 The V1 model is a multi-branch PyTorch regressor:
 
 - `face_branch`: consumes frozen/offline DECA features from `deca_feat`.
-- `face_image_encoder` (V3 optional): extracts a 128D appearance feature from
-  the RGB 224x224 face crop.
-- `eye_branch`: encodes left/right eye crops with a configurable image backbone.
-- `visual_fusion` (V3 optional): fuses the RGB face feature and binocular eye
-  feature before they are concatenated with structured branches.
+- `visual_encoder` (V3 optional): extracts a 3x3 face feature map with a
+  VGGFace2-pretrained Inception-ResNet V1 and two 2x2 eye feature maps with a
+  shared ResNet-18, then fuses them with eye-to-face cross-attention.
+- `eye_branch`: encodes left/right eye crops when the RGB face branch is disabled.
 - `crop_cam_branch`: embeds the 36D crop/camera vector.
 - `scene_branch`: embeds the 25D scene/table vector.
 - `fusion_mlp` + `uv_head`: predicts normalized table-local `(u, v)`.
+
+For a no-DECA ablation, set:
+
+```yaml
+model:
+  deca_feature_representation: none
+  deca_feature_dim: 0
+  deca_branch_mode: flat
+```
+
+This removes the DECA branch and its 128D output from the fusion input. The
+DataLoader and training entry point will not load, merge, or validate a DECA
+cache in this mode. RGB face/eye cross-attention remains enabled independently
+through `use_face_image`.
 
 The eye backbone is selected in the training YAML:
 
@@ -111,7 +141,7 @@ Minimal use:
 from modelv1 import ModelV1
 
 model = ModelV1()
-uv_pred = model(batch)  # batch must include deca_feat, left_eye, right_eye, crop_cam_vec, scene_vec
+uv_pred = model(batch)  # deca_feat is optional when deca_feature_representation="none"
 ```
 
 ### Optional V2.1/V2.2 binocular geometry
@@ -174,15 +204,15 @@ python scripts\check_dataloader.py --split-mode random_80_20 --scene-representat
 python scripts\check_dataloader.py --split-mode random_80_20 --scene-representation orientation6d
 ```
 
-### V3 RGB face encoder and visual fusion
+### V3 RGB face encoder and cross-attention fusion
 
 V3 retains the V2.2 DECA, TableFrame, binocular geometry, and quality-gate
 branches. It additionally computes:
 
 ```text
-face [B,3,224,224] -> pretrained ResNet18 -> f_face_image [B,128]
-left/right eye     -> shared ResNet18     -> f_eye        [B,128]
-concat(f_face_image, f_eye) -> MLP        -> f_visual     [B,128]
+face [B,3,160,160] -> Inception-ResNet V1 -> [B,1792,3,3] -> 9x128 K/V tokens
+each eye [B,3,36,60] -> shared ResNet18   -> [B,512,2,2]  -> 4x128 Q tokens
+CrossAttention(Q=8 eye tokens, K/V=9 face tokens) -> mean pool -> f_visual [B,128]
 ```
 
 The final fusion consumes `DECA feature + f_visual + scene + gated eye
@@ -195,17 +225,23 @@ data:
 
 model:
   use_face_image: true
-  face_image_embedding_dim: 128
-  face_image_backbone: resnet18
-  face_image_backbone_weights: DEFAULT
-  face_image_freeze_until: layer3
+  freeze_face_image_backbone: false
   visual_embedding_dim: 128
-  visual_fusion_hidden_dims: [256]
+  visual_attention_dim: 128
+  visual_attention_heads: 8
+  visual_attention_ffn_dim: 256
+  visual_attention_dropout: 0.1
+  eye_backbone: resnet18
+  eye_backbone_weights: DEFAULT
+  share_eye_encoder: true
 ```
 
-`face_image_freeze_until: layer3` freezes the pretrained stem and layers 1-3,
-including their BatchNorm statistics, while leaving layer4 and the projection
-head trainable.
+The face backbone is always initialized with VGGFace2 weights. Set
+`freeze_face_image_backbone: true` to freeze the complete Inception-ResNet
+backbone (including BatchNorm statistics) while training the 128D projection
+and cross-attention layers. Face images are resized to 160x160 and
+fixed-standardized to `[-1, 1]`;
+eye images keep their existing ImageNet normalization.
 
 ## UV Target Normalization
 

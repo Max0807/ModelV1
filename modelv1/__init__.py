@@ -1,9 +1,12 @@
 """ModelV1 package."""
 
 __all__ = [
-    "FaceImageEncoder",
+    "CrossAttentionVisualEncoder",
+    "InceptionResnetFaceEncoder",
     "ModelV1",
     "ModelV1Config",
+    "GazeGeometryLoss",
+    "GazeGeometryLossConfig",
     "UVLossConfig",
     "UVRegressionLoss",
     "build_modelv1",
@@ -19,24 +22,51 @@ def __getattr__(name: str):
     cache files before a training environment has been installed.
     """
 
-    if name in {"FaceImageEncoder", "ModelV1", "ModelV1Config", "build_modelv1"}:
-        from .model import FaceImageEncoder, ModelV1, ModelV1Config, build_modelv1
+    if name in {
+        "CrossAttentionVisualEncoder",
+        "InceptionResnetFaceEncoder",
+        "ModelV1",
+        "ModelV1Config",
+        "build_modelv1",
+    }:
+        from .model import (
+            CrossAttentionVisualEncoder,
+            InceptionResnetFaceEncoder,
+            ModelV1,
+            ModelV1Config,
+            build_modelv1,
+        )
 
         exports = {
-            "FaceImageEncoder": FaceImageEncoder,
+            "CrossAttentionVisualEncoder": CrossAttentionVisualEncoder,
+            "InceptionResnetFaceEncoder": InceptionResnetFaceEncoder,
             "ModelV1": ModelV1,
             "ModelV1Config": ModelV1Config,
             "build_modelv1": build_modelv1,
         }
         globals().update(exports)
         return exports[name]
-    if name in {"UVLossConfig", "UVRegressionLoss", "compute_uv_metrics"}:
-        from .losses import UVLossConfig, UVRegressionLoss, compute_uv_metrics
+    if name in {
+        "GazeGeometryLoss",
+        "GazeGeometryLossConfig",
+        "UVLossConfig",
+        "UVRegressionLoss",
+        "compute_uv_metrics",
+    }:
+        from .losses import (
+            GazeGeometryLoss,
+            GazeGeometryLossConfig,
+            UVLossConfig,
+            UVRegressionLoss,
+            compute_uv_metrics,
+        )
 
         exports = {
             "UVLossConfig": UVLossConfig,
             "UVRegressionLoss": UVRegressionLoss,
             "compute_uv_metrics": compute_uv_metrics,
+            "GazeGeometryLoss": GazeGeometryLoss,
+            "GazeGeometryLossConfig": GazeGeometryLossConfig,
         }
         globals().update(exports)
         return exports[name]

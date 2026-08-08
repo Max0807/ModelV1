@@ -37,6 +37,8 @@ EYE_QUALITY_COLUMNS = (
     "pnp_confidence",
 )
 VALID_PRIOR_STATUSES = {"success", "warning"}
+DEPTH_LOG_SCALE_STD_COLUMN = "depth_log_scale_std"
+DEPTH_UNCERTAINTY_STATUS_COLUMN = "depth_uncertainty_status"
 
 
 def canonical_eye_geometry_representation(value: str) -> str:
@@ -188,8 +190,10 @@ class DepthPriorTable:
     geometry_by_sample_id: dict[str, Tensor]
     quality_by_sample_id: dict[str, Tensor]
     confidence_by_sample_id: dict[str, float]
+    depth_log_scale_std_by_sample_id: dict[str, float]
     invalid_reasons: dict[str, str]
     quality_invalid_reasons: dict[str, str]
+    uncertainty_invalid_reasons: dict[str, str]
 
     @classmethod
     def load(
@@ -218,10 +222,16 @@ class DepthPriorTable:
         geometry_by_sample_id: dict[str, Tensor] = {}
         quality_by_sample_id: dict[str, Tensor] = {}
         confidence_by_sample_id: dict[str, float] = {}
+        depth_log_scale_std_by_sample_id: dict[str, float] = {}
         invalid_reasons: dict[str, str] = {}
         quality_invalid_reasons: dict[str, str] = {}
+        uncertainty_invalid_reasons: dict[str, str] = {}
         sample_ids: set[str] = set()
         has_quality_columns = set(EYE_QUALITY_COLUMNS).issubset(rows[0])
+        has_uncertainty_columns = {
+            DEPTH_LOG_SCALE_STD_COLUMN,
+            DEPTH_UNCERTAINTY_STATUS_COLUMN,
+        }.issubset(rows[0])
         for row in rows:
             sample_id = row["sample_id"].strip()
             if not sample_id:
@@ -265,25 +275,52 @@ class DepthPriorTable:
                 quality_invalid_reasons[sample_id] = (
                     "depth-prior CSV does not contain all PnP quality columns"
                 )
+            else:
+                try:
+                    quality_values = {
+                        column: float(row[column]) for column in EYE_QUALITY_COLUMNS
+                    }
+                    confidence = quality_values["pnp_confidence"]
+                    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                        raise ValueError("pnp_confidence must be finite and lie in [0, 1]")
+                    quality_by_sample_id[sample_id] = build_eye_geometry_quality_vector(
+                        quality_values["reprojection_error_mean_px"],
+                        quality_values["reprojection_error_max_px"],
+                        quality_values["pnp_inlier_count"],
+                        quality_values["pnp_num_points"],
+                        quality_values["scale_disagreement_ratio"],
+                    )
+                    confidence_by_sample_id[sample_id] = confidence
+                except (KeyError, TypeError, ValueError) as exc:
+                    quality_invalid_reasons[sample_id] = (
+                        f"invalid PnP quality values: {exc}"
+                    )
+
+            if not has_uncertainty_columns:
+                uncertainty_invalid_reasons[sample_id] = (
+                    "depth-prior CSV does not contain PnP uncertainty columns"
+                )
+                continue
+            uncertainty_status = row.get(
+                DEPTH_UNCERTAINTY_STATUS_COLUMN,
+                "failed",
+            ).strip().lower()
+            if uncertainty_status not in VALID_PRIOR_STATUSES:
+                uncertainty_invalid_reasons[sample_id] = (
+                    row.get("depth_uncertainty_reason", "").strip()
+                    or f"status={uncertainty_status!r}"
+                )
                 continue
             try:
-                quality_values = {
-                    column: float(row[column]) for column in EYE_QUALITY_COLUMNS
-                }
-                confidence = quality_values["pnp_confidence"]
-                if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-                    raise ValueError("pnp_confidence must be finite and lie in [0, 1]")
-                quality_by_sample_id[sample_id] = build_eye_geometry_quality_vector(
-                    quality_values["reprojection_error_mean_px"],
-                    quality_values["reprojection_error_max_px"],
-                    quality_values["pnp_inlier_count"],
-                    quality_values["pnp_num_points"],
-                    quality_values["scale_disagreement_ratio"],
-                )
-                confidence_by_sample_id[sample_id] = confidence
+                log_scale_std = float(row[DEPTH_LOG_SCALE_STD_COLUMN])
+                if not math.isfinite(log_scale_std) or log_scale_std < 0:
+                    raise ValueError(
+                        "depth_log_scale_std must be finite and non-negative"
+                    )
+                depth_log_scale_std_by_sample_id[sample_id] = log_scale_std
             except (KeyError, TypeError, ValueError) as exc:
-                quality_invalid_reasons[sample_id] = (
-                    f"invalid PnP quality values: {exc}"
+                uncertainty_invalid_reasons[sample_id] = (
+                    f"invalid PnP depth uncertainty: {exc}"
                 )
 
         return cls(
@@ -293,8 +330,10 @@ class DepthPriorTable:
             geometry_by_sample_id=geometry_by_sample_id,
             quality_by_sample_id=quality_by_sample_id,
             confidence_by_sample_id=confidence_by_sample_id,
+            depth_log_scale_std_by_sample_id=depth_log_scale_std_by_sample_id,
             invalid_reasons=invalid_reasons,
             quality_invalid_reasons=quality_invalid_reasons,
+            uncertainty_invalid_reasons=uncertainty_invalid_reasons,
         )
 
     def lookup(self, sample_id: str) -> Tensor:
@@ -338,6 +377,21 @@ class DepthPriorTable:
                 f"sample_id={sample_id!r}"
             ) from exc
 
+    def lookup_depth_log_scale_std(self, sample_id: str) -> float:
+        try:
+            return self.depth_log_scale_std_by_sample_id[sample_id]
+        except KeyError as exc:
+            reason = self.uncertainty_invalid_reasons.get(sample_id)
+            if reason is not None:
+                raise KeyError(
+                    f"PnP depth uncertainty for sample_id={sample_id!r} is "
+                    f"invalid: {reason}"
+                ) from exc
+            raise KeyError(
+                f"Depth-prior CSV {self.path} has no PnP depth uncertainty for "
+                f"sample_id={sample_id!r}"
+            ) from exc
+
     def is_gate_valid(self, sample_id: str, *, require_quality: bool) -> bool:
         if sample_id not in self.geometry_by_sample_id:
             return False
@@ -368,4 +422,18 @@ class DepthPriorTable:
             raise ValueError(
                 f"Depth-prior CSV {self.path} has no row for {len(missing)} "
                 f"required samples: {preview}{suffix}"
+            )
+
+    def require_uncertainty_sample_ids(self, sample_ids: Iterable[str]) -> None:
+        missing = [
+            sample_id
+            for sample_id in sample_ids
+            if sample_id not in self.depth_log_scale_std_by_sample_id
+        ]
+        if missing:
+            preview = ", ".join(repr(sample_id) for sample_id in missing[:5])
+            suffix = " ..." if len(missing) > 5 else ""
+            raise ValueError(
+                f"Depth-prior CSV {self.path} has no valid PnP uncertainty for "
+                f"{len(missing)} required samples: {preview}{suffix}"
             )
