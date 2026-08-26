@@ -11,6 +11,8 @@ from typing import Iterable
 import torch
 from torch import Tensor
 
+from modelv1.depth_prior.pnp import PNP_GEOMETRY_VERSION, PnpConfig
+
 from .normalization import EYE_GEOMETRY_DIM, EYE_GEOMETRY_QUALITY_DIM
 
 
@@ -212,11 +214,25 @@ class DepthPriorTable:
         if not rows:
             raise ValueError(f"Depth-prior CSV has no rows: {path}")
 
-        required = {"sample_id", *EYE_CAMERA_COLUMNS}
+        required = {
+            "sample_id",
+            "pnp_geometry_version",
+            "pnp_min_object_depth_mm",
+            *EYE_CAMERA_COLUMNS,
+            *EYE_QUALITY_COLUMNS,
+        }
         missing = required.difference(rows[0])
         if missing:
             raise ValueError(
                 f"Depth-prior CSV is missing columns {sorted(missing)}: {path}"
+            )
+        face_depth_column = (
+            "tvec_z_mm" if "tvec_z_mm" in rows[0] else "pnp_tvec_z_mm"
+        )
+        if face_depth_column not in rows[0]:
+            raise ValueError(
+                "Depth-prior CSV must contain tvec_z_mm or pnp_tvec_z_mm: "
+                f"{path}"
             )
 
         geometry_by_sample_id: dict[str, Tensor] = {}
@@ -227,7 +243,6 @@ class DepthPriorTable:
         quality_invalid_reasons: dict[str, str] = {}
         uncertainty_invalid_reasons: dict[str, str] = {}
         sample_ids: set[str] = set()
-        has_quality_columns = set(EYE_QUALITY_COLUMNS).issubset(rows[0])
         has_uncertainty_columns = {
             DEPTH_LOG_SCALE_STD_COLUMN,
             DEPTH_UNCERTAINTY_STATUS_COLUMN,
@@ -248,6 +263,13 @@ class DepthPriorTable:
                     row.get("reason", "").strip() or f"status={status!r}"
                 )
                 continue
+            pnp_version = row.get("pnp_geometry_version", "").strip()
+            if pnp_version != PNP_GEOMETRY_VERSION:
+                invalid_reasons[sample_id] = (
+                    "pnp_geometry_version mismatch: expected "
+                    f"{PNP_GEOMETRY_VERSION!r}, got {pnp_version or 'missing'!r}"
+                )
+                continue
             plausible = row.get("depth_is_plausible", "")
             if plausible and _is_false(plausible):
                 invalid_reasons[sample_id] = "depth_is_plausible=false"
@@ -261,6 +283,57 @@ class DepthPriorTable:
             if not all(math.isfinite(value) for value in values):
                 invalid_reasons[sample_id] = "non-finite eye camera coordinates"
                 continue
+            if values[2] <= 0.0 or values[5] <= 0.0:
+                invalid_reasons[sample_id] = "PnP eye depths must be positive"
+                continue
+            try:
+                min_object_depth = float(row["pnp_min_object_depth_mm"])
+            except (TypeError, ValueError) as exc:
+                invalid_reasons[sample_id] = f"invalid PnP landmark depth: {exc}"
+                continue
+            if not math.isfinite(min_object_depth) or min_object_depth <= 0.0:
+                invalid_reasons[sample_id] = (
+                    "pnp_min_object_depth_mm must be finite and positive"
+                )
+                continue
+            thresholds = PnpConfig()
+            try:
+                face_depth = float(row[face_depth_column])
+            except (TypeError, ValueError) as exc:
+                invalid_reasons[sample_id] = f"invalid PnP face-origin depth: {exc}"
+                continue
+            if not (
+                math.isfinite(face_depth)
+                and thresholds.min_plausible_depth_mm
+                <= face_depth
+                <= thresholds.max_plausible_depth_mm
+            ):
+                invalid_reasons[sample_id] = (
+                    "PnP face-origin depth is outside [100, 2000] mm"
+                )
+                continue
+            try:
+                mean_error = float(row["reprojection_error_mean_px"])
+                max_error = float(row["reprojection_error_max_px"])
+                scale_disagreement = float(row["scale_disagreement_ratio"])
+            except (TypeError, ValueError) as exc:
+                invalid_reasons[sample_id] = f"invalid PnP quality values: {exc}"
+                continue
+            if not all(
+                math.isfinite(value)
+                for value in (mean_error, max_error, scale_disagreement)
+            ):
+                invalid_reasons[sample_id] = "non-finite PnP quality values"
+                continue
+            if mean_error > thresholds.max_reprojection_error_mean_px:
+                invalid_reasons[sample_id] = "PnP mean reprojection error exceeds 8 px"
+                continue
+            if max_error > thresholds.max_reprojection_error_max_px:
+                invalid_reasons[sample_id] = "PnP max reprojection error exceeds 20 px"
+                continue
+            if scale_disagreement > thresholds.max_scale_disagreement_ratio:
+                invalid_reasons[sample_id] = "PnP scale disagreement exceeds 0.25"
+                continue
             try:
                 geometry_by_sample_id[sample_id] = build_eye_geometry_representation(
                     torch.tensor(values[:3], dtype=torch.float32),
@@ -271,30 +344,25 @@ class DepthPriorTable:
                 invalid_reasons[sample_id] = str(exc)
                 continue
 
-            if not has_quality_columns:
-                quality_invalid_reasons[sample_id] = (
-                    "depth-prior CSV does not contain all PnP quality columns"
+            try:
+                quality_values = {
+                    column: float(row[column]) for column in EYE_QUALITY_COLUMNS
+                }
+                confidence = quality_values["pnp_confidence"]
+                if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+                    raise ValueError("pnp_confidence must be finite and lie in [0, 1]")
+                quality_by_sample_id[sample_id] = build_eye_geometry_quality_vector(
+                    quality_values["reprojection_error_mean_px"],
+                    quality_values["reprojection_error_max_px"],
+                    quality_values["pnp_inlier_count"],
+                    quality_values["pnp_num_points"],
+                    quality_values["scale_disagreement_ratio"],
                 )
-            else:
-                try:
-                    quality_values = {
-                        column: float(row[column]) for column in EYE_QUALITY_COLUMNS
-                    }
-                    confidence = quality_values["pnp_confidence"]
-                    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-                        raise ValueError("pnp_confidence must be finite and lie in [0, 1]")
-                    quality_by_sample_id[sample_id] = build_eye_geometry_quality_vector(
-                        quality_values["reprojection_error_mean_px"],
-                        quality_values["reprojection_error_max_px"],
-                        quality_values["pnp_inlier_count"],
-                        quality_values["pnp_num_points"],
-                        quality_values["scale_disagreement_ratio"],
-                    )
-                    confidence_by_sample_id[sample_id] = confidence
-                except (KeyError, TypeError, ValueError) as exc:
-                    quality_invalid_reasons[sample_id] = (
-                        f"invalid PnP quality values: {exc}"
-                    )
+                confidence_by_sample_id[sample_id] = confidence
+            except (KeyError, TypeError, ValueError) as exc:
+                quality_invalid_reasons[sample_id] = (
+                    f"invalid PnP quality values: {exc}"
+                )
 
             if not has_uncertainty_columns:
                 uncertainty_invalid_reasons[sample_id] = (

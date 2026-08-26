@@ -2,11 +2,10 @@
 
 from .deca_flame import (
     DEFAULT_DECA_ROOT,
-    FLAME_LEFT_EYE_CENTER_VERTEX,
-    FLAME_RIGHT_EYE_CENTER_VERTEX,
     DecaFlameConfig,
     DecaFlameExtractor,
     DecaFlameOutput,
+    head_local_pose_parameters,
 )
 from .face_preprocess import (
     DEFAULT_DECA_CROP_SCALE,
@@ -20,9 +19,13 @@ from .face_preprocess import (
 from .pnp import (
     CROSSGAZE_CAMERA_MATRIX,
     CROSSGAZE_DIST_COEFFS,
+    CROSSGAZE_IMAGE_HEIGHT_PX,
+    CROSSGAZE_IMAGE_WIDTH_PX,
     DEFAULT_PNP_MAPPING,
     FLAME_LEFT_EYE_CANTHUS_INDICES,
     FLAME_RIGHT_EYE_CANTHUS_INDICES,
+    MEDIAPIPE_PNP_LANDMARK_INDICES,
+    PNP_GEOMETRY_VERSION,
     PnpCamera,
     PnpConfig,
     PnpFaceDepthResult,
@@ -31,6 +34,7 @@ from .pnp import (
     compute_eye_canthus_midpoints,
     compute_scale_estimate,
     solve_pnp_face_depth,
+    validate_crossgaze_image_size,
 )
 from .iris_ipd import (
     IrisIpdReconstruction,
@@ -41,19 +45,22 @@ from .iris_ipd import (
 __all__ = [
     "CROSSGAZE_CAMERA_MATRIX",
     "CROSSGAZE_DIST_COEFFS",
+    "CROSSGAZE_IMAGE_HEIGHT_PX",
+    "CROSSGAZE_IMAGE_WIDTH_PX",
     "DEFAULT_DECA_ROOT",
     "DEFAULT_DECA_CROP_SCALE",
     "DEFAULT_PNP_MAPPING",
     "FACE_PREPROCESS_CHOICES",
     "FACE_PREPROCESS_DECA",
     "FACE_PREPROCESS_LEGACY",
-    "FLAME_LEFT_EYE_CENTER_VERTEX",
     "FLAME_LEFT_EYE_CANTHUS_INDICES",
-    "FLAME_RIGHT_EYE_CENTER_VERTEX",
     "FLAME_RIGHT_EYE_CANTHUS_INDICES",
+    "MEDIAPIPE_PNP_LANDMARK_INDICES",
+    "PNP_GEOMETRY_VERSION",
     "DecaFlameConfig",
     "DecaFlameExtractor",
     "DecaFlameOutput",
+    "head_local_pose_parameters",
     "FaceCropTransform",
     "PnpCamera",
     "PnpConfig",
@@ -65,6 +72,7 @@ __all__ = [
     "build_face_crop_transform",
     "prepare_deca_face_image",
     "solve_pnp_face_depth",
+    "validate_crossgaze_image_size",
     "IrisIpdReconstruction",
     "assign_iris_groups_to_anatomical_sides",
     "reconstruct_iris_centres_from_ipd",

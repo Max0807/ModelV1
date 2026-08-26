@@ -32,6 +32,7 @@ from modelv1.data.depth_prior import (
     canonical_eye_geometry_representation,
     eye_geometry_representation_dim,
 )
+from modelv1.data.eye_geometry_pseudo_labels import EYE_PSEUDO_POINT_COUNT
 from modelv1.scene import (
     SCENE_REPRESENTATION_FULL25,
     SCENE_REPRESENTATION_TABLE_FRAME7,
@@ -48,6 +49,16 @@ from modelv1.depth_distribution import (
 )
 from modelv1.gaze_distribution import tangent_cholesky_from_raw, tangent_sigma_points
 from modelv1.geometry import RayTableGeometry, RayTableGeometryConfig
+from modelv1.vertical_eye_geometry import (
+    LandmarkGuidedEyeFusion,
+    LowDOFDifferentiableEyeballTemplate,
+    PitchToTableVResidual,
+    ProbabilisticEyeLandmarkHead,
+    VerticalEyeGeometryFeatureExtractor,
+    VERTICAL_EYE_GEOMETRY_FEATURE_DIM,
+    VerticalGeometryVResidual,
+    stack_binocular_outputs,
+)
 
 
 DEFAULT_DECA_FEATURE_DIM = 236
@@ -74,7 +85,19 @@ FACE_IMAGE_BACKBONE = "inception_resnet_v1"
 FACE_IMAGE_FEATURE_CHANNELS = 1792
 EYE_IMAGE_FEATURE_CHANNELS = 512
 FACE_IMAGE_TOKEN_COUNT = 9
-BINOCULAR_EYE_TOKEN_COUNT = 8
+FACE_FEATURE_MODE_NATIVE_3X3 = "native_3x3"
+FACE_FEATURE_MODE_PADDED_MIXED7A_4X4 = "padded_mixed7a_4x4"
+FACE_FEATURE_MODE_TOKEN_GRIDS = {
+    FACE_FEATURE_MODE_NATIVE_3X3: (3, 3),
+    FACE_FEATURE_MODE_PADDED_MIXED7A_4X4: (4, 4),
+}
+DEFAULT_EYE_IMAGE_TOKEN_GRID = (2, 2)
+EYE_FEATURE_MODE_SINGLE_STAGE = "single_stage"
+EYE_FEATURE_MODE_MULTISCALE_FPN24 = "multiscale_fpn24"
+EYE_STEM_MODE_STANDARD = "standard"
+EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL = "small_3x3_s2_no_maxpool"
+VISUAL_TOKEN_POOLING_MEAN = "mean"
+VISUAL_TOKEN_POOLING_LEARNED = "learned"
 RESNET_EYE_BACKBONES = {
     "resnet18": (models.resnet18, models.ResNet18_Weights),
     SMALL_IMAGE_RESNET18_BACKBONE: (models.resnet18, models.ResNet18_Weights),
@@ -186,6 +209,7 @@ class ModelV1Config:
     face_hidden_dims: tuple[int, ...] = (256,)
     use_face_image: bool = False
     freeze_face_image_backbone: bool = False
+    face_feature_mode: str = FACE_FEATURE_MODE_NATIVE_3X3
     eye_embedding_dim: int = 128
     per_eye_embedding_dim: int = 96
     eye_backbone: str = DEFAULT_EYE_BACKBONE
@@ -195,11 +219,83 @@ class ModelV1Config:
     visual_attention_heads: int = 8
     visual_attention_ffn_dim: int = 256
     visual_attention_dropout: float = 0.1
+    use_binocular_self_attention: bool = False
+    binocular_attention_heads: int = 4
+    binocular_attention_dropout: float = 0.1
+    use_eye_iris_auxiliary: bool = False
+    eye_iris_auxiliary_feature_stage: str = "layer3"
+    eye_iris_auxiliary_hidden_channels: int = 128
+    use_eye_keypoint_auxiliary: bool = False
+    eye_keypoint_count: int = EYE_PSEUDO_POINT_COUNT
+    eye_keypoint_auxiliary_feature_stage: str = "layer3"
+    eye_keypoint_auxiliary_hidden_channels: int = 128
+    eye_keypoint_probability_temperature: float = 1.0
+    eye_keypoint_heatmap_size: tuple[int, int] = (28, 45)
+    eye_keypoint_predict_variance_correction: bool = True
+    eye_keypoint_max_abs_log_std_correction: float = 1.5
+    eye_keypoint_shape_embedding_dim: int = 32
+    use_landmark_guided_eye_fusion: bool = False
+    landmark_guided_fusion_heads: int = 4
+    landmark_guided_fusion_dropout: float = 0.1
+    landmark_guided_fusion_gate_init: float = 0.0
+    landmark_guided_fusion_gate_max: float = 1.0
+    landmark_guided_quality_logit_scale: float = 1.0
+    landmark_guided_uncertainty_scale_norm: float = 0.25
+    landmark_guided_min_quality: float = 0.1
+    landmark_guided_detach_probability_for_sampling: bool = True
+    landmark_guided_detach_landmark_statistics: bool = True
+    landmark_guided_detach_quality: bool = True
+    use_low_dof_eye_template: bool = False
+    eye_template_image_size: tuple[int, int] = (90, 56)
+    eye_template_pitch_range_deg: tuple[float, float] = (-35.0, 35.0)
+    eye_template_yaw_range_deg: tuple[float, float] = (-45.0, 45.0)
+    eye_template_pitch_bins: int = 29
+    eye_template_yaw_bins: int = 31
+    eye_template_posterior_temperature: float = 0.25
+    eye_template_covariance_floor_px: float = 0.75
+    eye_template_min_canthus_distance_px: float = 4.0
+    eye_template_min_geometry_confidence: float = 0.1
+    eye_template_center_energy_weight: float = 1.0
+    eye_template_rim_energy_weight: float = 1.0
+    eye_template_angle_prior_weight: float = 0.05
+    eye_template_learnable_parameters: bool = True
+    eye_template_use_reference_uncertainty: bool = True
+    eye_template_use_aperture_visibility: bool = True
+    use_pitch_to_v_residual: bool = False
+    use_vertical_geometry_residual: bool = False
+    vertical_geometry_residual_hidden_dims: tuple[int, ...] = (64, 32)
+    vertical_geometry_residual_max_abs_delta_mm: float = 250.0
+    vertical_geometry_residual_min_training_gate: float = 0.10
+    vertical_geometry_residual_min_inference_confidence: float = 0.10
+    pitch_to_v_target_frame: str = "table_local"
+    pitch_to_v_hidden_dims: tuple[int, ...] = (32, 16)
+    pitch_to_v_max_abs_delta_mm: float = 250.0
+    pitch_to_v_pitch_scale_deg: float = 20.0
+    pitch_to_v_uncertainty_scale_deg: float = 8.0
+    pitch_to_v_disagreement_scale_deg: float = 6.0
+    pitch_to_v_min_pitch_std_deg: float = 0.5
+    pitch_to_v_min_active_gate: float = 0.05
+    pitch_to_v_detach_uncertainty_gate: bool = True
+    pitch_to_v_use_camera_table_sensitivity: bool = True
+    pitch_to_v_min_abs_table_normal_z: float = 0.1
+    visual_token_pooling: str = VISUAL_TOKEN_POOLING_MEAN
+    visual_token_pooling_hidden_dim: int = 64
+    visual_token_pooling_dropout: float = 0.1
+    eye_stem_mode: str = EYE_STEM_MODE_STANDARD
+    eye_feature_mode: str = EYE_FEATURE_MODE_SINGLE_STAGE
+    eye_feature_stage: str = "layer4"
+    eye_token_grid: tuple[int, int] = DEFAULT_EYE_IMAGE_TOKEN_GRID
     crop_cam_embedding_dim: int = 64
     crop_cam_hidden_dims: tuple[int, ...] = (128,)
     scene_embedding_dim: int = 64
     scene_hidden_dims: tuple[int, ...] = (128,)
     fusion_hidden_dims: tuple[int, ...] = (256, 128)
+    use_virtual_distance_film: bool = False
+    use_virtual_pose_film: bool = False
+    virtual_pose_dim: int = 9
+    virtual_distance_film_hidden_dims: tuple[int, ...] = (16,)
+    virtual_distance_film_embedding_dim: int = 32
+    virtual_distance_film_delta_max: float = 0.1
 
     branch_dropout: float = 0.1
     fusion_dropout: float = 0.2
@@ -224,8 +320,27 @@ class ModelV1Config:
             "visual_attention_dim": self.visual_attention_dim,
             "visual_attention_heads": self.visual_attention_heads,
             "visual_attention_ffn_dim": self.visual_attention_ffn_dim,
+            "binocular_attention_heads": self.binocular_attention_heads,
+            "eye_iris_auxiliary_hidden_channels": (
+                self.eye_iris_auxiliary_hidden_channels
+            ),
+            "eye_keypoint_count": self.eye_keypoint_count,
+            "eye_keypoint_auxiliary_hidden_channels": (
+                self.eye_keypoint_auxiliary_hidden_channels
+            ),
+            "eye_keypoint_shape_embedding_dim": (
+                self.eye_keypoint_shape_embedding_dim
+            ),
+            "landmark_guided_fusion_heads": self.landmark_guided_fusion_heads,
+            "eye_template_pitch_bins": self.eye_template_pitch_bins,
+            "eye_template_yaw_bins": self.eye_template_yaw_bins,
+            "visual_token_pooling_hidden_dim": self.visual_token_pooling_hidden_dim,
             "crop_cam_embedding_dim": self.crop_cam_embedding_dim,
             "scene_embedding_dim": self.scene_embedding_dim,
+            "virtual_pose_dim": self.virtual_pose_dim,
+            "virtual_distance_film_embedding_dim": (
+                self.virtual_distance_film_embedding_dim
+            ),
         }
         object.__setattr__(self, "eye_backbone", canonical_eye_backbone(self.eye_backbone))
         prediction_mode = str(self.prediction_mode).strip().lower()
@@ -287,18 +402,385 @@ class ModelV1Config:
             raise ValueError(f"ModelV1Config dimensions must be positive: {non_positive}")
         if not self.fusion_hidden_dims:
             raise ValueError("fusion_hidden_dims must contain at least one layer width.")
+        if not isinstance(self.use_virtual_distance_film, bool):
+            raise ValueError("use_virtual_distance_film must be a boolean.")
+        if not isinstance(self.use_virtual_pose_film, bool):
+            raise ValueError("use_virtual_pose_film must be a boolean.")
+        if not isinstance(self.use_binocular_self_attention, bool):
+            raise ValueError("use_binocular_self_attention must be a boolean.")
+        if not isinstance(self.use_eye_iris_auxiliary, bool):
+            raise ValueError("use_eye_iris_auxiliary must be a boolean.")
+        if not isinstance(self.use_eye_keypoint_auxiliary, bool):
+            raise ValueError("use_eye_keypoint_auxiliary must be a boolean.")
+        if self.eye_keypoint_count != EYE_PSEUDO_POINT_COUNT:
+            raise ValueError(
+                "eye_keypoint_count must match the pseudo-label schema: "
+                f"{EYE_PSEUDO_POINT_COUNT}."
+            )
+        if self.eye_keypoint_probability_temperature <= 0:
+            raise ValueError(
+                "eye_keypoint_probability_temperature must be positive."
+            )
+        if not isinstance(self.eye_keypoint_predict_variance_correction, bool):
+            raise ValueError(
+                "eye_keypoint_predict_variance_correction must be a boolean."
+            )
+        if self.eye_keypoint_max_abs_log_std_correction <= 0:
+            raise ValueError(
+                "eye_keypoint_max_abs_log_std_correction must be positive."
+            )
+        if not isinstance(self.use_landmark_guided_eye_fusion, bool):
+            raise ValueError(
+                "use_landmark_guided_eye_fusion must be a boolean."
+            )
+        for detach_name in (
+            "landmark_guided_detach_probability_for_sampling",
+            "landmark_guided_detach_landmark_statistics",
+            "landmark_guided_detach_quality",
+        ):
+            if not isinstance(getattr(self, detach_name), bool):
+                raise ValueError(f"{detach_name} must be a boolean.")
+        if self.visual_attention_dim % self.landmark_guided_fusion_heads != 0:
+            raise ValueError(
+                "visual_attention_dim must be divisible by "
+                "landmark_guided_fusion_heads."
+            )
+        if not 0 <= self.landmark_guided_fusion_dropout < 1:
+            raise ValueError(
+                "landmark_guided_fusion_dropout must lie in [0, 1)."
+            )
+        if self.landmark_guided_fusion_gate_max <= 0 or not (
+            -self.landmark_guided_fusion_gate_max
+            < self.landmark_guided_fusion_gate_init
+            < self.landmark_guided_fusion_gate_max
+        ):
+            raise ValueError(
+                "landmark_guided_fusion_gate_init must lie strictly inside "
+                "(-landmark_guided_fusion_gate_max, "
+                "landmark_guided_fusion_gate_max)."
+            )
+        if self.landmark_guided_quality_logit_scale < 0:
+            raise ValueError(
+                "landmark_guided_quality_logit_scale must be non-negative."
+            )
+        if self.landmark_guided_uncertainty_scale_norm <= 0:
+            raise ValueError(
+                "landmark_guided_uncertainty_scale_norm must be positive."
+            )
+        if not 0 <= self.landmark_guided_min_quality < 1:
+            raise ValueError(
+                "landmark_guided_min_quality must lie in [0, 1)."
+            )
+        if not isinstance(self.use_low_dof_eye_template, bool):
+            raise ValueError("use_low_dof_eye_template must be a boolean.")
+        if not isinstance(self.eye_template_learnable_parameters, bool):
+            raise ValueError(
+                "eye_template_learnable_parameters must be a boolean."
+            )
+        if not isinstance(self.eye_template_use_reference_uncertainty, bool):
+            raise ValueError(
+                "eye_template_use_reference_uncertainty must be a boolean."
+            )
+        if not isinstance(self.eye_template_use_aperture_visibility, bool):
+            raise ValueError(
+                "eye_template_use_aperture_visibility must be a boolean."
+            )
+        if not isinstance(self.use_pitch_to_v_residual, bool):
+            raise ValueError("use_pitch_to_v_residual must be a boolean.")
+        if not isinstance(self.use_vertical_geometry_residual, bool):
+            raise ValueError(
+                "use_vertical_geometry_residual must be a boolean."
+            )
+        if self.use_vertical_geometry_residual and self.use_pitch_to_v_residual:
+            raise ValueError(
+                "use_vertical_geometry_residual and use_pitch_to_v_residual "
+                "are mutually exclusive."
+            )
+        if not isinstance(self.pitch_to_v_detach_uncertainty_gate, bool):
+            raise ValueError(
+                "pitch_to_v_detach_uncertainty_gate must be a boolean."
+            )
+        if not isinstance(self.pitch_to_v_use_camera_table_sensitivity, bool):
+            raise ValueError(
+                "pitch_to_v_use_camera_table_sensitivity must be a boolean."
+            )
+        if not 0 < self.pitch_to_v_min_abs_table_normal_z < 1:
+            raise ValueError(
+                "pitch_to_v_min_abs_table_normal_z must lie in (0, 1)."
+            )
+        pitch_to_v_target_frame = str(self.pitch_to_v_target_frame).strip().lower()
+        if pitch_to_v_target_frame not in {"table_local", "virtual_camera"}:
+            raise ValueError(
+                "pitch_to_v_target_frame must be table_local or virtual_camera."
+            )
+        object.__setattr__(
+            self, "pitch_to_v_target_frame", pitch_to_v_target_frame
+        )
+        if not self.pitch_to_v_hidden_dims or min(self.pitch_to_v_hidden_dims) <= 0:
+            raise ValueError("pitch_to_v_hidden_dims must contain positive widths.")
+        if min(
+            self.pitch_to_v_max_abs_delta_mm,
+            self.pitch_to_v_pitch_scale_deg,
+            self.pitch_to_v_uncertainty_scale_deg,
+            self.pitch_to_v_disagreement_scale_deg,
+            self.pitch_to_v_min_pitch_std_deg,
+        ) <= 0:
+            raise ValueError("Pitch-to-v residual scales must be positive.")
+        if not 0 <= self.pitch_to_v_min_active_gate <= 1:
+            raise ValueError("pitch_to_v_min_active_gate must lie in [0, 1].")
+        if self.eye_template_pitch_bins < 3 or self.eye_template_yaw_bins < 3:
+            raise ValueError("Eye-template pitch/yaw bins must be at least three.")
+        if self.eye_template_posterior_temperature <= 0:
+            raise ValueError(
+                "eye_template_posterior_temperature must be positive."
+            )
+        if self.eye_template_covariance_floor_px <= 0:
+            raise ValueError("eye_template_covariance_floor_px must be positive.")
+        if self.eye_template_min_canthus_distance_px <= 0:
+            raise ValueError(
+                "eye_template_min_canthus_distance_px must be positive."
+            )
+        if not 0 <= self.eye_template_min_geometry_confidence <= 1:
+            raise ValueError(
+                "eye_template_min_geometry_confidence must lie in [0, 1]."
+            )
+        if min(
+            self.eye_template_center_energy_weight,
+            self.eye_template_rim_energy_weight,
+            self.eye_template_angle_prior_weight,
+        ) < 0:
+            raise ValueError("Eye-template energy weights must be non-negative.")
+        if self.virtual_distance_film_delta_max <= 0:
+            raise ValueError("virtual_distance_film_delta_max must be positive.")
         if self.branch_dropout < 0 or self.fusion_dropout < 0:
             raise ValueError("branch_dropout and fusion_dropout must be non-negative.")
         if not 0 <= self.visual_attention_dropout < 1:
             raise ValueError("visual_attention_dropout must be in [0, 1).")
+        if not 0 <= self.binocular_attention_dropout < 1:
+            raise ValueError("binocular_attention_dropout must be in [0, 1).")
+        if not 0 <= self.visual_token_pooling_dropout < 1:
+            raise ValueError("visual_token_pooling_dropout must be in [0, 1).")
         if self.visual_attention_dim % self.visual_attention_heads != 0:
             raise ValueError(
                 "visual_attention_dim must be divisible by visual_attention_heads."
             )
+        if self.visual_attention_dim % self.binocular_attention_heads != 0:
+            raise ValueError(
+                "visual_attention_dim must be divisible by binocular_attention_heads."
+            )
+        object.__setattr__(
+            self,
+            "eye_feature_stage",
+            canonical_eye_feature_stage(self.eye_feature_stage),
+        )
+        object.__setattr__(
+            self,
+            "eye_feature_mode",
+            canonical_eye_feature_mode(self.eye_feature_mode),
+        )
+        object.__setattr__(
+            self,
+            "eye_stem_mode",
+            canonical_eye_stem_mode(self.eye_stem_mode),
+        )
+        object.__setattr__(
+            self,
+            "eye_iris_auxiliary_feature_stage",
+            canonical_eye_iris_auxiliary_feature_stage(
+                self.eye_iris_auxiliary_feature_stage
+            ),
+        )
+        object.__setattr__(
+            self,
+            "eye_keypoint_auxiliary_feature_stage",
+            canonical_eye_iris_auxiliary_feature_stage(
+                self.eye_keypoint_auxiliary_feature_stage
+            ),
+        )
+        object.__setattr__(
+            self,
+            "visual_token_pooling",
+            canonical_visual_token_pooling(self.visual_token_pooling),
+        )
+        object.__setattr__(
+            self,
+            "face_feature_mode",
+            canonical_face_feature_mode(self.face_feature_mode),
+        )
+        try:
+            eye_token_grid = tuple(int(value) for value in self.eye_token_grid)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "eye_token_grid must be a two-item (height, width) sequence."
+            ) from exc
+        if len(eye_token_grid) != 2 or any(value <= 0 for value in eye_token_grid):
+            raise ValueError(
+                "eye_token_grid must contain two positive (height, width) values."
+            )
+        object.__setattr__(self, "eye_token_grid", eye_token_grid)
+        try:
+            eye_keypoint_heatmap_size = tuple(
+                int(value) for value in self.eye_keypoint_heatmap_size
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "eye_keypoint_heatmap_size must be a two-item "
+                "(height, width) sequence."
+            ) from exc
+        if len(eye_keypoint_heatmap_size) != 2 or any(
+            value <= 1 for value in eye_keypoint_heatmap_size
+        ):
+            raise ValueError(
+                "eye_keypoint_heatmap_size must contain two values greater than one."
+            )
+        object.__setattr__(
+            self,
+            "eye_keypoint_heatmap_size",
+            eye_keypoint_heatmap_size,
+        )
+        for field_name in (
+            "eye_template_image_size",
+            "eye_template_pitch_range_deg",
+            "eye_template_yaw_range_deg",
+        ):
+            try:
+                pair = tuple(getattr(self, field_name))
+            except TypeError as exc:
+                raise ValueError(f"{field_name} must be a two-item sequence.") from exc
+            if len(pair) != 2:
+                raise ValueError(f"{field_name} must be a two-item sequence.")
+            if field_name == "eye_template_image_size":
+                pair = tuple(int(value) for value in pair)
+                if min(pair) <= 1:
+                    raise ValueError(
+                        "eye_template_image_size values must be greater than one."
+                    )
+            else:
+                pair = tuple(float(value) for value in pair)
+                if pair[0] >= pair[1]:
+                    raise ValueError(f"{field_name} must be strictly increasing.")
+            object.__setattr__(self, field_name, pair)
         if self.use_face_image and self.eye_backbone not in RESNET_EYE_BACKBONES:
             raise ValueError(
                 "Cross-attention visual fusion requires a torchvision ResNet "
                 f"eye backbone, got {self.eye_backbone!r}."
+            )
+        if (
+            self.use_face_image
+            and self.eye_feature_mode == EYE_FEATURE_MODE_MULTISCALE_FPN24
+            and self.eye_backbone not in {"resnet18", SMALL_IMAGE_RESNET18_BACKBONE}
+        ):
+            raise ValueError(
+                "eye_feature_mode='multiscale_fpn24' is defined for the "
+                "ResNet18 eye backbone."
+            )
+        if (
+            self.use_face_image
+            and self.eye_stem_mode == EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL
+            and self.eye_backbone != "resnet18"
+        ):
+            raise ValueError(
+                "eye_stem_mode='small_3x3_s2_no_maxpool' is defined for "
+                "eye_backbone='resnet18'."
+            )
+        if self.use_eye_iris_auxiliary and not self.use_face_image:
+            raise ValueError(
+                "use_eye_iris_auxiliary=True requires use_face_image=True."
+            )
+        if self.use_eye_iris_auxiliary and self.eye_backbone != "resnet18":
+            raise ValueError(
+                "Iris auxiliary supervision is defined for eye_backbone='resnet18'."
+            )
+        if self.use_eye_keypoint_auxiliary and not self.use_face_image:
+            raise ValueError(
+                "use_eye_keypoint_auxiliary=True requires use_face_image=True."
+            )
+        if self.use_eye_keypoint_auxiliary and self.eye_backbone != "resnet18":
+            raise ValueError(
+                "Probabilistic eye-keypoint supervision is defined for "
+                "eye_backbone='resnet18'."
+            )
+        if (
+            self.use_landmark_guided_eye_fusion
+            and not self.use_eye_keypoint_auxiliary
+        ):
+            raise ValueError(
+                "use_landmark_guided_eye_fusion=True requires "
+                "use_eye_keypoint_auxiliary=True."
+            )
+        if self.use_landmark_guided_eye_fusion and not self.use_face_image:
+            raise ValueError(
+                "use_landmark_guided_eye_fusion=True requires "
+                "use_face_image=True."
+            )
+        if self.use_low_dof_eye_template and not self.use_eye_keypoint_auxiliary:
+            raise ValueError(
+                "use_low_dof_eye_template=True requires "
+                "use_eye_keypoint_auxiliary=True."
+            )
+        if self.use_vertical_geometry_residual and not self.use_eye_keypoint_auxiliary:
+            raise ValueError(
+                "use_vertical_geometry_residual=True requires "
+                "use_eye_keypoint_auxiliary=True."
+            )
+        if (
+            self.use_vertical_geometry_residual
+            and self.prediction_mode != PREDICTION_MODE_DIRECT_UV
+        ):
+            raise ValueError(
+                "Vertical geometry residual correction requires direct_uv mode."
+            )
+        if self.use_vertical_geometry_residual and self.use_pitch_to_v_residual:
+            raise ValueError(
+                "Use either vertical geometry residual or pitch-to-v residual, "
+                "not both."
+            )
+        if (
+            not self.vertical_geometry_residual_hidden_dims
+            or min(self.vertical_geometry_residual_hidden_dims) <= 0
+        ):
+            raise ValueError(
+                "vertical_geometry_residual_hidden_dims must contain positive widths."
+            )
+        if self.vertical_geometry_residual_max_abs_delta_mm <= 0:
+            raise ValueError(
+                "vertical_geometry_residual_max_abs_delta_mm must be positive."
+            )
+        if not 0 <= self.vertical_geometry_residual_min_training_gate <= 1:
+            raise ValueError(
+                "vertical_geometry_residual_min_training_gate must lie in [0, 1]."
+            )
+        if not 0 <= self.vertical_geometry_residual_min_inference_confidence <= 1:
+            raise ValueError(
+                "vertical_geometry_residual_min_inference_confidence must lie in [0, 1]."
+            )
+        if self.use_pitch_to_v_residual and not self.use_low_dof_eye_template:
+            raise ValueError(
+                "use_pitch_to_v_residual=True requires "
+                "use_low_dof_eye_template=True."
+            )
+        if (
+            self.use_pitch_to_v_residual
+            and self.prediction_mode != PREDICTION_MODE_DIRECT_UV
+        ):
+            raise ValueError(
+                "Pitch-to-v residual correction currently requires direct_uv mode."
+            )
+        if (
+            self.use_pitch_to_v_residual
+            and self.scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7
+        ):
+            raise ValueError(
+                "Pitch-to-v residual correction requires scene_representation="
+                "table_frame7."
+            )
+        if (
+            self.use_eye_iris_auxiliary
+            and self.prediction_mode != PREDICTION_MODE_DIRECT_UV
+        ):
+            raise ValueError(
+                "Iris auxiliary supervision is currently supported only in "
+                "prediction_mode='direct_uv'."
             )
         if self.use_face_image and not self.share_eye_encoder:
             raise ValueError(
@@ -364,6 +846,14 @@ class ModelV1Config:
         if self.eye_geometry_gate_delta_max <= 0:
             raise ValueError("eye_geometry_gate_delta_max must be positive.")
         if self.prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY:
+            if self.use_virtual_distance_film:
+                raise ValueError(
+                    "Virtual-distance FiLM is only supported by direct_uv mode."
+                )
+            if self.use_virtual_pose_film:
+                raise ValueError(
+                    "Virtual-camera pose FiLM is only supported by direct_uv mode."
+                )
             if self.gaze_dim != 3:
                 raise ValueError("gaze_geometry prediction requires gaze_dim=3.")
             if not isinstance(self.use_gaze_uncertainty, bool):
@@ -432,15 +922,42 @@ class ModelV1Config:
                         "DepthCorrectionHead requires 6D normalized PnP geometry "
                         "and 4D PnP quality (10D total)."
                     )
-        elif self.use_depth_correction:
-            raise ValueError(
-                "use_depth_correction=True requires prediction_mode='gaze_geometry'."
-            )
-        elif self.gaze_prediction_frame != GAZE_PREDICTION_FRAME_CAMERA:
-            raise ValueError(
-                "gaze_prediction_frame='virtual_camera' requires "
-                "prediction_mode='gaze_geometry'."
-            )
+        else:
+            if self.use_depth_correction:
+                raise ValueError(
+                    "use_depth_correction=True requires "
+                    "prediction_mode='gaze_geometry'."
+                )
+            if (
+                self.use_virtual_distance_film
+                and self.scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7
+            ):
+                raise ValueError(
+                    "Virtual-distance FiLM requires "
+                    "scene_representation='table_frame7'."
+                )
+            if (
+                self.use_virtual_pose_film
+                and self.scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7
+            ):
+                raise ValueError(
+                    "Virtual-camera pose FiLM requires "
+                    "scene_representation='table_frame7'."
+                )
+            if (
+                self.use_virtual_distance_film or self.use_virtual_pose_film
+            ) and len(self.fusion_hidden_dims) < 2:
+                raise ValueError(
+                    "Direct-UV FiLM requires fusion_hidden_dims to contain "
+                    "at least the FiLM width and output width."
+                )
+            if self.use_virtual_pose_film and self.virtual_pose_dim != 9:
+                raise ValueError("Virtual-camera pose FiLM requires virtual_pose_dim=9.")
+            if self.gaze_prediction_frame != GAZE_PREDICTION_FRAME_CAMERA:
+                raise ValueError(
+                    "gaze_prediction_frame='virtual_camera' requires "
+                    "prediction_mode='gaze_geometry'."
+                )
         if self.depth_reweighter_dropout < 0:
             raise ValueError("depth_reweighter_dropout must be non-negative.")
         if self.depth_correction_dropout < 0:
@@ -507,13 +1024,47 @@ class ResNetEyeImageEncoder(nn.Module):
         dropout: float,
         weights: str | None = None,
         in_channels: int = 3,
+        spatial_pool_size: tuple[int, int] | None = None,
+        feature_map_stage: str = "layer4",
+        feature_map_mode: str = EYE_FEATURE_MODE_SINGLE_STAGE,
+        stem_mode: str = EYE_STEM_MODE_STANDARD,
     ) -> None:
         super().__init__()
         self.backbone_name = canonical_eye_backbone(backbone)
+        self.spatial_pool_size = spatial_pool_size
+        self.feature_map_stage = canonical_eye_feature_stage(feature_map_stage)
+        self.feature_map_mode = canonical_eye_feature_mode(feature_map_mode)
+        self.stem_mode = canonical_eye_stem_mode(stem_mode)
+        if (
+            self.feature_map_mode == EYE_FEATURE_MODE_MULTISCALE_FPN24
+            and self.backbone_name not in {"resnet18", SMALL_IMAGE_RESNET18_BACKBONE}
+        ):
+            raise ValueError(
+                "feature_map_mode='multiscale_fpn24' is defined for the "
+                "ResNet18 eye backbone."
+            )
+        if (
+            self.stem_mode == EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL
+            and self.backbone_name != "resnet18"
+        ):
+            raise ValueError(
+                "stem_mode='small_3x3_s2_no_maxpool' is defined for "
+                "backbone='resnet18'."
+            )
         resolved_weights = resolve_resnet_weights(self.backbone_name, weights)
         builder, _ = RESNET_EYE_BACKBONES[self.backbone_name]
         resnet = builder(weights=resolved_weights)
-        if self.backbone_name == SMALL_IMAGE_RESNET18_BACKBONE:
+        if self.stem_mode == EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL:
+            resnet.conv1 = replace_resnet_h5_small_stem(
+                resnet.conv1,
+                in_channels,
+                bool(resolved_weights),
+            )
+            resnet.maxpool = nn.Identity()
+            # The kernel support changes from 7x7 to 3x3, so inherited
+            # ImageNet BatchNorm statistics are no longer representative.
+            resnet.bn1.reset_running_stats()
+        elif self.backbone_name == SMALL_IMAGE_RESNET18_BACKBONE:
             resnet.conv1 = replace_resnet_small_image_stem(
                 resnet.conv1,
                 in_channels,
@@ -522,9 +1073,61 @@ class ResNetEyeImageEncoder(nn.Module):
             resnet.maxpool = nn.Identity()
         elif in_channels != 3:
             resnet.conv1 = replace_first_conv(resnet.conv1, in_channels, bool(resolved_weights))
-        feature_dim = resnet.fc.in_features
+        feature_dim = (
+            128
+            if self.feature_map_mode == EYE_FEATURE_MODE_MULTISCALE_FPN24
+            else resnet_stage_feature_channels(resnet, self.feature_map_stage)
+        )
         resnet.fc = nn.Identity()
         self.backbone = resnet
+        self.feature_map_channels = feature_dim
+        if self.feature_map_mode == EYE_FEATURE_MODE_MULTISCALE_FPN24:
+            if self.stem_mode == EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL:
+                # H5 at 90x56: layer2/3/4 are 14x23, 7x12 and 4x6.
+                # Keep the native layer3 grid for denser 7x12 eye tokens.
+                self.fpn_layer2 = nn.Sequential(
+                    nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(128),
+                    nn.SiLU(inplace=True),
+                )
+                self.fpn_layer3 = nn.Sequential(
+                    nn.Conv2d(256, 128, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(128),
+                    nn.SiLU(inplace=True),
+                )
+                self.fpn_layer4 = nn.Sequential(
+                    nn.Conv2d(512, 128, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(128),
+                    nn.SiLU(inplace=True),
+                )
+            else:
+                # H3 at 90x56: layer2/3/4 are 7x12, 4x6 and 2x3.
+                # Align them on the native layer3 grid.
+                self.fpn_layer2 = nn.Sequential(
+                    nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(128),
+                    nn.SiLU(inplace=True),
+                )
+                self.fpn_layer3 = nn.Sequential(
+                    nn.Conv2d(256, 128, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(128),
+                    nn.SiLU(inplace=True),
+                )
+                self.fpn_layer4 = nn.Sequential(
+                    nn.Conv2d(512, 128, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(128),
+                    nn.SiLU(inplace=True),
+                )
+            self.fpn_fusion = nn.Sequential(
+                nn.Conv2d(384, 128, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.SiLU(inplace=True),
+            )
+        else:
+            self.fpn_layer2 = None
+            self.fpn_layer3 = None
+            self.fpn_layer4 = None
+            self.fpn_fusion = None
         self.backbone_train_from: str | None = "stem"
         self._frozen_backbone_modules: tuple[nn.Module, ...] = ()
         self.proj = (
@@ -551,7 +1154,12 @@ class ResNetEyeImageEncoder(nn.Module):
         return self.proj(pooled)
 
     def forward_feature_map(self, image: Tensor) -> Tensor:
-        """Return the layer4 feature map before ResNet global pooling."""
+        """Return a selected spatial ResNet stage before global pooling."""
+
+        return self.forward_feature_maps(image)["feature_map"]
+
+    def forward_feature_maps(self, image: Tensor) -> dict[str, Tensor]:
+        """Return the fused map together with unpooled ResNet stage maps."""
 
         image = ensure_image_batch(image, "eye")
         x = image.float()
@@ -560,9 +1168,43 @@ class ResNetEyeImageEncoder(nn.Module):
         x = self.backbone.relu(x)
         x = self.backbone.maxpool(x)
         x = self.backbone.layer1(x)
-        x = self.backbone.layer2(x)
-        x = self.backbone.layer3(x)
-        return self.backbone.layer4(x)
+        layer2 = self.backbone.layer2(x)
+        layer3 = self.backbone.layer3(layer2)
+        layer4 = self.backbone.layer4(layer3)
+        if self.feature_map_mode == EYE_FEATURE_MODE_MULTISCALE_FPN24:
+            assert self.fpn_layer2 is not None
+            assert self.fpn_layer3 is not None
+            assert self.fpn_layer4 is not None
+            assert self.fpn_fusion is not None
+            layer2_aligned = self.fpn_layer2(layer2)
+            layer3_aligned = self.fpn_layer3(layer3)
+            target_size = layer3.shape[-2:]
+            layer4_aligned = F.interpolate(
+                self.fpn_layer4(layer4),
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+            feature_map = self.fpn_fusion(
+                torch.cat((layer2_aligned, layer3_aligned, layer4_aligned), dim=1)
+            )
+        else:
+            feature_map = (
+                layer3
+                if self.feature_map_stage == "layer3"
+                else layer4
+            )
+        if (
+            self.spatial_pool_size is not None
+            and tuple(feature_map.shape[-2:]) != self.spatial_pool_size
+        ):
+            feature_map = F.adaptive_avg_pool2d(feature_map, self.spatial_pool_size)
+        return {
+            "feature_map": feature_map,
+            "layer2": layer2,
+            "layer3": layer3,
+            "layer4": layer4,
+        }
 
     def set_backbone_train_from(self, stage: str | None) -> None:
         """Freeze the backbone below ``stage``; ``None`` freezes it all."""
@@ -628,6 +1270,86 @@ class EyeImageEncoder(nn.Module):
         return self.net if isinstance(self.net, ResNetEyeImageEncoder) else None
 
 
+def _set_basic_conv_padding(module: nn.Module, padding: int) -> bool:
+    conv = getattr(module, "conv", module)
+    if not isinstance(conv, nn.Conv2d):
+        return False
+    conv.padding = (padding, padding)
+    return True
+
+
+def _module_at_path(module: nn.Module, path: tuple[str | int, ...]) -> nn.Module | None:
+    current: nn.Module = module
+    for part in path:
+        try:
+            if isinstance(part, int):
+                current = current[part]  # type: ignore[index]
+            else:
+                current = getattr(current, part)
+        except (AttributeError, IndexError, TypeError):
+            return None
+    return current
+
+
+def adapt_mixed_7a_for_padded_4x4(mixed_7a: nn.Module) -> None:
+    """Keep one extra spatial cell when Inception-ResNet downsamples 8x8 to 4x4."""
+
+    patched_conv_paths = 0
+    for path in (
+        ("branch0",),
+        ("branch0", 1),
+        ("branch1", 1),
+        ("branch2", 2),
+    ):
+        target = _module_at_path(mixed_7a, path)
+        if target is not None and _set_basic_conv_padding(target, padding=1):
+            patched_conv_paths += 1
+    branch3 = getattr(mixed_7a, "branch3", None)
+    patched_pool = False
+    if isinstance(branch3, nn.MaxPool2d):
+        mixed_7a.branch3 = nn.MaxPool2d(  # type: ignore[attr-defined]
+            kernel_size=branch3.kernel_size,
+            stride=branch3.stride,
+            padding=1,
+            dilation=branch3.dilation,
+            return_indices=branch3.return_indices,
+            ceil_mode=branch3.ceil_mode,
+        )
+        patched_pool = True
+    if patched_conv_paths < 3 or not patched_pool:
+        raise TypeError(
+            "Could not adapt facenet-pytorch mixed_7a for 4x4 face tokens; "
+            "the module layout is not recognized."
+        )
+
+
+def canonical_face_feature_mode(value: str) -> str:
+    """Return the Inception-ResNet spatial-token topology for face images."""
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "native": FACE_FEATURE_MODE_NATIVE_3X3,
+        "native_3x3": FACE_FEATURE_MODE_NATIVE_3X3,
+        "3x3": FACE_FEATURE_MODE_NATIVE_3X3,
+        "f0": FACE_FEATURE_MODE_NATIVE_3X3,
+        "padded_mixed7a_4x4": FACE_FEATURE_MODE_PADDED_MIXED7A_4X4,
+        "mixed7a_4x4": FACE_FEATURE_MODE_PADDED_MIXED7A_4X4,
+        "4x4": FACE_FEATURE_MODE_PADDED_MIXED7A_4X4,
+        "f1": FACE_FEATURE_MODE_PADDED_MIXED7A_4X4,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        supported = ", ".join(FACE_FEATURE_MODE_TOKEN_GRIDS)
+        raise ValueError(
+            f"face_feature_mode must be one of: {supported}, got {value!r}."
+        ) from exc
+
+
+def face_feature_token_grid(feature_mode: str) -> tuple[int, int]:
+    return FACE_FEATURE_MODE_TOKEN_GRIDS[canonical_face_feature_mode(feature_mode)]
+
+
 class InceptionResnetFaceEncoder(nn.Module):
     """Return VGGFace2 Inception-ResNet spatial features for a 160x160 face."""
 
@@ -635,6 +1357,7 @@ class InceptionResnetFaceEncoder(nn.Module):
         self,
         *,
         freeze_backbone: bool = False,
+        feature_mode: str = FACE_FEATURE_MODE_NATIVE_3X3,
     ) -> None:
         super().__init__()
         try:
@@ -648,10 +1371,14 @@ class InceptionResnetFaceEncoder(nn.Module):
         self.backbone_name = FACE_IMAGE_BACKBONE
         self.pretrained_dataset = FACE_IMAGE_PRETRAINED_DATASET
         self.freeze_backbone = freeze_backbone
+        self.feature_mode = canonical_face_feature_mode(feature_mode)
+        self.output_grid = face_feature_token_grid(self.feature_mode)
         self.backbone = InceptionResnetV1(
             pretrained=self.pretrained_dataset,
             classify=False,
         )
+        if self.feature_mode == FACE_FEATURE_MODE_PADDED_MIXED7A_4X4:
+            adapt_mixed_7a_for_padded_4x4(self.backbone.mixed_7a)
         # The pretrained identity-classification head is not used by the
         # embedding path and would otherwise remain as dead parameters.
         self.backbone.logits = nn.Identity()
@@ -678,6 +1405,12 @@ class InceptionResnetFaceEncoder(nn.Module):
             "block8",
         ):
             x = getattr(self.backbone, stage_name)(x)
+        if tuple(x.shape[-2:]) != self.output_grid:
+            raise ValueError(
+                f"Expected a {self.output_grid[0]}x{self.output_grid[1]} "
+                "Inception-ResNet face feature map for "
+                f"feature_mode={self.feature_mode!r}, got {tuple(x.shape[-2:])}."
+            )
         return x
 
     def train(self, mode: bool = True) -> InceptionResnetFaceEncoder:
@@ -687,6 +1420,96 @@ class InceptionResnetFaceEncoder(nn.Module):
             # running statistics fixed.
             self.backbone.eval()
         return self
+
+
+class ProbabilisticEyeKeypointHead(nn.Module):
+    """Predict spatial distributions and their moments for eye landmarks.
+
+    The head emits one categorical distribution over the feature-map grid for
+    each keypoint. Its expectation is the normalized crop coordinate and its
+    second central moment is a full 2D covariance. Consequently uncertainty is
+    derived from the same distribution as the position instead of a separate,
+    potentially inconsistent confidence regressor.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_channels: int,
+        hidden_channels: int,
+        keypoint_count: int = EYE_PSEUDO_POINT_COUNT,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if input_channels <= 0 or hidden_channels <= 0 or keypoint_count <= 0:
+            raise ValueError("Probabilistic keypoint-head dimensions must be positive.")
+        if temperature <= 0:
+            raise ValueError("Probabilistic keypoint temperature must be positive.")
+        self.keypoint_count = int(keypoint_count)
+        self.temperature = float(temperature)
+        self.predictor = nn.Sequential(
+            nn.Conv2d(
+                input_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(hidden_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, self.keypoint_count, kernel_size=1),
+        )
+
+    def forward(self, feature_map: Tensor) -> dict[str, Tensor]:
+        if feature_map.ndim != 4:
+            raise ValueError(
+                "Eye keypoint feature_map must have shape [B, C, H, W], got "
+                f"{tuple(feature_map.shape)}."
+            )
+        logits = self.predictor(feature_map)
+        batch_size, keypoint_count, height, width = logits.shape
+        if keypoint_count != self.keypoint_count or height <= 0 or width <= 0:
+            raise RuntimeError("Probabilistic keypoint head produced an invalid shape.")
+
+        # Moment computation remains FP32 under AMP so small covariances do not
+        # underflow and uncertainty can safely drive later geometry fitting.
+        flat_logits = logits.float().flatten(start_dim=2) / self.temperature
+        probabilities = torch.softmax(flat_logits, dim=-1)
+        y_coordinates, x_coordinates = torch.meshgrid(
+            torch.linspace(0.0, 1.0, height, device=logits.device),
+            torch.linspace(0.0, 1.0, width, device=logits.device),
+            indexing="ij",
+        )
+        coordinate_grid = torch.stack(
+            (x_coordinates, y_coordinates), dim=-1
+        ).reshape(height * width, 2)
+        mean_xy = torch.einsum(
+            "bkn,nc->bkc", probabilities, coordinate_grid
+        )
+        centered = coordinate_grid[None, None, :, :] - mean_xy[:, :, None, :]
+        covariance = torch.einsum(
+            "bkn,bknc,bknd->bkcd",
+            probabilities,
+            centered,
+            centered,
+        )
+        variance_xy = torch.diagonal(covariance, dim1=-2, dim2=-1)
+        log_probabilities = torch.log(probabilities.clamp_min(1e-12))
+        entropy = -(probabilities * log_probabilities).sum(dim=-1)
+        if height * width > 1:
+            entropy = entropy / math.log(height * width)
+        confidence = (1.0 - entropy).clamp(0.0, 1.0)
+        return {
+            "logits": logits,
+            "probability_maps": probabilities.reshape(
+                batch_size, keypoint_count, height, width
+            ),
+            "mean_xy": mean_xy,
+            "covariance": covariance,
+            "variance_xy": variance_xy,
+            "entropy": entropy,
+            "confidence": confidence,
+        }
 
 
 class CrossAttentionVisualEncoder(nn.Module):
@@ -703,30 +1526,222 @@ class CrossAttentionVisualEncoder(nn.Module):
         eye_backbone: str,
         eye_backbone_weights: str | None,
         freeze_face_backbone: bool,
+        face_feature_mode: str = FACE_FEATURE_MODE_NATIVE_3X3,
+        eye_token_grid: tuple[int, int] = DEFAULT_EYE_IMAGE_TOKEN_GRID,
+        eye_feature_stage: str = "layer4",
+        eye_feature_mode: str = EYE_FEATURE_MODE_SINGLE_STAGE,
+        eye_stem_mode: str = EYE_STEM_MODE_STANDARD,
+        use_binocular_self_attention: bool = False,
+        binocular_attention_heads: int = 4,
+        binocular_attention_dropout: float = 0.1,
+        use_iris_auxiliary: bool = False,
+        iris_auxiliary_feature_stage: str = "layer3",
+        iris_auxiliary_hidden_channels: int = 128,
+        use_keypoint_auxiliary: bool = False,
+        keypoint_count: int = EYE_PSEUDO_POINT_COUNT,
+        keypoint_auxiliary_feature_stage: str = "layer3",
+        keypoint_auxiliary_hidden_channels: int = 128,
+        keypoint_probability_temperature: float = 1.0,
+        keypoint_heatmap_size: tuple[int, int] = (28, 45),
+        keypoint_predict_variance_correction: bool = True,
+        keypoint_max_abs_log_std_correction: float = 1.5,
+        keypoint_shape_embedding_dim: int = 32,
+        use_landmark_guided_fusion: bool = False,
+        landmark_guided_fusion_heads: int = 4,
+        landmark_guided_fusion_dropout: float = 0.1,
+        landmark_guided_fusion_gate_init: float = 0.0,
+        landmark_guided_fusion_gate_max: float = 1.0,
+        landmark_guided_quality_logit_scale: float = 1.0,
+        landmark_guided_uncertainty_scale_norm: float = 0.25,
+        landmark_guided_min_quality: float = 0.1,
+        landmark_guided_detach_probability_for_sampling: bool = True,
+        landmark_guided_detach_landmark_statistics: bool = True,
+        landmark_guided_detach_quality: bool = True,
+        use_low_dof_eye_template: bool = False,
+        eye_template_image_size: tuple[int, int] = (90, 56),
+        eye_template_pitch_range_deg: tuple[float, float] = (-35.0, 35.0),
+        eye_template_yaw_range_deg: tuple[float, float] = (-45.0, 45.0),
+        eye_template_pitch_bins: int = 29,
+        eye_template_yaw_bins: int = 31,
+        eye_template_posterior_temperature: float = 0.25,
+        eye_template_covariance_floor_px: float = 0.75,
+        eye_template_min_canthus_distance_px: float = 4.0,
+        eye_template_min_geometry_confidence: float = 0.1,
+        eye_template_center_energy_weight: float = 1.0,
+        eye_template_rim_energy_weight: float = 1.0,
+        eye_template_angle_prior_weight: float = 0.05,
+        eye_template_learnable_parameters: bool = True,
+        eye_template_use_reference_uncertainty: bool = True,
+        eye_template_use_aperture_visibility: bool = True,
+        token_pooling: str = VISUAL_TOKEN_POOLING_MEAN,
+        token_pooling_hidden_dim: int = 64,
+        token_pooling_dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        self.eye_feature_stage = canonical_eye_feature_stage(eye_feature_stage)
+        self.eye_feature_mode = canonical_eye_feature_mode(eye_feature_mode)
+        self.eye_stem_mode = canonical_eye_stem_mode(eye_stem_mode)
+        self.use_binocular_self_attention = bool(use_binocular_self_attention)
+        self.use_iris_auxiliary = bool(use_iris_auxiliary)
+        self.use_keypoint_auxiliary = bool(use_keypoint_auxiliary)
+        self.use_landmark_guided_fusion = bool(use_landmark_guided_fusion)
+        if self.use_landmark_guided_fusion and not self.use_keypoint_auxiliary:
+            raise ValueError(
+                "use_landmark_guided_fusion requires use_keypoint_auxiliary=True."
+            )
+        if use_low_dof_eye_template and not self.use_keypoint_auxiliary:
+            raise ValueError(
+                "use_low_dof_eye_template requires use_keypoint_auxiliary=True."
+            )
+        self.face_feature_mode = canonical_face_feature_mode(face_feature_mode)
+        self.face_token_grid = face_feature_token_grid(self.face_feature_mode)
+        self.face_token_count = math.prod(self.face_token_grid)
+        self.iris_auxiliary_feature_stage = canonical_eye_iris_auxiliary_feature_stage(
+            iris_auxiliary_feature_stage
+        )
+        self.keypoint_auxiliary_feature_stage = (
+            canonical_eye_iris_auxiliary_feature_stage(
+                keypoint_auxiliary_feature_stage
+            )
+        )
+        self.token_pooling = canonical_visual_token_pooling(token_pooling)
+        if binocular_attention_heads <= 0:
+            raise ValueError("binocular_attention_heads must be positive.")
+        if attention_dim % binocular_attention_heads != 0:
+            raise ValueError(
+                "attention_dim must be divisible by binocular_attention_heads."
+            )
+        if not 0 <= binocular_attention_dropout < 1:
+            raise ValueError("binocular_attention_dropout must be in [0, 1).")
+        if iris_auxiliary_hidden_channels <= 0:
+            raise ValueError("iris_auxiliary_hidden_channels must be positive.")
+        if token_pooling_hidden_dim <= 0:
+            raise ValueError("token_pooling_hidden_dim must be positive.")
+        if not 0 <= token_pooling_dropout < 1:
+            raise ValueError("token_pooling_dropout must be in [0, 1).")
+        self.eye_token_grid = tuple(int(value) for value in eye_token_grid)
+        if len(self.eye_token_grid) != 2 or any(
+            value <= 0 for value in self.eye_token_grid
+        ):
+            raise ValueError(
+                "eye_token_grid must contain two positive (height, width) values."
+            )
+        self.binocular_eye_token_count = 2 * math.prod(self.eye_token_grid)
         self.face_encoder = InceptionResnetFaceEncoder(
             freeze_backbone=freeze_face_backbone,
+            feature_mode=self.face_feature_mode,
         )
         self.eye_encoder = ResNetEyeImageEncoder(
             backbone=eye_backbone,
             embedding_dim=None,
             dropout=dropout,
             weights=eye_backbone_weights,
+            spatial_pool_size=self.eye_token_grid,
+            feature_map_stage=self.eye_feature_stage,
+            feature_map_mode=self.eye_feature_mode,
+            stem_mode=self.eye_stem_mode,
         )
         self.face_projection = nn.Sequential(
             nn.Linear(FACE_IMAGE_FEATURE_CHANNELS, attention_dim),
             nn.LayerNorm(attention_dim),
         )
         self.eye_projection = nn.Sequential(
-            nn.Linear(EYE_IMAGE_FEATURE_CHANNELS, attention_dim),
+            nn.Linear(self.eye_encoder.feature_map_channels, attention_dim),
             nn.LayerNorm(attention_dim),
         )
+        iris_feature_channels = {
+            "layer2": 128,
+            "layer3": 256,
+        }[self.iris_auxiliary_feature_stage]
+        self.iris_heatmap_head = (
+            nn.Sequential(
+                nn.Conv2d(
+                    iris_feature_channels,
+                    iris_auxiliary_hidden_channels,
+                    kernel_size=3,
+                    padding=1,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(iris_auxiliary_hidden_channels),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(iris_auxiliary_hidden_channels, 1, kernel_size=1),
+            )
+            if self.use_iris_auxiliary
+            else None
+        )
+        self.eye_keypoint_head = (
+            ProbabilisticEyeLandmarkHead(
+                layer2_channels=128,
+                layer3_channels=256,
+                hidden_channels=keypoint_auxiliary_hidden_channels,
+                keypoint_count=keypoint_count,
+                output_size=keypoint_heatmap_size,
+                temperature=keypoint_probability_temperature,
+                predict_variance_correction=(
+                    keypoint_predict_variance_correction
+                ),
+                max_abs_log_std_correction=(
+                    keypoint_max_abs_log_std_correction
+                ),
+                shape_embedding_dim=keypoint_shape_embedding_dim,
+            )
+            if self.use_keypoint_auxiliary
+            else None
+        )
+        self.eye_geometry_template = (
+            LowDOFDifferentiableEyeballTemplate(
+                eye_image_size=eye_template_image_size,
+                pitch_range_deg=eye_template_pitch_range_deg,
+                yaw_range_deg=eye_template_yaw_range_deg,
+                pitch_bins=eye_template_pitch_bins,
+                yaw_bins=eye_template_yaw_bins,
+                posterior_temperature=eye_template_posterior_temperature,
+                covariance_floor_px=eye_template_covariance_floor_px,
+                min_canthus_distance_px=eye_template_min_canthus_distance_px,
+                min_geometry_confidence=eye_template_min_geometry_confidence,
+                center_energy_weight=eye_template_center_energy_weight,
+                rim_energy_weight=eye_template_rim_energy_weight,
+                angle_prior_weight=eye_template_angle_prior_weight,
+                learnable_template=eye_template_learnable_parameters,
+                use_reference_uncertainty=(
+                    eye_template_use_reference_uncertainty
+                ),
+                use_aperture_visibility=(
+                    eye_template_use_aperture_visibility
+                ),
+            )
+            if use_low_dof_eye_template
+            else None
+        )
+        self.landmark_guided_fusion = (
+            LandmarkGuidedEyeFusion(
+                token_dim=attention_dim,
+                num_heads=landmark_guided_fusion_heads,
+                dropout=landmark_guided_fusion_dropout,
+                keypoint_count=keypoint_count,
+                gate_init=landmark_guided_fusion_gate_init,
+                gate_max=landmark_guided_fusion_gate_max,
+                quality_logit_scale=landmark_guided_quality_logit_scale,
+                uncertainty_scale_norm=(
+                    landmark_guided_uncertainty_scale_norm
+                ),
+                min_quality=landmark_guided_min_quality,
+                detach_probability_for_sampling=(
+                    landmark_guided_detach_probability_for_sampling
+                ),
+                detach_landmark_statistics=(
+                    landmark_guided_detach_landmark_statistics
+                ),
+                detach_quality=landmark_guided_detach_quality,
+            )
+            if self.use_landmark_guided_fusion
+            else None
+        )
         self.face_position = nn.Parameter(
-            torch.zeros(1, FACE_IMAGE_TOKEN_COUNT, attention_dim)
+            torch.zeros(1, self.face_token_count, attention_dim)
         )
         self.eye_position = nn.Parameter(
-            torch.zeros(1, BINOCULAR_EYE_TOKEN_COUNT, attention_dim)
+            torch.zeros(1, self.binocular_eye_token_count, attention_dim)
         )
         self.left_eye_type = nn.Parameter(torch.zeros(1, 1, attention_dim))
         self.right_eye_type = nn.Parameter(torch.zeros(1, 1, attention_dim))
@@ -735,6 +1750,21 @@ class CrossAttentionVisualEncoder(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
+        )
+        self.binocular_self_attention = (
+            nn.MultiheadAttention(
+                embed_dim=attention_dim,
+                num_heads=binocular_attention_heads,
+                dropout=binocular_attention_dropout,
+                batch_first=True,
+            )
+            if self.use_binocular_self_attention
+            else None
+        )
+        self.binocular_attention_norm = (
+            nn.LayerNorm(attention_dim)
+            if self.use_binocular_self_attention
+            else None
         )
         self.attention_norm = nn.LayerNorm(attention_dim)
         self.ffn = nn.Sequential(
@@ -745,6 +1775,17 @@ class CrossAttentionVisualEncoder(nn.Module):
             nn.Dropout(dropout),
         )
         self.ffn_norm = nn.LayerNorm(attention_dim)
+        self.token_score = (
+            nn.Sequential(
+                nn.LayerNorm(attention_dim),
+                nn.Linear(attention_dim, token_pooling_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(token_pooling_dropout),
+                nn.Linear(token_pooling_hidden_dim, 1),
+            )
+            if self.token_pooling == VISUAL_TOKEN_POOLING_LEARNED
+            else None
+        )
         self.output_projection = (
             nn.Identity()
             if attention_dim == output_dim
@@ -760,6 +1801,7 @@ class CrossAttentionVisualEncoder(nn.Module):
             self.right_eye_type,
         ):
             nn.init.trunc_normal_(embedding, std=0.02)
+        self.reset_token_pooling_to_mean()
 
     @staticmethod
     def _spatial_tokens(feature_map: Tensor) -> Tensor:
@@ -772,22 +1814,40 @@ class CrossAttentionVisualEncoder(nn.Module):
         right_eye: Tensor,
         *,
         return_attention: bool = False,
+        return_auxiliary: bool = False,
     ) -> dict[str, Tensor]:
         face_map = self.face_encoder(face)
-        left_eye_map = self.eye_encoder.forward_feature_map(left_eye)
-        right_eye_map = self.eye_encoder.forward_feature_map(right_eye)
+        left_eye_maps = self.eye_encoder.forward_feature_maps(left_eye)
+        right_eye_maps = self.eye_encoder.forward_feature_maps(right_eye)
+        left_eye_map = left_eye_maps["feature_map"]
+        right_eye_map = right_eye_maps["feature_map"]
+        landmark_outputs: dict[str, Tensor] = {}
+        if self.eye_keypoint_head is not None and (
+            return_auxiliary or self.landmark_guided_fusion is not None
+        ):
+            landmark_outputs = self._eye_landmarks_from_feature_maps(
+                left_eye_maps,
+                right_eye_maps,
+                include_template=return_auxiliary,
+            )
 
         face_tokens = self.face_projection(self._spatial_tokens(face_map))
         left_tokens = self.eye_projection(self._spatial_tokens(left_eye_map))
         right_tokens = self.eye_projection(self._spatial_tokens(right_eye_map))
-        if face_tokens.shape[1] != FACE_IMAGE_TOKEN_COUNT:
+        if face_tokens.shape[1] != self.face_token_count:
             raise ValueError(
-                "Expected a 3x3 Inception-ResNet face feature map for 160x160 "
-                f"input, got {tuple(face_map.shape[-2:])}."
+                f"Expected a {self.face_token_grid[0]}x{self.face_token_grid[1]} "
+                "Inception-ResNet face feature map for "
+                f"feature_mode={self.face_feature_mode!r}, "
+                f"got {tuple(face_map.shape[-2:])}."
             )
-        if left_tokens.shape[1] + right_tokens.shape[1] != BINOCULAR_EYE_TOKEN_COUNT:
+        if (
+            tuple(left_eye_map.shape[-2:]) != self.eye_token_grid
+            or tuple(right_eye_map.shape[-2:]) != self.eye_token_grid
+        ):
             raise ValueError(
-                "Expected two 2x2 ResNet eye feature maps for 60x36 inputs, got "
+                f"Expected two {self.eye_token_grid[0]}x{self.eye_token_grid[1]} "
+                "ResNet eye feature maps, got "
                 f"left={tuple(left_eye_map.shape[-2:])}, "
                 f"right={tuple(right_eye_map.shape[-2:])}."
             )
@@ -805,32 +1865,164 @@ class CrossAttentionVisualEncoder(nn.Module):
             + self.right_eye_type
         )
         eye_tokens = torch.cat((left_tokens, right_tokens), dim=1)
+        binocular_attention_weights: Tensor | None = None
+        if self.binocular_self_attention is None:
+            binocular_tokens = eye_tokens
+        else:
+            binocular_attended, binocular_attention_weights = (
+                self.binocular_self_attention(
+                    query=eye_tokens,
+                    key=eye_tokens,
+                    value=eye_tokens,
+                    need_weights=return_attention,
+                    average_attn_weights=False,
+                )
+            )
+            assert self.binocular_attention_norm is not None
+            binocular_tokens = self.binocular_attention_norm(
+                eye_tokens + binocular_attended
+            )
+        landmark_fusion_outputs: dict[str, Tensor] = {}
+        pre_landmark_eye_tokens: Tensor | None = None
+        if self.landmark_guided_fusion is not None:
+            pre_landmark_eye_tokens = binocular_tokens
+            fusion_outputs = self.landmark_guided_fusion(
+                binocular_tokens,
+                left_layer2=left_eye_maps["layer2"],
+                left_layer3=left_eye_maps["layer3"],
+                right_layer2=right_eye_maps["layer2"],
+                right_layer3=right_eye_maps["layer3"],
+                predictions=landmark_outputs,
+                return_attention=return_attention,
+            )
+            binocular_tokens = fusion_outputs["refined_eye_tokens"]
+            landmark_fusion_outputs = {
+                f"landmark_guided_{name}": value
+                for name, value in fusion_outputs.items()
+                if name not in {"refined_eye_tokens", "landmark_tokens"}
+            }
         attended, attention_weights = self.cross_attention(
-            query=eye_tokens,
+            query=binocular_tokens,
             key=face_tokens,
             value=face_tokens,
             need_weights=return_attention,
             average_attn_weights=False,
         )
-        attended = self.attention_norm(eye_tokens + attended)
+        attended = self.attention_norm(binocular_tokens + attended)
         fused_tokens = self.ffn_norm(attended + self.ffn(attended))
-        visual_features = self.output_projection(fused_tokens.mean(dim=1))
+        token_pooling_weights: Tensor | None = None
+        if self.token_score is None:
+            pooled_tokens = fused_tokens.mean(dim=1)
+        else:
+            token_pooling_weights = torch.softmax(
+                self.token_score(fused_tokens).squeeze(dim=-1),
+                dim=1,
+            )
+            pooled_tokens = torch.sum(
+                fused_tokens * token_pooling_weights.unsqueeze(dim=-1),
+                dim=1,
+            )
+        visual_features = self.output_projection(pooled_tokens)
 
         output = {
             "visual_features": visual_features,
             "face_image_features": face_tokens.mean(dim=1),
-            "eye_features": eye_tokens.mean(dim=1),
+            "eye_features": binocular_tokens.mean(dim=1),
         }
+        if return_auxiliary and self.iris_heatmap_head is not None:
+            output["left_iris_heatmap"] = self.iris_heatmap_head(
+                left_eye_maps[self.iris_auxiliary_feature_stage]
+            )
+            output["right_iris_heatmap"] = self.iris_heatmap_head(
+                right_eye_maps[self.iris_auxiliary_feature_stage]
+            )
+        if return_auxiliary and self.eye_keypoint_head is not None:
+            output.update(landmark_outputs)
+        output.update(landmark_fusion_outputs)
         if return_attention and attention_weights is not None:
             output.update(
                 {
                     "face_tokens": face_tokens,
-                    "eye_tokens": eye_tokens,
+                    "eye_tokens": binocular_tokens,
                     "cross_attended_tokens": fused_tokens,
                     "cross_attention_weights": attention_weights,
                 }
             )
+            if binocular_attention_weights is not None:
+                output["pre_binocular_eye_tokens"] = eye_tokens
+                output["binocular_self_attention_weights"] = (
+                    binocular_attention_weights
+                )
+            if pre_landmark_eye_tokens is not None:
+                output["pre_landmark_eye_tokens"] = pre_landmark_eye_tokens
+            if token_pooling_weights is not None:
+                output["token_pooling_weights"] = token_pooling_weights
         return output
+
+    def _eye_landmarks_from_feature_maps(
+        self,
+        left_eye_maps: Mapping[str, Tensor],
+        right_eye_maps: Mapping[str, Tensor],
+        *,
+        include_template: bool = True,
+    ) -> dict[str, Tensor]:
+        if self.eye_keypoint_head is None:
+            raise RuntimeError("The probabilistic eye-landmark head is disabled.")
+        output: dict[str, Tensor] = {}
+        for side, eye_maps in (
+            ("left", left_eye_maps),
+            ("right", right_eye_maps),
+        ):
+            prediction = self.eye_keypoint_head(
+                eye_maps["layer2"],
+                eye_maps["layer3"],
+            )
+            output.update(
+                {
+                    f"{side}_eye_keypoint_{name}": value
+                    for name, value in prediction.items()
+                }
+            )
+        if include_template and self.eye_geometry_template is not None:
+            template_outputs = self.eye_geometry_template(
+                stack_binocular_outputs(output, "mean_xy"),
+                stack_binocular_outputs(output, "covariance"),
+                stack_binocular_outputs(output, "visibility_probability"),
+            )
+            output.update(
+                {
+                    f"eye_template_{name}": value
+                    for name, value in template_outputs.items()
+                }
+            )
+        return output
+
+    def predict_eye_landmarks(
+        self,
+        left_eye: Tensor,
+        right_eye: Tensor,
+        *,
+        include_template: bool = True,
+    ) -> dict[str, Tensor]:
+        """Run only the shared eye encoder and probabilistic landmark head."""
+
+        left_eye_maps = self.eye_encoder.forward_feature_maps(left_eye)
+        right_eye_maps = self.eye_encoder.forward_feature_maps(right_eye)
+        return self._eye_landmarks_from_feature_maps(
+            left_eye_maps,
+            right_eye_maps,
+            include_template=include_template,
+        )
+
+    def reset_token_pooling_to_mean(self) -> None:
+        """Start learned pooling as exact mean pooling before it specializes."""
+
+        if self.token_score is None:
+            return
+        output = self.token_score[-1]
+        assert isinstance(output, nn.Linear)
+        nn.init.zeros_(output.weight)
+        nn.init.zeros_(output.bias)
 
 
 class FaceBranch(nn.Module):
@@ -1036,6 +2228,133 @@ class VectorBranch(nn.Module):
         return self.net(x.float())
 
 
+class DirectUVFiLMFusion(nn.Module):
+    """Condition the first direct-UV fusion layer on virtual-camera metadata."""
+
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        fusion_hidden_dims: tuple[int, ...],
+        scale_hidden_dims: tuple[int, ...],
+        scale_embedding_dim: int,
+        dropout: float,
+        delta_max: float,
+        use_pose_condition: bool = False,
+        pose_dim: int = 9,
+    ) -> None:
+        super().__init__()
+        if len(fusion_hidden_dims) < 2:
+            raise ValueError(
+                "fusion_hidden_dims must contain a FiLM width and output width."
+            )
+        self.film_dim = fusion_hidden_dims[0]
+        self.output_dim = fusion_hidden_dims[-1]
+        self.delta_max = float(delta_max)
+        self.use_pose_condition = bool(use_pose_condition)
+        self.pose_dim = int(pose_dim)
+        self.condition_dim = self.pose_dim if self.use_pose_condition else 1
+        self.pre_film = make_mlp(
+            input_dim=input_dim,
+            hidden_dims=(),
+            output_dim=self.film_dim,
+            dropout=dropout,
+            input_layer_norm=False,
+            activate_output=True,
+        )
+        # LayerNorm on a scalar input would erase the scale-only condition.
+        self.condition_encoder = make_mlp(
+            input_dim=self.condition_dim,
+            hidden_dims=scale_hidden_dims,
+            output_dim=scale_embedding_dim,
+            dropout=0.0,
+            input_layer_norm=self.use_pose_condition,
+            activate_output=True,
+        )
+        self.film_parameters = nn.Linear(scale_embedding_dim, 2 * self.film_dim)
+        self.post_film = make_mlp(
+            input_dim=self.film_dim,
+            hidden_dims=fusion_hidden_dims[1:-1],
+            output_dim=self.output_dim,
+            dropout=dropout,
+            input_layer_norm=False,
+            activate_output=True,
+        )
+
+    def forward(
+        self,
+        fusion_input: Tensor,
+        virtual_log_scale_normalized: Tensor | None = None,
+        virtual_camera_pose_table: Tensor | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if self.use_pose_condition:
+            if virtual_camera_pose_table is None:
+                raise ValueError(
+                    "Missing virtual_camera_pose_table for virtual pose FiLM."
+                )
+            pose = ensure_vector_batch(
+                virtual_camera_pose_table,
+                "virtual_camera_pose_table",
+            ).float()
+            if pose.shape[-1] != self.pose_dim:
+                raise ValueError(
+                    f"virtual_camera_pose_table must have shape [B, {self.pose_dim}]."
+                )
+            if pose.shape[0] != fusion_input.shape[0]:
+                raise ValueError(
+                    "Virtual FiLM condition tensors must share the batch dimension."
+                )
+            if not torch.isfinite(pose).all():
+                raise ValueError(
+                    "Virtual FiLM condition tensors must contain only finite values."
+                )
+            condition = pose.to(device=fusion_input.device, dtype=fusion_input.dtype)
+        else:
+            if virtual_log_scale_normalized is None:
+                raise ValueError(
+                    "Missing virtual_log_scale_normalized for direct-UV FiLM."
+                )
+            scale = ensure_vector_batch(
+                virtual_log_scale_normalized,
+                "virtual_log_scale_normalized",
+            ).float()
+            if scale.shape[-1] != 1:
+                raise ValueError("virtual_log_scale_normalized must have shape [B, 1].")
+            if scale.shape[0] != fusion_input.shape[0]:
+                raise ValueError(
+                    "Fusion features and virtual scale must share the batch dimension."
+                )
+            if not torch.isfinite(scale).all():
+                raise ValueError(
+                    "virtual_log_scale_normalized must contain only finite values."
+                )
+            condition = scale.to(device=fusion_input.device, dtype=fusion_input.dtype)
+
+        hidden = self.pre_film(fusion_input)
+        condition_embedding = self.condition_encoder(condition)
+        gamma_raw, beta_raw = self.film_parameters(condition_embedding).chunk(2, dim=-1)
+        gamma = self.delta_max * torch.tanh(gamma_raw)
+        beta = self.delta_max * torch.tanh(beta_raw)
+        modulated = (1.0 + gamma) * hidden + beta
+        output = self.post_film(modulated)
+        features = {
+            "virtual_film_condition": condition,
+            "virtual_film_condition_embedding": condition_embedding,
+            "virtual_film_gamma": gamma,
+            "virtual_film_beta": beta,
+            "virtual_film_features": modulated,
+        }
+        if self.use_pose_condition:
+            features["virtual_pose_embedding"] = condition_embedding
+        else:
+            features["virtual_scale_embedding"] = condition_embedding
+        return output, features
+
+    def reset_to_identity(self) -> None:
+        nn.init.zeros_(self.film_parameters.weight)
+        nn.init.zeros_(self.film_parameters.bias)
+
+
 class EyeGeometryQualityGate(nn.Module):
     """Predict a bounded logit-space correction to offline PnP reliability."""
 
@@ -1229,6 +2548,124 @@ class ModelV1(nn.Module):
                 eye_backbone=self.config.eye_backbone,
                 eye_backbone_weights=self.config.eye_backbone_weights,
                 freeze_face_backbone=self.config.freeze_face_image_backbone,
+                face_feature_mode=self.config.face_feature_mode,
+                eye_token_grid=self.config.eye_token_grid,
+                eye_feature_stage=self.config.eye_feature_stage,
+                eye_feature_mode=self.config.eye_feature_mode,
+                eye_stem_mode=self.config.eye_stem_mode,
+                use_binocular_self_attention=(
+                    self.config.use_binocular_self_attention
+                ),
+                binocular_attention_heads=self.config.binocular_attention_heads,
+                binocular_attention_dropout=(
+                    self.config.binocular_attention_dropout
+                ),
+                use_iris_auxiliary=self.config.use_eye_iris_auxiliary,
+                iris_auxiliary_feature_stage=(
+                    self.config.eye_iris_auxiliary_feature_stage
+                ),
+                iris_auxiliary_hidden_channels=(
+                    self.config.eye_iris_auxiliary_hidden_channels
+                ),
+                use_keypoint_auxiliary=(
+                    self.config.use_eye_keypoint_auxiliary
+                ),
+                keypoint_count=self.config.eye_keypoint_count,
+                keypoint_auxiliary_feature_stage=(
+                    self.config.eye_keypoint_auxiliary_feature_stage
+                ),
+                keypoint_auxiliary_hidden_channels=(
+                    self.config.eye_keypoint_auxiliary_hidden_channels
+                ),
+                keypoint_probability_temperature=(
+                    self.config.eye_keypoint_probability_temperature
+                ),
+                keypoint_heatmap_size=self.config.eye_keypoint_heatmap_size,
+                keypoint_predict_variance_correction=(
+                    self.config.eye_keypoint_predict_variance_correction
+                ),
+                keypoint_max_abs_log_std_correction=(
+                    self.config.eye_keypoint_max_abs_log_std_correction
+                ),
+                keypoint_shape_embedding_dim=(
+                    self.config.eye_keypoint_shape_embedding_dim
+                ),
+                use_landmark_guided_fusion=(
+                    self.config.use_landmark_guided_eye_fusion
+                ),
+                landmark_guided_fusion_heads=(
+                    self.config.landmark_guided_fusion_heads
+                ),
+                landmark_guided_fusion_dropout=(
+                    self.config.landmark_guided_fusion_dropout
+                ),
+                landmark_guided_fusion_gate_init=(
+                    self.config.landmark_guided_fusion_gate_init
+                ),
+                landmark_guided_fusion_gate_max=(
+                    self.config.landmark_guided_fusion_gate_max
+                ),
+                landmark_guided_quality_logit_scale=(
+                    self.config.landmark_guided_quality_logit_scale
+                ),
+                landmark_guided_uncertainty_scale_norm=(
+                    self.config.landmark_guided_uncertainty_scale_norm
+                ),
+                landmark_guided_min_quality=(
+                    self.config.landmark_guided_min_quality
+                ),
+                landmark_guided_detach_probability_for_sampling=(
+                    self.config.landmark_guided_detach_probability_for_sampling
+                ),
+                landmark_guided_detach_landmark_statistics=(
+                    self.config.landmark_guided_detach_landmark_statistics
+                ),
+                landmark_guided_detach_quality=(
+                    self.config.landmark_guided_detach_quality
+                ),
+                use_low_dof_eye_template=self.config.use_low_dof_eye_template,
+                eye_template_image_size=self.config.eye_template_image_size,
+                eye_template_pitch_range_deg=(
+                    self.config.eye_template_pitch_range_deg
+                ),
+                eye_template_yaw_range_deg=(
+                    self.config.eye_template_yaw_range_deg
+                ),
+                eye_template_pitch_bins=self.config.eye_template_pitch_bins,
+                eye_template_yaw_bins=self.config.eye_template_yaw_bins,
+                eye_template_posterior_temperature=(
+                    self.config.eye_template_posterior_temperature
+                ),
+                eye_template_covariance_floor_px=(
+                    self.config.eye_template_covariance_floor_px
+                ),
+                eye_template_min_canthus_distance_px=(
+                    self.config.eye_template_min_canthus_distance_px
+                ),
+                eye_template_min_geometry_confidence=(
+                    self.config.eye_template_min_geometry_confidence
+                ),
+                eye_template_center_energy_weight=(
+                    self.config.eye_template_center_energy_weight
+                ),
+                eye_template_rim_energy_weight=(
+                    self.config.eye_template_rim_energy_weight
+                ),
+                eye_template_angle_prior_weight=(
+                    self.config.eye_template_angle_prior_weight
+                ),
+                eye_template_learnable_parameters=(
+                    self.config.eye_template_learnable_parameters
+                ),
+                eye_template_use_reference_uncertainty=(
+                    self.config.eye_template_use_reference_uncertainty
+                ),
+                eye_template_use_aperture_visibility=(
+                    self.config.eye_template_use_aperture_visibility
+                ),
+                token_pooling=self.config.visual_token_pooling,
+                token_pooling_hidden_dim=self.config.visual_token_pooling_hidden_dim,
+                token_pooling_dropout=self.config.visual_token_pooling_dropout,
             )
             if self.config.use_face_image
             else None
@@ -1305,18 +2742,107 @@ class ModelV1(nn.Module):
             + (1 if use_quality_gate else 0)
         )
         fusion_output_dim = self.config.fusion_hidden_dims[-1]
-        self.fusion_mlp = make_mlp(
-            input_dim=fusion_input_dim,
-            hidden_dims=self.config.fusion_hidden_dims[:-1],
-            output_dim=fusion_output_dim,
-            dropout=self.config.fusion_dropout,
-            input_layer_norm=False,
-            activate_output=True,
+        self.direct_uv_film_fusion = (
+            DirectUVFiLMFusion(
+                input_dim=fusion_input_dim,
+                fusion_hidden_dims=self.config.fusion_hidden_dims,
+                scale_hidden_dims=(
+                    self.config.virtual_distance_film_hidden_dims
+                ),
+                scale_embedding_dim=(
+                    self.config.virtual_distance_film_embedding_dim
+                ),
+                dropout=self.config.fusion_dropout,
+                delta_max=self.config.virtual_distance_film_delta_max,
+                use_pose_condition=self.config.use_virtual_pose_film,
+                pose_dim=self.config.virtual_pose_dim,
+            )
+            if (
+                self.config.use_virtual_distance_film
+                or self.config.use_virtual_pose_film
+            )
+            else None
+        )
+        self.fusion_mlp = (
+            None
+            if self.direct_uv_film_fusion is not None
+            else make_mlp(
+                input_dim=fusion_input_dim,
+                hidden_dims=self.config.fusion_hidden_dims[:-1],
+                output_dim=fusion_output_dim,
+                dropout=self.config.fusion_dropout,
+                input_layer_norm=False,
+                activate_output=True,
+            )
         )
         self.uv_head = (
             None
             if self.uses_gaze_geometry
             else nn.Linear(fusion_output_dim, self.config.uv_dim)
+        )
+        self.pitch_to_v_mapper = (
+            PitchToTableVResidual(
+                scene_dim=self.config.scene_dim,
+                pose_dim=(
+                    self.config.virtual_pose_dim
+                    if self.config.use_virtual_pose_film
+                    else 0
+                ),
+                hidden_dims=self.config.pitch_to_v_hidden_dims,
+                max_abs_delta_v_mm=self.config.pitch_to_v_max_abs_delta_mm,
+                pitch_scale_deg=self.config.pitch_to_v_pitch_scale_deg,
+                uncertainty_scale_deg=(
+                    self.config.pitch_to_v_uncertainty_scale_deg
+                ),
+                disagreement_scale_deg=(
+                    self.config.pitch_to_v_disagreement_scale_deg
+                ),
+                min_pitch_std_deg=self.config.pitch_to_v_min_pitch_std_deg,
+                min_active_gate=self.config.pitch_to_v_min_active_gate,
+                detach_uncertainty_gate=(
+                    self.config.pitch_to_v_detach_uncertainty_gate
+                ),
+                table_distance_scale_mm=self.config.table_distance_scale_mm,
+                use_camera_table_sensitivity=(
+                    self.config.pitch_to_v_use_camera_table_sensitivity
+                ),
+                min_abs_table_normal_z=(
+                    self.config.pitch_to_v_min_abs_table_normal_z
+                ),
+            )
+            if self.config.use_pitch_to_v_residual
+            else None
+        )
+        self.vertical_geometry_feature_extractor = (
+            VerticalEyeGeometryFeatureExtractor(
+                eye_image_size=self.config.eye_template_image_size
+            )
+            if self.config.use_vertical_geometry_residual
+            else None
+        )
+        self.vertical_geometry_residual = (
+            VerticalGeometryVResidual(
+                geometry_dim=VERTICAL_EYE_GEOMETRY_FEATURE_DIM,
+                fused_feature_dim=fusion_output_dim,
+                scene_dim=self.config.scene_dim,
+                pose_dim=(
+                    self.config.virtual_pose_dim
+                    if self.config.use_virtual_pose_film
+                    else 0
+                ),
+                hidden_dims=self.config.vertical_geometry_residual_hidden_dims,
+                max_abs_delta_v_mm=(
+                    self.config.vertical_geometry_residual_max_abs_delta_mm
+                ),
+                min_training_gate=(
+                    self.config.vertical_geometry_residual_min_training_gate
+                ),
+                min_inference_confidence=(
+                    self.config.vertical_geometry_residual_min_inference_confidence
+                ),
+            )
+            if self.config.use_vertical_geometry_residual
+            else None
         )
         self.gaze_head = (
             nn.Linear(fusion_output_dim, self.config.gaze_dim)
@@ -1382,6 +2908,25 @@ class ModelV1(nn.Module):
 
         self.reset_parameters()
 
+    def predict_eye_landmarks(
+        self,
+        left_eye: Tensor,
+        right_eye: Tensor,
+        *,
+        include_template: bool = True,
+    ) -> dict[str, Tensor]:
+        """Predict eye landmarks without running face fusion or the UV head."""
+
+        if self.visual_encoder is None:
+            raise RuntimeError(
+                "Eye-landmark prediction requires use_face_image=True."
+            )
+        return self.visual_encoder.predict_eye_landmarks(
+            left_eye,
+            right_eye,
+            include_template=include_template,
+        )
+
     def forward(
         self,
         batch: Mapping[str, object] | None = None,
@@ -1401,7 +2946,10 @@ class ModelV1(nn.Module):
         pnp_geometry_vec: Tensor | None = None,
         pnp_quality_vec: Tensor | None = None,
         rotation_n_from_c: Tensor | None = None,
+        virtual_log_scale_normalized: Tensor | None = None,
+        virtual_camera_pose_table: Tensor | None = None,
         return_features: bool = False,
+        return_auxiliary: bool = False,
     ) -> Tensor | dict[str, Tensor]:
         """Predict table-local gaze ``uv`` in the configured target space.
 
@@ -1415,6 +2963,9 @@ class ModelV1(nn.Module):
         ``config.use_eye_geometry`` is enabled, the batch must additionally
         contain a normalized ``eye_geometry_vec``. Virtual-camera gaze
         prediction additionally requires the per-sample ``rotation_n_from_c``.
+        Direct-UV FiLM uses either the training-normalized scalar
+        ``virtual_log_scale_normalized`` or, when virtual pose FiLM is enabled,
+        ``virtual_camera_pose_table``.
 
         The default ModelV1 DataLoader uses z-score-normalized targets. Use
         ``UVTargetNormalizer.denormalize`` to convert this output to millimeters.
@@ -1436,7 +2987,31 @@ class ModelV1(nn.Module):
                     batch,
                     ("table_frame7", "scene_vec")
                     if self.uses_gaze_geometry
-                    else ("scene_vec",),
+                    else (
+                        ("table_frame7_n", "scene_vec")
+                        if (
+                            self.config.use_virtual_distance_film
+                            or self.config.use_virtual_pose_film
+                        )
+                        else ("scene_vec",)
+                    ),
+                )
+            if (
+                self.config.use_virtual_distance_film
+                and not self.config.use_virtual_pose_film
+                and virtual_log_scale_normalized is None
+            ):
+                virtual_log_scale_normalized = get_required_tensor(
+                    batch,
+                    ("virtual_log_scale_normalized",),
+                )
+            if (
+                self.config.use_virtual_pose_film
+                and virtual_camera_pose_table is None
+            ):
+                virtual_camera_pose_table = get_required_tensor(
+                    batch,
+                    ("virtual_camera_pose_table",),
                 )
             if self.uses_gaze_geometry:
                 if (
@@ -1506,6 +3081,21 @@ class ModelV1(nn.Module):
             raise ValueError("Missing crop_cam_vec for crop_cam_branch.")
         if scene_vec is None:
             raise ValueError("Missing scene_vec/TableFrame7.")
+        if (
+            self.config.use_virtual_distance_film
+            and not self.config.use_virtual_pose_film
+            and virtual_log_scale_normalized is None
+        ):
+            raise ValueError(
+                "Missing virtual_log_scale_normalized for direct-UV FiLM."
+            )
+        if (
+            self.config.use_virtual_pose_film
+            and virtual_camera_pose_table is None
+        ):
+            raise ValueError(
+                "Missing virtual_camera_pose_table for virtual-camera pose FiLM."
+            )
         if self.uses_gaze_geometry and raw_eye_geometry_mm is None:
             raise ValueError(
                 "Missing raw_eye_geometry_mm for V4 parameter-free geometry."
@@ -1562,6 +3152,11 @@ class ModelV1(nn.Module):
                 left_eye,
                 right_eye,
                 return_attention=return_features,
+                return_auxiliary=(
+                    return_auxiliary
+                    or self.pitch_to_v_mapper is not None
+                    or self.vertical_geometry_residual is not None
+                ),
             )
             face_image_features = visual_outputs["face_image_features"]
             eye_features = visual_outputs["eye_features"]
@@ -1569,12 +3164,46 @@ class ModelV1(nn.Module):
             visual_debug_features = {
                 key: value
                 for key, value in visual_outputs.items()
-                if key
+                if key.startswith("eye_template_")
+                or key.startswith("landmark_guided_")
+                or key
                 in {
                     "face_tokens",
                     "eye_tokens",
+                    "pre_binocular_eye_tokens",
+                    "pre_landmark_eye_tokens",
                     "cross_attended_tokens",
                     "cross_attention_weights",
+                    "binocular_self_attention_weights",
+                    "token_pooling_weights",
+                    "left_iris_heatmap",
+                    "right_iris_heatmap",
+                    "left_eye_keypoint_logits",
+                    "left_eye_keypoint_probability_maps",
+                    "left_eye_keypoint_mean_xy",
+                    "left_eye_keypoint_covariance",
+                    "left_eye_keypoint_covariance_heatmap",
+                    "left_eye_keypoint_variance_xy",
+                    "left_eye_keypoint_log_std_correction",
+                    "left_eye_keypoint_visibility_logits",
+                    "left_eye_keypoint_visibility_probability",
+                    "left_eye_keypoint_entropy",
+                    "left_eye_keypoint_confidence",
+                    "left_eye_keypoint_canonical_shape",
+                    "left_eye_keypoint_shape_embedding",
+                    "right_eye_keypoint_logits",
+                    "right_eye_keypoint_probability_maps",
+                    "right_eye_keypoint_mean_xy",
+                    "right_eye_keypoint_covariance",
+                    "right_eye_keypoint_covariance_heatmap",
+                    "right_eye_keypoint_variance_xy",
+                    "right_eye_keypoint_log_std_correction",
+                    "right_eye_keypoint_visibility_logits",
+                    "right_eye_keypoint_visibility_probability",
+                    "right_eye_keypoint_entropy",
+                    "right_eye_keypoint_confidence",
+                    "right_eye_keypoint_canonical_shape",
+                    "right_eye_keypoint_shape_embedding",
                 }
             }
         else:
@@ -1691,7 +3320,16 @@ class ModelV1(nn.Module):
             if eye_geometry_gate is not None:
                 fusion_parts.append(eye_geometry_gate)
         fusion_input = torch.cat(fusion_parts, dim=-1)
-        fused_features = self.fusion_mlp(fusion_input)
+        virtual_film_features: dict[str, Tensor] = {}
+        if self.direct_uv_film_fusion is not None:
+            fused_features, virtual_film_features = self.direct_uv_film_fusion(
+                fusion_input,
+                virtual_log_scale_normalized,
+                virtual_camera_pose_table=virtual_camera_pose_table,
+            )
+        else:
+            assert self.fusion_mlp is not None
+            fused_features = self.fusion_mlp(fusion_input)
         if self.uses_gaze_geometry:
             assert self.gaze_head is not None
             assert self.depth_hypothesis_generator is not None
@@ -1916,8 +3554,76 @@ class ModelV1(nn.Module):
 
         assert self.uv_head is not None
         uv = self.uv_head(fused_features)
+        vertical_residual_outputs: dict[str, Tensor] = {}
+        if self.pitch_to_v_mapper is not None:
+            required_template_names = (
+                "eye_template_pitch_rad",
+                "eye_template_pitch_variance",
+                "eye_template_geometry_confidence",
+                "eye_template_valid_mask",
+            )
+            missing_template_names = [
+                name
+                for name in required_template_names
+                if name not in visual_debug_features
+            ]
+            if missing_template_names:
+                raise RuntimeError(
+                    "Pitch-to-v mapper is missing eye-template outputs: "
+                    f"{missing_template_names}."
+                )
+            mapping_outputs = self.pitch_to_v_mapper(
+                pitch_rad=visual_debug_features["eye_template_pitch_rad"],
+                pitch_variance=visual_debug_features[
+                    "eye_template_pitch_variance"
+                ],
+                geometry_confidence=visual_debug_features[
+                    "eye_template_geometry_confidence"
+                ],
+                geometry_valid_mask=visual_debug_features[
+                    "eye_template_valid_mask"
+                ],
+                scene_vec=scene_vec,
+                virtual_camera_pose_table=virtual_camera_pose_table,
+            )
+            vertical_residual_outputs = {
+                f"vertical_{name}": value
+                for name, value in mapping_outputs.items()
+            }
 
-        if return_features:
+        elif self.vertical_geometry_residual is not None:
+            if self.vertical_geometry_feature_extractor is None:
+                raise RuntimeError("Vertical geometry feature extractor is missing.")
+            geometry_outputs = self.vertical_geometry_feature_extractor(
+                stack_binocular_outputs(visual_debug_features, "mean_xy"),
+                stack_binocular_outputs(visual_debug_features, "covariance"),
+                stack_binocular_outputs(visual_debug_features, "visibility_probability"),
+                stack_binocular_outputs(visual_debug_features, "entropy"),
+            )
+            mapping_outputs = self.vertical_geometry_residual(
+                geometry_features=geometry_outputs["features"],
+                geometry_confidence=geometry_outputs["geometry_confidence"],
+                fused_features=fused_features,
+                scene_vec=scene_vec,
+                base_v_normalized=uv[:, 1:2],
+                virtual_camera_pose_table=virtual_camera_pose_table,
+            )
+            vertical_residual_outputs = {
+                f"vertical_{name}": value
+                for name, value in mapping_outputs.items()
+            }
+            vertical_residual_outputs.update(
+                {
+                    f"vertical_geometry_{name}": value
+                    for name, value in geometry_outputs.items()
+                }
+            )
+        if (
+            return_features
+            or return_auxiliary
+            or self.pitch_to_v_mapper is not None
+            or self.vertical_geometry_residual is not None
+        ):
             features = {
                 "uv": uv,
                 "face_features": (
@@ -1939,6 +3645,8 @@ class ModelV1(nn.Module):
             if face_image_features is not None:
                 features["face_image_features"] = face_image_features
             features.update(visual_debug_features)
+            features.update(vertical_residual_outputs)
+            features.update(virtual_film_features)
             if crop_cam_features is not None:
                 features["crop_cam_features"] = crop_cam_features
             if normalized_eye_geometry is not None:
@@ -2034,6 +3742,16 @@ class ModelV1(nn.Module):
             self.eye_geometry_quality_gate.reset_output_to_zero()
         if self.depth_correction_head is not None:
             self.depth_correction_head.reset_output_to_identity()
+        if self.direct_uv_film_fusion is not None:
+            self.direct_uv_film_fusion.reset_to_identity()
+        if self.pitch_to_v_mapper is not None:
+            self.pitch_to_v_mapper.reset_output_to_zero()
+        if self.vertical_geometry_residual is not None:
+            self.vertical_geometry_residual.reset_output_to_zero()
+        if self.visual_encoder is not None:
+            self.visual_encoder.reset_token_pooling_to_mean()
+            if self.visual_encoder.landmark_guided_fusion is not None:
+                self.visual_encoder.landmark_guided_fusion.reset_gate()
         if self.gaze_uncertainty_head is not None:
             # A default Linear bias is zero, which would map through sigmoid
             # to the midpoint of the allowed range. Start narrowly instead,
@@ -2088,6 +3806,103 @@ def canonical_eye_backbone(name: str) -> str:
     except KeyError as exc:
         supported = ", ".join(SUPPORTED_EYE_BACKBONES)
         raise ValueError(f"Unknown eye_backbone={name!r}; expected one of: {supported}") from exc
+
+
+def canonical_eye_feature_stage(value: str) -> str:
+    """Return the ResNet stage used as the eye spatial-token source."""
+
+    stage = str(value).strip().lower().replace("-", "")
+    if stage not in {"layer3", "layer4"}:
+        raise ValueError(
+            "eye_feature_stage must be 'layer3' or 'layer4', got "
+            f"{value!r}."
+        )
+    return stage
+
+
+def canonical_eye_feature_mode(value: str) -> str:
+    """Return the eye spatial-feature extraction topology."""
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "single": EYE_FEATURE_MODE_SINGLE_STAGE,
+        "single_stage": EYE_FEATURE_MODE_SINGLE_STAGE,
+        "multiscale_fpn24": EYE_FEATURE_MODE_MULTISCALE_FPN24,
+        "fpn24": EYE_FEATURE_MODE_MULTISCALE_FPN24,
+        "h3": EYE_FEATURE_MODE_MULTISCALE_FPN24,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "eye_feature_mode must be 'single_stage' or 'multiscale_fpn24', got "
+            f"{value!r}."
+        ) from exc
+
+
+def canonical_eye_stem_mode(value: str) -> str:
+    """Return the ResNet input-stem topology for an eye image."""
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "standard": EYE_STEM_MODE_STANDARD,
+        "imagenet": EYE_STEM_MODE_STANDARD,
+        "small_3x3_s2_no_maxpool": EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL,
+        "small_stem": EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL,
+        "h5": EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "eye_stem_mode must be 'standard' or 'small_3x3_s2_no_maxpool', "
+            f"got {value!r}."
+        ) from exc
+
+
+def canonical_eye_iris_auxiliary_feature_stage(value: str) -> str:
+    """Return the ResNet stage used by the iris heatmap auxiliary head."""
+
+    stage = str(value).strip().lower().replace("-", "")
+    if stage not in {"layer2", "layer3"}:
+        raise ValueError(
+            "eye_iris_auxiliary_feature_stage must be 'layer2' or 'layer3', "
+            f"got {value!r}."
+        )
+    return stage
+
+
+def canonical_visual_token_pooling(value: str) -> str:
+    """Return the aggregation rule for fused binocular eye tokens."""
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "mean": VISUAL_TOKEN_POOLING_MEAN,
+        "average": VISUAL_TOKEN_POOLING_MEAN,
+        "learned": VISUAL_TOKEN_POOLING_LEARNED,
+        "attention": VISUAL_TOKEN_POOLING_LEARNED,
+        "learned_attention": VISUAL_TOKEN_POOLING_LEARNED,
+        "h4": VISUAL_TOKEN_POOLING_LEARNED,
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            "visual_token_pooling must be 'mean' or 'learned', got "
+            f"{value!r}."
+        ) from exc
+
+
+def resnet_stage_feature_channels(backbone: nn.Module, stage: str) -> int:
+    """Return the output-channel count of one torchvision ResNet stage."""
+
+    if stage == "layer4":
+        return int(backbone.fc.in_features)  # type: ignore[attr-defined]
+    block = backbone.layer3[-1]  # type: ignore[attr-defined]
+    norm = getattr(block, "bn3", None) or getattr(block, "bn2", None)
+    if not isinstance(norm, nn.BatchNorm2d):
+        raise TypeError("Could not infer the output channels of ResNet layer3.")
+    return int(norm.num_features)
 
 
 def canonical_resnet_stage(value: str) -> str:
@@ -2191,6 +4006,41 @@ def replace_resnet_small_image_stem(
                 new_conv.weight.copy_(center_weights.mean(dim=1, keepdim=True))
             else:
                 nn.init.kaiming_normal_(new_conv.weight, nonlinearity="relu")
+    return new_conv
+
+
+def replace_resnet_h5_small_stem(
+    conv: nn.Conv2d,
+    in_channels: int,
+    preserve_rgb: bool,
+) -> nn.Conv2d:
+    """Build H5's stride-2 3x3 stem from an ImageNet 7x7 stem when available."""
+
+    new_conv = nn.Conv2d(
+        in_channels,
+        conv.out_channels,
+        kernel_size=3,
+        stride=2,
+        padding=1,
+        bias=False,
+    )
+    if not preserve_rgb:
+        return new_conv
+    with torch.no_grad():
+        center_weights = conv.weight[:, :, 2:5, 2:5]
+        if in_channels == 3:
+            source_weights = center_weights
+        elif in_channels == 1:
+            source_weights = center_weights.mean(dim=1, keepdim=True)
+        else:
+            nn.init.kaiming_normal_(new_conv.weight, nonlinearity="relu")
+            return new_conv
+        # Preserve each output filter's energy after the 7x7 -> 3x3 crop,
+        # reducing the feature-scale shift seen by the inherited BN1 affine.
+        source_norm = conv.weight.flatten(start_dim=1).norm(dim=1, keepdim=True)
+        target_norm = source_weights.flatten(start_dim=1).norm(dim=1, keepdim=True)
+        scale = (source_norm / target_norm.clamp_min(torch.finfo(source_weights.dtype).eps))
+        new_conv.weight.copy_(source_weights * scale.view(-1, 1, 1, 1))
     return new_conv
 
 

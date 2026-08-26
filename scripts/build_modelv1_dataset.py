@@ -16,7 +16,7 @@ import json
 import math
 from pathlib import Path
 from statistics import mean
-from typing import Any, Iterable
+from typing import Any
 
 
 DEFAULT_SOURCE_ROOT = Path(r"D:\GithubCode\CrossGaze-main\baseline\data_collection")
@@ -49,6 +49,15 @@ HAND_EYE_RIGID_TO_OPTICAL = [
 CROP_CAM_COLUMNS = [f"crop_cam_{idx:02d}" for idx in range(36)]
 SCENE_COLUMNS = [f"scene_{idx:02d}" for idx in range(25)]
 
+# Coordinate contract for the current experiment. The table is horizontal in
+# the Vicon world frame. For every sample, the optical camera centre is
+# projected along Vicon Z onto the table and becomes the local UV origin.
+TABLE_NORMAL_W = [0.0, 0.0, 1.0]
+TABLE_U_AXIS_W = [1.0, 0.0, 0.0]
+TABLE_V_AXIS_W = [0.0, 1.0, 0.0]
+GEOMETRY_ATOL = 1e-5
+GEOMETRY_DISTANCE_ATOL_MM = 1e-3
+
 BASE_COLUMNS = [
     "sample_id",
     "dataset",
@@ -77,10 +86,6 @@ BASE_COLUMNS = [
     "gaze_cam_recomputed_x_mm",
     "gaze_cam_recomputed_y_mm",
     "gaze_cam_recomputed_z_mm",
-    "gaze_cam_csv_x_mm",
-    "gaze_cam_csv_y_mm",
-    "gaze_cam_csv_z_mm",
-    "gaze_cam_error_mm",
     "gaze_cam_csv_raw_x_mm",
     "gaze_cam_csv_raw_y_mm",
     "gaze_cam_csv_raw_z_mm",
@@ -149,6 +154,23 @@ def parse_args() -> argparse.Namespace:
         help="Build exactly one collection dataset and name the output modelv1_dataset<ID>.csv.",
     )
     parser.add_argument(
+        "--face-image-dir",
+        default="insightface_face",
+        help=(
+            "Per-dataset InsightFace face-image directory used for face_path, "
+            "for example insightface_face_160. The calibrated source image "
+            "remains insightface_img."
+        ),
+    )
+    parser.add_argument(
+        "--insightface-coordinates-file",
+        default="insightface_coordinates.csv",
+        help=(
+            "Per-dataset InsightFace detection CSV, for example "
+            "insightface_coordinates_224.csv."
+        ),
+    )
+    parser.add_argument(
         "--pnp-csv",
         default="pnp_face_depth_scale_1010.csv",
         help="Preferred PnP CSV name. Falls back to pnp_face_depth.csv.",
@@ -175,10 +197,13 @@ def parse_args() -> argparse.Namespace:
         help="Scale applied to hand-eye translation. Use 1000 when stored in meters.",
     )
     parser.add_argument(
-        "--table-z-scope",
-        choices=["per-dataset", "global"],
-        default="per-dataset",
-        help="Use per-dataset or global mean gaze_target_tz as table height.",
+        "--table-z-source",
+        choices=["per-sample-target", "per-dataset-mean"],
+        default="per-sample-target",
+        help=(
+            "Source of the horizontal reference-plane height: use each row's "
+            "gaze_target_tz (default), or the dataset-wide mean for legacy compatibility."
+        ),
     )
     parser.add_argument(
         "--write-npz",
@@ -208,7 +233,7 @@ def format_cell(value: Any) -> str:
         return "1" if value else "0"
     if isinstance(value, float):
         if math.isnan(value) or math.isinf(value):
-            return ""
+            raise DatasetBuildError(f"Refusing to write non-finite value: {value}")
         return f"{value:.10g}"
     return str(value)
 
@@ -228,15 +253,15 @@ def as_int_text(row: dict[str, str], key: str) -> str:
     return str(value).strip()
 
 
-def normalize_dataset_names(values: list[str] | None) -> set[str] | None:
+def normalize_dataset_names(values: list[str] | None) -> set[str] | None:  # 数据文件选择
     if not values:
         return None
     result = set()
     for value in values:
-        text = str(value).strip()
+        text = str(value).strip()  # 去除首尾的空白字符
         if not text:
             continue
-        if text.isdigit():
+        if text.isdigit():  # 判断 text 这个字符串是否只由数字组成
             result.add(f"dataset_dual_rigid_body_{text}")
         else:
             result.add(text)
@@ -253,12 +278,27 @@ def discover_dataset_dirs(source_root: Path, requested: set[str] | None) -> list
     )
     if requested is not None:
         dirs = [path for path in dirs if path.name in requested]
+        found = {path.name for path in dirs}
+        missing = sorted(requested - found)
+        if missing:
+            raise DatasetBuildError(
+                f"Requested dataset directories not found under {source_root}: {missing}"
+            )
+    if not dirs:
+        raise DatasetBuildError(
+            f"No dataset_dual_rigid_body_* directories found under {source_root}"
+        )
     return dirs
 
 
-def choose_one(paths: Iterable[Path]) -> Path | None:
-    paths = sorted(paths)
-    return paths[-1] if paths else None
+def choose_data_log_csv(dataset_dir: Path) -> Path | None:
+    paths = sorted(dataset_dir.glob("data_log_*.csv"))
+    if len(paths) > 1:
+        rendered = ", ".join(path.name for path in paths)
+        raise DatasetBuildError(
+            f"Multiple data logs found in {dataset_dir}; keep or select exactly one: {rendered}"
+        )
+    return paths[0] if paths else None
 
 
 def choose_pnp_csv(dataset_dir: Path, preferred_name: str) -> Path | None:
@@ -272,7 +312,7 @@ def choose_pnp_csv(dataset_dir: Path, preferred_name: str) -> Path | None:
     return scaled[-1] if scaled else None
 
 
-def require_columns(rows: list[dict[str, str]], columns: list[str], label: str) -> bool:
+def require_columns(rows: list[dict[str, str]], columns: list[str]) -> bool:
     if not rows:
         return False
     keys = set(rows[0].keys())
@@ -286,11 +326,20 @@ def status_success(row: dict[str, str]) -> bool:
     return row.get("status", "success").strip().lower() == "success"
 
 
-def index_by(rows: list[dict[str, str]], key: str) -> dict[str, dict[str, str]]:
+def index_by(
+    rows: list[dict[str, str]],
+    key: str,
+    *,
+    label: str,
+) -> dict[str, dict[str, str]]:
     result = {}
     for row in rows:
         value = row.get(key, "").strip()
         if value:
+            if value in result:
+                raise DatasetBuildError(
+                    f"Duplicate {key}={value!r} in {label}; joins must be one-to-one."
+                )
             result[value] = row
     return result
 
@@ -330,11 +379,48 @@ def norm(a: list[float]) -> float:
     return math.sqrt(dot(a, a))
 
 
+def cross(a: list[float], b: list[float]) -> list[float]:
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def validate_right_handed_basis(
+    u_axis: list[float],
+    v_axis: list[float],
+    normal: list[float],
+    *,
+    label: str,
+    atol: float = GEOMETRY_ATOL,
+) -> None:
+    vectors = (u_axis, v_axis, normal)
+    if any(len(vector) != 3 for vector in vectors) or not all(
+        math.isfinite(value) for vector in vectors for value in vector
+    ):
+        raise DatasetBuildError(f"{label} basis must contain three finite 3D vectors.")
+    errors = [
+        abs(norm(u_axis) - 1.0),
+        abs(norm(v_axis) - 1.0),
+        abs(norm(normal) - 1.0),
+        abs(dot(u_axis, v_axis)),
+        abs(dot(u_axis, normal)),
+        abs(dot(v_axis, normal)),
+        norm(vec_sub(cross(u_axis, v_axis), normal)),
+    ]
+    if max(errors) > atol:
+        raise DatasetBuildError(
+            f"{label} basis is not orthonormal and right-handed; "
+            f"max error={max(errors):.3g}."
+        )
+
+
 def flatten(matrix: list[list[float]]) -> list[float]:
     return [value for row in matrix for value in row]
 
 
-def camera_pose_from_row(row: dict[str, str], handeye_translation_scale: float) -> dict[str, list[float] | list[list[float]]]:
+def camera_pose_from_row(row: dict[str, str], handeye_translation_scale: float) -> dict[str, list[float] | list[list[float]]]:  # 相机位姿
     rotation_keys = [
         ["cam_r11", "cam_r12", "cam_r13"],
         ["cam_r21", "cam_r22", "cam_r23"],
@@ -422,22 +508,34 @@ def build_crop_cam_vec(insight_row: dict[str, str]) -> tuple[list[float], dict[s
     return vector, {"face": face, "left_eye": left_eye, "right_eye": right_eye}
 
 
-def build_scene_vec(
+def build_vicon_aligned_table_scene(
     r_cw: list[list[float]],
     t_cw: list[float],
     t_wc: list[float],
     z_table: float,
 ) -> tuple[list[float], dict[str, list[float] | float]]:
-    n_w = [0.0, 0.0, 1.0]
-    e1_w = [1.0, 0.0, 0.0]
-    e2_w = [0.0, 1.0, 0.0]
+    if not math.isfinite(z_table):
+        raise DatasetBuildError(f"Table height must be finite, got {z_table}.")
+    n_w = list(TABLE_NORMAL_W)
+    e1_w = list(TABLE_U_AXIS_W)
+    e2_w = list(TABLE_V_AXIS_W)
+    validate_right_handed_basis(e1_w, e2_w, n_w, label="Vicon-world table")
+
+    # This is a per-sample local UV origin, not a fixed global table origin.
     o_table_w = [t_wc[0], t_wc[1], z_table]
 
     n_c = matvec(r_cw, n_w)
     o_table_c = vec_add(matvec(r_cw, o_table_w), t_cw)
     e1_c = matvec(r_cw, e1_w)
     e2_c = matvec(r_cw, e2_w)
+    validate_right_handed_basis(e1_c, e2_c, n_c, label="camera-frame table")
     d_c = dot(n_c, o_table_c)
+    expected_d_c = z_table - t_wc[2]
+    if abs(d_c - expected_d_c) > GEOMETRY_DISTANCE_ATOL_MM:
+        raise DatasetBuildError(
+            "Camera-frame table distance is inconsistent with the Vicon-world "
+            f"projection: d_c={d_c}, expected={expected_d_c}."
+        )
 
     vector = []
     vector.extend(n_c)
@@ -452,8 +550,11 @@ def build_scene_vec(
     return vector, {
         "n_c": n_c,
         "d_c": d_c,
+        "n_w": n_w,
         "o_table_w": o_table_w,
         "o_table_c": o_table_c,
+        "e1_w": e1_w,
+        "e2_w": e2_w,
         "e1_c": e1_c,
         "e2_c": e2_c,
     }
@@ -473,18 +574,11 @@ def old_gaze_cam(row: dict[str, str]) -> list[float] | None:
     return [float(value) for value in values]
 
 
-def corrected_gaze_camera_fields(
+def raw_gaze_camera_audit_fields(
     gaze_cam_recomputed: list[float],
     gaze_cam_csv_raw: list[float] | None,
 ) -> dict[str, float | None]:
-    """Expose only corrected camera coordinates through legacy active fields.
-
-    The original recorder combined millimetre Vicon translations with the
-    metre-valued hand-eye translation without converting the latter. Keep that
-    source value under explicit ``*_raw_*`` provenance columns, while the
-    backward-compatible ``gaze_cam_csv_*`` fields now alias the authoritative
-    recomputation made with ``handeye_translation_scale=1000``.
-    """
+    """Preserve the recorder value only as provenance against recomputation."""
 
     raw_error = (
         norm(vec_sub(gaze_cam_recomputed, gaze_cam_csv_raw))
@@ -492,10 +586,6 @@ def corrected_gaze_camera_fields(
         else None
     )
     return {
-        "gaze_cam_csv_x_mm": gaze_cam_recomputed[0],
-        "gaze_cam_csv_y_mm": gaze_cam_recomputed[1],
-        "gaze_cam_csv_z_mm": gaze_cam_recomputed[2],
-        "gaze_cam_error_mm": 0.0,
         "gaze_cam_csv_raw_x_mm": (
             gaze_cam_csv_raw[0] if gaze_cam_csv_raw is not None else None
         ),
@@ -509,10 +599,15 @@ def corrected_gaze_camera_fields(
     }
 
 
-def existing_image_paths(dataset_dir: Path, image_name: str) -> dict[str, Path]:
+def existing_image_paths(
+    dataset_dir: Path,
+    image_name: str,
+    *,
+    face_image_dir: str,
+) -> dict[str, Path]:
     return {
         "source": dataset_dir / "insightface_img" / image_name,
-        "face": dataset_dir / "insightface_face" / image_name,
+        "face": dataset_dir / face_image_dir / image_name,
         "left_eye": dataset_dir / "insightface_eyes" / "left_eye" / image_name,
         "right_eye": dataset_dir / "insightface_eyes" / "right_eye" / image_name,
     }
@@ -580,7 +675,7 @@ def stats(values: list[float]) -> dict[str, float | int | None]:
 def collect_table_z_values(dataset_dirs: list[Path]) -> dict[str, list[float]]:
     result: dict[str, list[float]] = {}
     for dataset_dir in dataset_dirs:
-        data_log = choose_one(dataset_dir.glob("data_log_*.csv"))
+        data_log = choose_data_log_csv(dataset_dir)
         if data_log is None:
             result[dataset_dir.name] = []
             continue
@@ -594,18 +689,50 @@ def collect_table_z_values(dataset_dirs: list[Path]) -> dict[str, list[float]]:
     return result
 
 
+def resolve_table_z_mm(
+    gaze_target_w: list[float],
+    dataset_mean_z_mm: float | None,
+    source: str,
+) -> float:
+    if source == "per-sample-target":
+        z_table = gaze_target_w[2]
+    elif source == "per-dataset-mean":
+        if dataset_mean_z_mm is None:
+            raise DatasetBuildError(
+                "Cannot use per-dataset-mean without valid gaze_target_tz values."
+            )
+        z_table = dataset_mean_z_mm
+    else:
+        raise DatasetBuildError(f"Unsupported table Z source: {source!r}")
+    if not math.isfinite(z_table):
+        raise DatasetBuildError(f"Resolved table height must be finite, got {z_table}.")
+    return z_table
+
+
 def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     requested = normalize_dataset_names(args.datasets)
     dataset_dirs = discover_dataset_dirs(args.source_root, requested)
-    z_values_by_dataset = collect_table_z_values(dataset_dirs)
-    global_z_values = [value for values in z_values_by_dataset.values() for value in values]
-    global_z_table = mean(global_z_values) if global_z_values else None
+    if args.table_z_source == "per-dataset-mean":
+        z_values_by_dataset = collect_table_z_values(dataset_dirs)
+    else:
+        z_values_by_dataset = {dataset_dir.name: [] for dataset_dir in dataset_dirs}
 
     output_rows: list[dict[str, Any]] = []
     report: dict[str, Any] = {
         "source_root": str(args.source_root),
         "output_dir": str(args.output_dir),
-        "table_z_scope": args.table_z_scope,
+        "table_z_source": args.table_z_source,
+        "table_coordinate_contract": {
+            "world_frame": "Vicon right-handed: X right, Y forward, Z up; millimetres",
+            "table_model": "per-sample horizontal reference plane z = z_table_mm",
+            "uv_origin": "optical camera centre projected along Vicon Z onto the table",
+            "u_axis_world": TABLE_U_AXIS_W,
+            "v_axis_world": TABLE_V_AXIS_W,
+            "normal_world": TABLE_NORMAL_W,
+            "uv_formula": "U=dot(e_u, gaze_w-origin_w), V=dot(e_v, gaze_w-origin_w)",
+            "basis_validation_atol": GEOMETRY_ATOL,
+            "distance_validation_atol_mm": GEOMETRY_DISTANCE_ATOL_MM,
+        },
         "handeye_translation_scale": args.handeye_translation_scale,
         "require_pnp": args.require_pnp,
         "allow_missing_images": args.allow_missing_images,
@@ -623,6 +750,7 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
             "insightface_csv": None,
             "pnp_csv": None,
             "z_table_mm": None,
+            "z_table_mm_stats": {},
             "counts": {
                 "data_log_rows": 0,
                 "insightface_rows": 0,
@@ -648,18 +776,18 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
                 "left_eye": 0,
                 "right_eye": 0,
             },
-            "gaze_cam_error_mm": {},
             "gaze_cam_raw_error_mm": {},
+            "table_target_z_delta_mm": {},
         }
 
-        data_log = choose_one(dataset_dir.glob("data_log_*.csv"))
+        data_log = choose_data_log_csv(dataset_dir)
         if data_log is None:
             dataset_report["skipped"]["missing_data_log"] = 1
             report["datasets"].append(dataset_report)
             continue
         dataset_report["data_log_csv"] = str(data_log)
 
-        insightface_csv = dataset_dir / "insightface_coordinates.csv"
+        insightface_csv = dataset_dir / args.insightface_coordinates_file
         if not insightface_csv.exists():
             dataset_report["skipped"]["missing_insightface_csv"] = 1
             report["datasets"].append(dataset_report)
@@ -677,25 +805,30 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
         dataset_report["counts"]["insightface_rows"] = len(insight_rows)
         dataset_report["counts"]["pnp_rows"] = len(pnp_rows)
 
-        if not require_columns(data_rows, ["image_filename"], "data_log"):
+        if not require_columns(data_rows, ["image_filename"]):
             dataset_report["skipped"]["missing_data_log"] = 1
             report["datasets"].append(dataset_report)
             continue
 
         z_values = z_values_by_dataset.get(dataset_dir.name, [])
-        if args.table_z_scope == "global":
-            z_table = global_z_table
-        else:
-            z_table = mean(z_values) if z_values else None
-        dataset_report["z_table_mm"] = z_table
-        if z_table is None:
+        dataset_mean_z_mm = mean(z_values) if z_values else None
+        dataset_report["z_table_source"] = args.table_z_source
+        if args.table_z_source == "per-dataset-mean":
+            dataset_report["z_table_mm"] = dataset_mean_z_mm
+        if args.table_z_source == "per-dataset-mean" and dataset_mean_z_mm is None:
             dataset_report["skipped"]["missing_gaze_target"] = len(data_rows)
             report["datasets"].append(dataset_report)
             continue
 
-        insight_by_name = index_by(insight_rows, "image_name")
-        pnp_by_name = index_by(pnp_rows, "image_name")
+        insight_by_name = index_by(
+            insight_rows, "image_name", label=str(insightface_csv)
+        )
+        pnp_by_name = index_by(
+            pnp_rows, "image_name", label=str(pnp_csv or "PnP rows")
+        )
         dataset_raw_errors: list[float] = []
+        dataset_z_deltas: list[float] = []
+        dataset_resolved_z_tables: list[float] = []
 
         for data_row in data_rows:
             image_name = data_row.get("image_filename", "").strip()
@@ -724,7 +857,11 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
             crop_cam_vec, bboxes = crop_result
             dataset_report["counts"]["joined_rows"] += 1
 
-            image_paths = existing_image_paths(dataset_dir, image_name)
+            image_paths = existing_image_paths(
+                dataset_dir,
+                image_name,
+                face_image_dir=args.face_image_dir,
+            )
             image_exists = {key: bool_exists(path) for key, path in image_paths.items()}
             for key, exists in image_exists.items():
                 if not exists:
@@ -754,11 +891,19 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
             r_cw = pose["r_cw"]  # type: ignore[assignment]
             t_cw = pose["t_cw"]  # type: ignore[assignment]
             t_wc = pose["t_wc"]  # type: ignore[assignment]
-            scene_vec, scene_meta = build_scene_vec(r_cw, t_cw, t_wc, z_table)  # type: ignore[arg-type]
+            z_table = resolve_table_z_mm(
+                gaze_target_w,
+                dataset_mean_z_mm,
+                args.table_z_source,
+            )
+            dataset_resolved_z_tables.append(z_table)
+            scene_vec, scene_meta = build_vicon_aligned_table_scene(
+                r_cw, t_cw, t_wc, z_table  # type: ignore[arg-type]
+            )
 
             gaze_cam_recomputed = vec_add(matvec(r_cw, gaze_target_w), t_cw)  # type: ignore[arg-type]
             gaze_cam_csv_raw = old_gaze_cam(data_row)
-            gaze_camera_columns = corrected_gaze_camera_fields(
+            gaze_camera_columns = raw_gaze_camera_audit_fields(
                 gaze_cam_recomputed,
                 gaze_cam_csv_raw,
             )
@@ -768,11 +913,18 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
                 all_raw_errors.append(raw_error)
 
             o_table_w = scene_meta["o_table_w"]
+            e1_w = scene_meta["e1_w"]
+            e2_w = scene_meta["e2_w"]
+            n_w = scene_meta["n_w"]
+            target_from_origin = vec_sub(
+                gaze_target_w, o_table_w  # type: ignore[arg-type]
+            )
             uv_gt = [
-                gaze_target_w[0] - o_table_w[0],  # type: ignore[index]
-                gaze_target_w[1] - o_table_w[1],  # type: ignore[index]
+                dot(e1_w, target_from_origin),  # type: ignore[arg-type]
+                dot(e2_w, target_from_origin),  # type: ignore[arg-type]
             ]
-            z_delta = gaze_target_w[2] - z_table
+            z_delta = dot(n_w, target_from_origin)  # type: ignore[arg-type]
+            dataset_z_deltas.append(z_delta)
 
             pnp_data = pnp_fields(pnp_row)
             row: dict[str, Any] = {
@@ -828,17 +980,14 @@ def build_dataset(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[
             output_rows.append(row)
             dataset_report["counts"]["written_rows"] += 1
 
-        dataset_report["gaze_cam_error_mm"] = stats(
-            [0.0] * len(dataset_raw_errors)
-        )
         dataset_report["gaze_cam_raw_error_mm"] = stats(dataset_raw_errors)
+        dataset_report["z_table_mm_stats"] = stats(dataset_resolved_z_tables)
+        dataset_report["table_target_z_delta_mm"] = stats(dataset_z_deltas)
         report["datasets"].append(dataset_report)
 
     report["overall"] = {
         "dataset_count": len(dataset_dirs),
         "sample_count": len(output_rows),
-        "global_z_table_mm": global_z_table,
-        "gaze_cam_error_mm": stats([0.0] * len(all_raw_errors)),
         "gaze_cam_raw_error_mm": stats(all_raw_errors),
         "crop_cam_dim": 36,
         "scene_dim": 25,

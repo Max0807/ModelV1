@@ -78,6 +78,57 @@ def unpack_table_frame7(
     }
 
 
+def virtual_camera_xy_to_table_uv(
+    point_xy_n_mm: Tensor,
+    table_frame7_n: Tensor,
+    *,
+    distance_scale_mm: float,
+    min_abs_normal_z: float = 1e-4,
+) -> Tensor:
+    """Map predicted virtual-camera ``P_N[:2]`` to table-local UV in mm.
+
+    ``P_N`` is constrained to the known per-sample table plane. Given its
+    predicted x/y coordinates, the missing z coordinate follows from
+    ``n_N dot P_N = d_N``. The recovered point is then expressed in the table
+    basis stored by ``TableFrame7_N``. The operation is parameter-free and
+    differentiable with respect to ``point_xy_n_mm``.
+    """
+
+    if distance_scale_mm <= 0:
+        raise ValueError("distance_scale_mm must be positive.")
+    if min_abs_normal_z <= 0:
+        raise ValueError("min_abs_normal_z must be positive.")
+
+    point_xy = _vector_batch(point_xy_n_mm, "point_xy_n_mm", 2)
+    table = unpack_table_frame7(
+        table_frame7_n.to(device=point_xy.device, dtype=point_xy.dtype),
+        distance_scale_mm=distance_scale_mm,
+    )
+    if table["n_c"].shape[0] != point_xy.shape[0]:
+        raise ValueError(
+            "table_frame7_n and point_xy_n_mm must share the batch dimension."
+        )
+
+    normal_n = table["n_c"]
+    normal_z = normal_n[:, 2:3]
+    if torch.any(normal_z.abs() < float(min_abs_normal_z)):
+        minimum = float(normal_z.detach().abs().min())
+        raise ValueError(
+            "Cannot recover P_N.z from P_N[:2]: the table plane is nearly "
+            f"parallel to the virtual-camera z axis (min |n_N.z|={minimum:.3e})."
+        )
+
+    point_z = (
+        table["d_c_mm"]
+        - (normal_n[:, :2] * point_xy).sum(dim=-1, keepdim=True)
+    ) / normal_z
+    point_n = torch.cat((point_xy, point_z), dim=-1)
+    displacement = point_n - table["origin_c_mm"]
+    u = (displacement * table["e1_c"]).sum(dim=-1)
+    v = (displacement * table["e2_c"]).sum(dim=-1)
+    return torch.stack((u, v), dim=-1)
+
+
 class RayTableGeometry(nn.Module):
     """Intersect gaze rays with a table and return camera-projection-local UV."""
 

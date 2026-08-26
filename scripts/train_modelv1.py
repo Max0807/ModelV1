@@ -33,6 +33,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modelv1 import (
+    DirectTableUVLoss,
+    DirectVirtualTableUVLoss,
     GazeGeometryLoss,
     GazeGeometryLossConfig,
     ModelV1,
@@ -40,19 +42,44 @@ from modelv1 import (
     UVLossConfig,
     UVRegressionLoss,
 )
-from modelv1.losses import compute_uv_metrics_mm
+from modelv1.losses import (
+    compute_uv_metrics_mm,
+    iris_heatmap_mse_loss,
+    probabilistic_eye_keypoint_nll,
+)
+from modelv1.vertical_eye_geometry import (
+    eye_landmark_validation_metrics,
+    equivariant_landmark_consistency_loss,
+    low_dof_eye_template_losses,
+    low_dof_eye_template_metrics,
+    mirror_shape_consistency_loss,
+    pitch_to_v_residual_regularization,
+    probabilistic_landmark_supervision_losses,
+    sample_eye_affine_matrices,
+    stack_binocular_outputs,
+    warp_eye_images,
+)
 from modelv1.deca_cache import DecaFeatureCache
 from modelv1.processed_artifacts import processed_dataset_artifacts
+from modelv1.preprocessed_v2 import (
+    canonical_preprocessed_v2_depth_method,
+    load_preprocessed_v2_training_inputs,
+)
 from modelv1.data import (
+    DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+    DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA,
     EyeAppearanceAugmentationConfig,
     IMAGE_SOURCE_LEGACY,
     IMAGE_SOURCE_VIRTUAL_CAMERA,
     PairedEyeAppearanceAugmentation,
+    VirtualCameraManifest,
     build_modelv1_dataloaders,
+    canonical_direct_uv_target_frame,
     get_depth_correction_geometry_normalizer,
     get_eye_geometry_normalizer,
     get_eye_geometry_quality_normalizer,
     get_uv_target_normalizer,
+    get_virtual_distance_scale_normalizer,
     canonical_image_source,
     merge_virtual_camera_manifests,
 )
@@ -60,6 +87,7 @@ from modelv1.data.normalization import (
     EyeGeometryNormalizer,
     EyeGeometryQualityNormalizer,
     UVTargetNormalizer,
+    VirtualDistanceScaleNormalizer,
 )
 from modelv1.depth_prior.face_preprocess import (
     DEFAULT_DECA_CROP_SCALE,
@@ -85,6 +113,7 @@ from modelv1.model import (
     FACE_IMAGE_PRETRAINED_DATASET,
     GAZE_PREDICTION_FRAME_CAMERA,
     GAZE_PREDICTION_FRAME_VIRTUAL_CAMERA,
+    PREDICTION_MODE_DIRECT_UV,
     PREDICTION_MODE_GAZE_GEOMETRY,
     canonical_deca_branch_mode,
     canonical_gaze_prediction_frame,
@@ -100,6 +129,7 @@ from modelv1.data.depth_prior import (
 )
 from modelv1.scene import (
     SCENE_REPRESENTATION_FULL25,
+    SCENE_REPRESENTATION_TABLE_FRAME7,
     canonical_scene_representation,
     scene_representation_dim,
 )
@@ -133,6 +163,13 @@ TUPLE_CONFIG_KEYS = (
     "fusion_hidden_dims",
     "depth_reweighter_hidden_dims",
     "depth_correction_hidden_dims",
+    "virtual_distance_film_hidden_dims",
+    "eye_token_grid",
+    "eye_keypoint_heatmap_size",
+    "eye_template_image_size",
+    "eye_template_pitch_range_deg",
+    "eye_template_yaw_range_deg",
+    "pitch_to_v_hidden_dims",
 )
 EYE_BACKBONE_TRAIN_FROM_STAGES = (
     "stem",
@@ -156,8 +193,84 @@ def metric_names_for_model(
             or float(loss_config.get("uv_gaussian_nll_weight", 0.0)) > 0
         ):
             names = (*names, *V4_LOSS_METRIC_NAMES)
-        return names
-    return BASE_METRIC_NAMES
+    else:
+        names = BASE_METRIC_NAMES
+    if config.use_eye_iris_auxiliary:
+        names = (*names, "iris_heatmap_loss", "weighted_iris_heatmap_loss")
+    if config.use_eye_keypoint_auxiliary:
+        names = (
+            *names,
+            "eye_keypoint_nll",
+            "weighted_eye_keypoint_nll",
+            "eye_keypoint_mean_std_norm",
+            "eye_keypoint_effective_weight_per_sample",
+            "eye_landmark_coordinate_loss",
+            "weighted_eye_landmark_coordinate_loss",
+            "eye_landmark_heatmap_loss",
+            "weighted_eye_landmark_heatmap_loss",
+            "eye_landmark_visibility_loss",
+            "weighted_eye_landmark_visibility_loss",
+            "eye_landmark_equivariance_loss",
+            "weighted_eye_landmark_equivariance_loss",
+            "eye_landmark_mirror_shape_loss",
+            "weighted_eye_landmark_mirror_shape_loss",
+            "eye_landmark_nme",
+            "eye_landmark_iris_center_error_px",
+            "eye_landmark_vertical_error_px",
+            "eye_landmark_ellipse_reprojection_error",
+            "eye_landmark_equivariance_error_norm",
+            "eye_landmark_teacher_quality_error_corr",
+        )
+    if config.use_landmark_guided_eye_fusion:
+        names = (
+            *names,
+            "landmark_guided_global_gate_mean",
+            "landmark_guided_applied_gate_abs_mean",
+            "landmark_guided_quality_mean",
+            "landmark_guided_delta_norm_mean",
+        )
+    if config.use_low_dof_eye_template:
+        names = (
+            *names,
+            "eye_template_reprojection_loss",
+            "weighted_eye_template_reprojection_loss",
+            "eye_template_binocular_pitch_consistency_loss",
+            "weighted_eye_template_binocular_pitch_consistency_loss",
+            "eye_template_reprojection_error_norm",
+            "eye_template_pitch_std_deg",
+            "eye_template_binocular_pitch_disagreement_deg",
+            "eye_template_geometry_confidence",
+            "eye_template_reference_confidence",
+            "eye_template_iris_effective_visibility",
+            "eye_template_valid_rate",
+        )
+    if config.use_pitch_to_v_residual or config.use_vertical_geometry_residual:
+        names = (
+            *names,
+            "vertical_residual_regularization_loss",
+            "weighted_vertical_residual_regularization_loss",
+            "vertical_base_epe_mm",
+            "vertical_base_mae_u_mm",
+            "vertical_base_mae_v_mm",
+            "vertical_delta_abs_mean_mm",
+            "vertical_geometry_gate_mean",
+            "vertical_camera_table_sensitivity_abs_mean_mm_per_rad",
+            "vertical_camera_table_geometry_valid_rate",
+            "vertical_geometric_pitch_delta_abs_mean_mm",
+            "vertical_fallback_rate",
+            "vertical_v_improvement_mm",
+            "vertical_u_invariance_max_mm",
+        )
+    if config.use_vertical_geometry_residual:
+        names = (
+            *names,
+            "vertical_residual_supervision_loss",
+            "weighted_vertical_residual_supervision_loss",
+            "vertical_geometry_confidence_mean",
+            "vertical_training_gate_mean",
+            "vertical_learned_gate_mean",
+        )
+    return names
 
 
 def _split_identity(values: Any, fallback: str) -> str:
@@ -180,7 +293,12 @@ def apply_numbered_experiment_identity(config: dict[str, Any]) -> None:
     val_id = _split_identity(data_config.get("val_datasets"), "random_val")
     prediction_mode = str(config["model"].get("prediction_mode", "direct_uv"))
     model_stage = "v4" if prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY else prediction_mode
-    prior_kind = str(data_config.get("depth_prior_kind", "none")).lower()
+    prior_kind = str(
+        data_config.get(
+            "depth_method",
+            data_config.get("depth_prior_kind", "none"),
+        )
+    ).lower()
     depth_mode = str(config["model"].get("depth_distribution_mode", "point")).lower()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_stem = (
@@ -306,6 +424,22 @@ def validate_config(config: Mapping[str, Any]) -> None:
         )
     if float(config["data"].get("deca_crop_scale", DEFAULT_DECA_CROP_SCALE)) <= 0:
         raise ValueError("data.deca_crop_scale must be positive.")
+    eye_image_size = config["data"].get("eye_image_size", (60, 36))
+    if (
+        not isinstance(eye_image_size, (list, tuple))
+        or len(eye_image_size) != 2
+    ):
+        raise ValueError(
+            "data.eye_image_size must be a two-item [width, height] sequence."
+        )
+    try:
+        eye_width, eye_height = (int(value) for value in eye_image_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "data.eye_image_size must contain integer width and height values."
+        ) from exc
+    if eye_width <= 0 or eye_height <= 0:
+        raise ValueError("data.eye_image_size dimensions must be positive.")
     use_eye_geometry = config["model"].get("use_eye_geometry", False)
     if not isinstance(use_eye_geometry, bool):
         raise ValueError("model.use_eye_geometry must be true or false.")
@@ -321,6 +455,138 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if use_face_image and not load_face_image:
         raise ValueError(
             "data.load_face_image must be true when model.use_face_image=true."
+        )
+    use_eye_iris_auxiliary = config["model"].get(
+        "use_eye_iris_auxiliary", False
+    )
+    if not isinstance(use_eye_iris_auxiliary, bool):
+        raise ValueError("model.use_eye_iris_auxiliary must be true or false.")
+    use_eye_keypoint_auxiliary = config["model"].get(
+        "use_eye_keypoint_auxiliary", False
+    )
+    if not isinstance(use_eye_keypoint_auxiliary, bool):
+        raise ValueError(
+            "model.use_eye_keypoint_auxiliary must be true or false."
+        )
+    use_landmark_guided_eye_fusion = config["model"].get(
+        "use_landmark_guided_eye_fusion", False
+    )
+    if not isinstance(use_landmark_guided_eye_fusion, bool):
+        raise ValueError(
+            "model.use_landmark_guided_eye_fusion must be true or false."
+        )
+    if use_landmark_guided_eye_fusion and not use_eye_keypoint_auxiliary:
+        raise ValueError(
+            "model.use_landmark_guided_eye_fusion=true requires "
+            "model.use_eye_keypoint_auxiliary=true."
+        )
+    use_low_dof_eye_template = config["model"].get(
+        "use_low_dof_eye_template", False
+    )
+    if not isinstance(use_low_dof_eye_template, bool):
+        raise ValueError("model.use_low_dof_eye_template must be true or false.")
+    if use_low_dof_eye_template and not use_eye_keypoint_auxiliary:
+        raise ValueError(
+            "model.use_low_dof_eye_template=true requires "
+            "model.use_eye_keypoint_auxiliary=true."
+        )
+    use_pitch_to_v_residual = config["model"].get(
+        "use_pitch_to_v_residual", False
+    )
+    if not isinstance(use_pitch_to_v_residual, bool):
+        raise ValueError("model.use_pitch_to_v_residual must be true or false.")
+    if use_pitch_to_v_residual and not use_low_dof_eye_template:
+        raise ValueError(
+            "model.use_pitch_to_v_residual=true requires "
+            "model.use_low_dof_eye_template=true."
+        )
+    use_vertical_geometry_residual = config["model"].get(
+        "use_vertical_geometry_residual", False
+    )
+    if not isinstance(use_vertical_geometry_residual, bool):
+        raise ValueError(
+            "model.use_vertical_geometry_residual must be true or false."
+        )
+    if use_vertical_geometry_residual and not use_eye_keypoint_auxiliary:
+        raise ValueError(
+            "model.use_vertical_geometry_residual=true requires "
+            "model.use_eye_keypoint_auxiliary=true."
+        )
+    if use_vertical_geometry_residual and use_pitch_to_v_residual:
+        raise ValueError(
+            "model.use_vertical_geometry_residual and "
+            "model.use_pitch_to_v_residual cannot both be true."
+        )
+    pitch_to_v_target_frame = str(
+        config["model"].get("pitch_to_v_target_frame", "table_local")
+    ).strip().lower()
+    data_direct_uv_target_frame = canonical_direct_uv_target_frame(
+        config["data"].get(
+            "direct_uv_target_frame", DIRECT_UV_TARGET_FRAME_TABLE_LOCAL
+        )
+    )
+    if use_pitch_to_v_residual and (
+        pitch_to_v_target_frame != data_direct_uv_target_frame
+    ):
+        raise ValueError(
+            "model.pitch_to_v_target_frame must match "
+            "data.direct_uv_target_frame."
+        )
+    template_image_size = tuple(
+        int(value)
+        for value in config["model"].get(
+            "eye_template_image_size", eye_image_size
+        )
+    )
+    if (
+        (use_low_dof_eye_template or use_vertical_geometry_residual)
+        and template_image_size != (eye_width, eye_height)
+    ):
+        raise ValueError(
+            "model.eye_template_image_size must exactly match "
+            "data.eye_image_size so normalized landmark geometry is isotropic "
+            "in pixel space."
+        )
+    iris_supervision_csv_paths = config["data"].get(
+        "iris_supervision_csv_paths"
+    )
+    eye_geometry_pseudo_label_paths = config["data"].get(
+        "eye_geometry_pseudo_label_paths"
+    )
+    if eye_geometry_pseudo_label_paths is not None and (
+        not isinstance(eye_geometry_pseudo_label_paths, (list, tuple))
+        or not eye_geometry_pseudo_label_paths
+        or not all(str(path).strip() for path in eye_geometry_pseudo_label_paths)
+    ):
+        raise ValueError(
+            "data.eye_geometry_pseudo_label_paths must be a non-empty YAML list."
+        )
+    require_eye_geometry_pseudo_labels = config["data"].get(
+        "require_eye_geometry_pseudo_labels", False
+    )
+    if not isinstance(require_eye_geometry_pseudo_labels, bool):
+        raise ValueError(
+            "data.require_eye_geometry_pseudo_labels must be true or false."
+        )
+    if require_eye_geometry_pseudo_labels and not eye_geometry_pseudo_label_paths:
+        raise ValueError(
+            "data.require_eye_geometry_pseudo_labels=true requires "
+            "data.eye_geometry_pseudo_label_paths."
+        )
+    if use_eye_keypoint_auxiliary and not eye_geometry_pseudo_label_paths:
+        raise ValueError(
+            "model.use_eye_keypoint_auxiliary=true requires "
+            "data.eye_geometry_pseudo_label_paths."
+        )
+    if use_eye_iris_auxiliary and not eye_geometry_pseudo_label_paths and (
+        not isinstance(iris_supervision_csv_paths, (list, tuple))
+        or not iris_supervision_csv_paths
+        or not all(str(path).strip() for path in iris_supervision_csv_paths)
+    ):
+        raise ValueError(
+            "Eye iris auxiliary supervision requires either a non-empty "
+            "data.eye_geometry_pseudo_label_paths list or legacy "
+            "data.iris_supervision_csv_paths."
         )
     deca_feature_representation = canonical_deca_feature_representation(
         config["model"].get(
@@ -384,6 +650,37 @@ def validate_config(config: Mapping[str, Any]) -> None:
     if int(config["model"].get("eye_geometry_quality_dim", 4)) != 4:
         raise ValueError("model.eye_geometry_quality_dim must be 4 for V2.2.")
     has_numbered_dataset_ids = bool(config["data"].get("dataset_ids"))
+    preprocessed_v2_root = config["data"].get("preprocessed_v2_root")
+    uses_preprocessed_v2 = preprocessed_v2_root is not None
+    if uses_preprocessed_v2:
+        if not str(preprocessed_v2_root).strip():
+            raise ValueError("data.preprocessed_v2_root must be a non-empty path.")
+        if not has_numbered_dataset_ids:
+            raise ValueError(
+                "data.dataset_ids is required with data.preprocessed_v2_root."
+            )
+        canonical_preprocessed_v2_depth_method(
+            config["data"].get("depth_method", "")
+        )
+        incompatible = [
+            key
+            for key in (
+                "csv_path",
+                "depth_prior_csv_path",
+                "processed_data_dir",
+                "depth_prior_kind",
+                "use_trainable_depth_subset",
+                "virtual_camera_manifest_path",
+                "virtual_camera_manifest_paths",
+                "sample_id_filter_virtual_camera_manifest_paths",
+            )
+            if config["data"].get(key) is not None
+        ]
+        if incompatible:
+            raise ValueError(
+                "preprocessed-v2 training inputs are authoritative; remove "
+                f"legacy/explicit data keys: {incompatible}."
+            )
     if (
         use_eye_geometry
         and not has_numbered_dataset_ids
@@ -397,11 +694,216 @@ def validate_config(config: Mapping[str, Any]) -> None:
     )
     if gate_regularization_weight < 0:
         raise ValueError("loss.gate_regularization_weight must be non-negative.")
+    iris_heatmap_weight = float(
+        config["loss"].get("iris_heatmap_weight", 0.0)
+    )
+    iris_heatmap_sigma_pixels = float(
+        config["loss"].get("iris_heatmap_sigma_pixels", 1.0)
+    )
+    eye_keypoint_nll_weight = float(
+        config["loss"].get("eye_keypoint_nll_weight", 0.0)
+    )
+    eye_keypoint_min_std_norm = float(
+        config["loss"].get("eye_keypoint_min_std_norm", 0.01)
+    )
+    eye_landmark_coordinate_weight = float(
+        config["loss"].get("eye_landmark_coordinate_weight", 0.0)
+    )
+    eye_landmark_heatmap_weight = float(
+        config["loss"].get("eye_landmark_heatmap_weight", 0.0)
+    )
+    eye_landmark_visibility_weight = float(
+        config["loss"].get("eye_landmark_visibility_weight", 0.0)
+    )
+    eye_landmark_equivariance_weight = float(
+        config["loss"].get("eye_landmark_equivariance_weight", 0.0)
+    )
+    eye_landmark_mirror_shape_weight = float(
+        config["loss"].get("eye_landmark_mirror_shape_weight", 0.0)
+    )
+    eye_landmark_huber_delta_norm = float(
+        config["loss"].get("eye_landmark_huber_delta_norm", 0.02)
+    )
+    eye_landmark_heatmap_sigma_min_px = float(
+        config["loss"].get("eye_landmark_heatmap_sigma_min_px", 1.0)
+    )
+    eye_landmark_heatmap_sigma_max_px = float(
+        config["loss"].get("eye_landmark_heatmap_sigma_max_px", 3.0)
+    )
+    eye_landmark_equivariance_rotation_deg = float(
+        config["loss"].get("eye_landmark_equivariance_rotation_deg", 4.0)
+    )
+    eye_landmark_equivariance_translation_norm = float(
+        config["loss"].get("eye_landmark_equivariance_translation_norm", 0.03)
+    )
+    eye_landmark_equivariance_scale_min = float(
+        config["loss"].get("eye_landmark_equivariance_scale_min", 0.97)
+    )
+    eye_landmark_equivariance_scale_max = float(
+        config["loss"].get("eye_landmark_equivariance_scale_max", 1.03)
+    )
+    eye_template_reprojection_weight = float(
+        config["loss"].get("eye_template_reprojection_weight", 0.0)
+    )
+    eye_template_binocular_pitch_weight = float(
+        config["loss"].get("eye_template_binocular_pitch_weight", 0.0)
+    )
+    eye_template_pitch_huber_delta_deg = float(
+        config["loss"].get("eye_template_pitch_huber_delta_deg", 2.0)
+    )
+    vertical_residual_regularization_weight = float(
+        config["loss"].get("vertical_residual_regularization_weight", 0.0)
+    )
+    vertical_residual_supervision_weight = float(
+        config["loss"].get("vertical_residual_supervision_weight", 0.0)
+    )
+    vertical_residual_huber_beta_mm = float(
+        config["loss"].get("vertical_residual_huber_beta_mm", 30.0)
+    )
+    if iris_heatmap_weight < 0:
+        raise ValueError("loss.iris_heatmap_weight must be non-negative.")
+    if iris_heatmap_sigma_pixels <= 0:
+        raise ValueError("loss.iris_heatmap_sigma_pixels must be positive.")
+    if use_eye_iris_auxiliary and iris_heatmap_weight <= 0:
+        raise ValueError(
+            "loss.iris_heatmap_weight must be positive when "
+            "model.use_eye_iris_auxiliary=true."
+        )
+    if eye_keypoint_nll_weight < 0:
+        raise ValueError("loss.eye_keypoint_nll_weight must be non-negative.")
+    if eye_keypoint_min_std_norm <= 0:
+        raise ValueError("loss.eye_keypoint_min_std_norm must be positive.")
+    if use_eye_keypoint_auxiliary and eye_keypoint_nll_weight <= 0:
+        raise ValueError(
+            "loss.eye_keypoint_nll_weight must be positive when "
+            "model.use_eye_keypoint_auxiliary=true."
+        )
+    landmark_weights = {
+        "eye_landmark_coordinate_weight": eye_landmark_coordinate_weight,
+        "eye_landmark_heatmap_weight": eye_landmark_heatmap_weight,
+        "eye_landmark_visibility_weight": eye_landmark_visibility_weight,
+        "eye_landmark_equivariance_weight": eye_landmark_equivariance_weight,
+        "eye_landmark_mirror_shape_weight": eye_landmark_mirror_shape_weight,
+    }
+    invalid_landmark_weights = [
+        name for name, value in landmark_weights.items() if value < 0
+    ]
+    if invalid_landmark_weights:
+        raise ValueError(
+            "Eye-landmark loss weights must be non-negative: "
+            f"{invalid_landmark_weights}."
+        )
+    if use_eye_keypoint_auxiliary:
+        required_positive = (
+            "eye_landmark_coordinate_weight",
+            "eye_landmark_heatmap_weight",
+            "eye_landmark_visibility_weight",
+            "eye_landmark_equivariance_weight",
+            "eye_landmark_mirror_shape_weight",
+        )
+        missing_positive = [
+            name for name in required_positive if landmark_weights[name] <= 0
+        ]
+        if missing_positive:
+            raise ValueError(
+                "The probabilistic landmark stage requires positive coordinate, "
+                "heatmap, and equivariance weights: "
+                f"{missing_positive}."
+            )
+    if eye_landmark_huber_delta_norm <= 0:
+        raise ValueError("loss.eye_landmark_huber_delta_norm must be positive.")
+    if not (
+        0 < eye_landmark_heatmap_sigma_min_px
+        <= eye_landmark_heatmap_sigma_max_px
+    ):
+        raise ValueError(
+            "Eye-landmark heatmap sigma must satisfy 0 < min <= max."
+        )
+    if eye_landmark_equivariance_rotation_deg < 0:
+        raise ValueError(
+            "loss.eye_landmark_equivariance_rotation_deg must be non-negative."
+        )
+    if not 0 <= eye_landmark_equivariance_translation_norm < 0.5:
+        raise ValueError(
+            "loss.eye_landmark_equivariance_translation_norm must be in [0, 0.5)."
+        )
+    if not (
+        0 < eye_landmark_equivariance_scale_min
+        <= eye_landmark_equivariance_scale_max
+    ):
+        raise ValueError(
+            "Eye-landmark equivariance scale must satisfy 0 < min <= max."
+        )
+    if eye_template_reprojection_weight < 0:
+        raise ValueError(
+            "loss.eye_template_reprojection_weight must be non-negative."
+        )
+    if eye_template_binocular_pitch_weight < 0:
+        raise ValueError(
+            "loss.eye_template_binocular_pitch_weight must be non-negative."
+        )
+    if eye_template_pitch_huber_delta_deg <= 0:
+        raise ValueError(
+            "loss.eye_template_pitch_huber_delta_deg must be positive."
+        )
+    if vertical_residual_supervision_weight < 0:
+        raise ValueError(
+            "loss.vertical_residual_supervision_weight must be non-negative."
+        )
+    if vertical_residual_huber_beta_mm <= 0:
+        raise ValueError(
+            "loss.vertical_residual_huber_beta_mm must be positive."
+        )
+    if use_vertical_geometry_residual and vertical_residual_supervision_weight <= 0:
+        raise ValueError(
+            "Simplified vertical geometry residual requires positive "
+            "loss.vertical_residual_supervision_weight."
+        )
+    if use_low_dof_eye_template and (
+        eye_template_reprojection_weight <= 0
+        or eye_template_binocular_pitch_weight <= 0
+    ):
+        raise ValueError(
+            "The low-DOF eye template requires positive reprojection and "
+            "binocular-pitch loss weights."
+        )
+    if vertical_residual_regularization_weight < 0:
+        raise ValueError(
+            "loss.vertical_residual_regularization_weight must be non-negative."
+        )
     prediction_mode = str(
         config["model"].get("prediction_mode", "direct_uv")
     ).strip().lower()
     image_source = canonical_image_source(
         config["data"].get("image_source", IMAGE_SOURCE_LEGACY)
+    )
+    eye_image_source = canonical_image_source(
+        config["data"].get("eye_image_source", image_source)
+    )
+    if (
+        eye_image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
+        and image_source != IMAGE_SOURCE_VIRTUAL_CAMERA
+    ):
+        raise ValueError(
+            "data.eye_image_source='virtual_camera' requires "
+            "data.image_source='virtual_camera'."
+        )
+    if (
+        (
+            eye_geometry_pseudo_label_paths
+            or (use_eye_iris_auxiliary and iris_supervision_csv_paths)
+        )
+        and eye_image_source != IMAGE_SOURCE_LEGACY
+    ):
+        raise ValueError(
+            "MediaPipe eye landmark supervision uses legacy crop coordinates; "
+            "data.eye_image_source must be 'legacy'."
+        )
+    direct_uv_target_frame = canonical_direct_uv_target_frame(
+        config["data"].get(
+            "direct_uv_target_frame",
+            DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+        )
     )
     gaze_prediction_frame = canonical_gaze_prediction_frame(
         config["model"].get(
@@ -409,8 +911,17 @@ def validate_config(config: Mapping[str, Any]) -> None:
             GAZE_PREDICTION_FRAME_CAMERA,
         )
     )
+    use_virtual_distance_film = bool(
+        config["model"].get("use_virtual_distance_film", False)
+    )
+    use_virtual_pose_film = bool(
+        config["model"].get("use_virtual_pose_film", False)
+    )
     virtual_manifest_path = config["data"].get("virtual_camera_manifest_path")
     virtual_manifest_paths = config["data"].get("virtual_camera_manifest_paths")
+    sample_filter_manifest_paths = config["data"].get(
+        "sample_id_filter_virtual_camera_manifest_paths"
+    )
     if virtual_manifest_path and virtual_manifest_paths:
         raise ValueError(
             "Use either data.virtual_camera_manifest_path or "
@@ -424,10 +935,20 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "data.virtual_camera_manifest_paths must be a non-empty YAML list."
         )
+    if sample_filter_manifest_paths is not None and (
+        not isinstance(sample_filter_manifest_paths, (list, tuple))
+        or not sample_filter_manifest_paths
+        or not all(str(path).strip() for path in sample_filter_manifest_paths)
+    ):
+        raise ValueError(
+            "data.sample_id_filter_virtual_camera_manifest_paths must be "
+            "a non-empty YAML list."
+        )
     if (
         image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
         and not virtual_manifest_path
         and not virtual_manifest_paths
+        and not uses_preprocessed_v2
     ):
         raise ValueError(
             "data.virtual_camera_manifest_path or "
@@ -458,6 +979,76 @@ def validate_config(config: Mapping[str, Any]) -> None:
             raise ValueError(
                 "model.gaze_prediction_frame='virtual_camera' requires "
                 "data.image_source='virtual_camera'."
+            )
+    if direct_uv_target_frame == DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA:
+        if prediction_mode != PREDICTION_MODE_DIRECT_UV:
+            raise ValueError(
+                "data.direct_uv_target_frame='virtual_camera' requires "
+                "model.prediction_mode='direct_uv'."
+            )
+        if image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+            raise ValueError(
+                "data.direct_uv_target_frame='virtual_camera' requires "
+                "data.image_source='virtual_camera'."
+            )
+        if (
+            canonical_scene_representation(
+                config["model"].get(
+                    "scene_representation",
+                    SCENE_REPRESENTATION_FULL25,
+                )
+            )
+            != SCENE_REPRESENTATION_TABLE_FRAME7
+        ):
+            raise ValueError(
+                "data.direct_uv_target_frame='virtual_camera' requires "
+                "model.scene_representation='table_frame7'."
+            )
+    if use_virtual_distance_film:
+        if prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY:
+            raise ValueError(
+                "model.use_virtual_distance_film requires prediction_mode='direct_uv'."
+            )
+        if image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+            raise ValueError(
+                "model.use_virtual_distance_film requires "
+                "data.image_source='virtual_camera'."
+            )
+        if (
+            canonical_scene_representation(
+                config["model"].get(
+                    "scene_representation",
+                    SCENE_REPRESENTATION_FULL25,
+                )
+            )
+            != SCENE_REPRESENTATION_TABLE_FRAME7
+        ):
+            raise ValueError(
+                "model.use_virtual_distance_film requires "
+                "scene_representation='table_frame7'."
+            )
+    if use_virtual_pose_film:
+        if prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY:
+            raise ValueError(
+                "model.use_virtual_pose_film requires prediction_mode='direct_uv'."
+            )
+        if image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+            raise ValueError(
+                "model.use_virtual_pose_film requires "
+                "data.image_source='virtual_camera'."
+            )
+        if (
+            canonical_scene_representation(
+                config["model"].get(
+                    "scene_representation",
+                    SCENE_REPRESENTATION_FULL25,
+                )
+            )
+            != SCENE_REPRESENTATION_TABLE_FRAME7
+        ):
+            raise ValueError(
+                "model.use_virtual_pose_film requires "
+                "scene_representation='table_frame7'."
             )
     if (
         prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY
@@ -544,6 +1135,8 @@ def make_eye_appearance_augmentation(
             f"{missing}."
         )
     values = {key: section[key] for key in required}
+    if "coordinate_policy" in section:
+        values["coordinate_policy"] = section["coordinate_policy"]
     values["blur_kernel_size"] = int(values["blur_kernel_size"])
     augmentation_config = EyeAppearanceAugmentationConfig(**values)
     return PairedEyeAppearanceAugmentation(augmentation_config)
@@ -797,14 +1390,138 @@ def resolve_numbered_dataset_artifacts(
     return dataset_csv, deca_cache, depth_prior
 
 
+def resolve_preprocessed_v2_artifacts(
+    data_config: Mapping[str, Any],
+    run_dir: Path,
+    *,
+    require_deca_features: bool,
+    require_depth_prior: bool,
+) -> tuple[Path, Path | None, Path | None, list[Path]]:
+    """Resolve and merge versioned preprocessing training-input contracts."""
+
+    raw_ids = data_config.get("dataset_ids")
+    if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+        raise ValueError(
+            "data.dataset_ids must be a non-empty YAML list for preprocessed-v2."
+        )
+    root = resolve_project_path(data_config["preprocessed_v2_root"])
+    depth_method = canonical_preprocessed_v2_depth_method(
+        data_config["depth_method"]
+    )
+    inputs = load_preprocessed_v2_training_inputs(root, raw_ids, depth_method)
+
+    dataset_paths = [item.dataset_csv for item in inputs]
+    prior_paths = [item.depth_prior_csv for item in inputs]
+    virtual_manifest_paths = [item.virtual_camera_manifest for item in inputs]
+    deca_paths: list[Path] = []
+    if require_deca_features:
+        missing_deca = [
+            item.manifest_path for item in inputs if item.deca_cache is None
+        ]
+        if missing_deca:
+            raise ValueError(
+                "DECA features are required, but preprocessed-v2 manifests have "
+                f"no deca_cache: {missing_deca}"
+            )
+        deca_paths = [
+            item.deca_cache for item in inputs if item.deca_cache is not None
+        ]
+
+    for item in inputs:
+        rows, _ = _read_csv_records(item.dataset_csv)
+        if len(rows) != item.sample_count:
+            raise ValueError(
+                f"Preprocessed-v2 sample_count mismatch for Dataset {item.dataset_id}: "
+                f"manifest={item.sample_count}, dataset_csv={len(rows)}."
+            )
+        wrong_dataset = [
+            row.get("sample_id", "")
+            for row in rows
+            if row.get("dataset") != item.dataset_name
+        ]
+        if wrong_dataset:
+            raise ValueError(
+                f"Preprocessed-v2 Dataset {item.dataset_id} CSV contains "
+                f"{len(wrong_dataset)} rows from another dataset."
+            )
+
+    resolved_dir = run_dir / "resolved_preprocessed_v2"
+    if len(inputs) == 1:
+        dataset_csv = dataset_paths[0]
+        deca_cache = deca_paths[0] if require_deca_features else None
+        depth_prior = prior_paths[0] if require_depth_prior else None
+    else:
+        dataset_csv = _merge_csv_files(
+            dataset_paths,
+            resolved_dir / "dataset.csv",
+            label="dataset",
+        )
+        deca_cache = (
+            _merge_deca_caches(deca_paths, resolved_dir / "deca_features.npz")
+            if require_deca_features
+            else None
+        )
+        depth_prior = (
+            _merge_csv_files(
+                prior_paths,
+                resolved_dir / "depth_prior.csv",
+                label="depth-prior",
+            )
+            if require_depth_prior
+            else None
+        )
+
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+    (resolved_dir / "sources.json").write_text(
+        json.dumps(
+            {
+                "artifact_source": "preprocessed_v2",
+                "preprocessed_v2_root": str(root),
+                "depth_method": depth_method,
+                "dataset_ids": [item.dataset_id for item in inputs],
+                "training_input_manifests": [
+                    str(item.manifest_path) for item in inputs
+                ],
+                "dataset_csvs": [str(path) for path in dataset_paths],
+                "depth_prior_csvs": (
+                    [str(path) for path in prior_paths]
+                    if require_depth_prior
+                    else []
+                ),
+                "virtual_camera_manifests": [
+                    str(path) for path in virtual_manifest_paths
+                ],
+                "deca_caches": (
+                    [str(path) for path in deca_paths]
+                    if require_deca_features
+                    else []
+                ),
+                "sample_counts": {
+                    item.dataset_id: item.sample_count for item in inputs
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return dataset_csv, deca_cache, depth_prior, virtual_manifest_paths
+
+
 def resolve_virtual_camera_manifest_path(
     data_config: Mapping[str, Any],
     run_dir: Path,
+    fallback_paths: list[Path] | None = None,
 ) -> Path | None:
     """Resolve one manifest or merge configured manifests inside ``run_dir``."""
 
     singular = data_config.get("virtual_camera_manifest_path")
     plural = data_config.get("virtual_camera_manifest_paths")
+    if fallback_paths and (singular is not None or plural is not None):
+        raise ValueError(
+            "Preprocessed-v2 virtual-camera manifests cannot be combined with "
+            "explicit virtual_camera_manifest_path(s)."
+        )
     if singular and plural:
         raise ValueError(
             "Use either virtual_camera_manifest_path or "
@@ -812,14 +1529,47 @@ def resolve_virtual_camera_manifest_path(
         )
     if singular is not None:
         return resolve_project_path(singular)
-    if plural is None:
+    if plural is None and not fallback_paths:
         return None
-    if not isinstance(plural, (list, tuple)) or not plural:
-        raise ValueError("virtual_camera_manifest_paths must be a non-empty list.")
-    source_paths = [resolve_project_path(path) for path in plural]
+    if fallback_paths:
+        source_paths = fallback_paths
+    else:
+        if not isinstance(plural, (list, tuple)) or not plural:
+            raise ValueError("virtual_camera_manifest_paths must be a non-empty list.")
+        source_paths = [resolve_project_path(path) for path in plural]
     if len(source_paths) == 1:
         return source_paths[0]
     merged_path = run_dir / "resolved_virtual_camera" / "manifest.csv"
+    return merge_virtual_camera_manifests(source_paths, merged_path)
+
+
+def resolve_sample_id_filter_manifest_path(
+    data_config: Mapping[str, Any],
+    run_dir: Path,
+    fallback_paths: list[Path] | None = None,
+) -> Path | None:
+    """Resolve manifests used only to lock a paired experiment's samples."""
+
+    values = data_config.get("sample_id_filter_virtual_camera_manifest_paths")
+    if fallback_paths and values is not None:
+        raise ValueError(
+            "Preprocessed-v2 sample filtering cannot be combined with explicit "
+            "sample_id_filter_virtual_camera_manifest_paths."
+        )
+    if values is None and not fallback_paths:
+        return None
+    if fallback_paths:
+        source_paths = fallback_paths
+    else:
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError(
+                "sample_id_filter_virtual_camera_manifest_paths must be a "
+                "non-empty list."
+            )
+        source_paths = [resolve_project_path(path) for path in values]
+    if len(source_paths) == 1:
+        return source_paths[0]
+    merged_path = run_dir / "resolved_sample_id_filter" / "manifest.csv"
     return merge_virtual_camera_manifests(source_paths, merged_path)
 
 
@@ -1198,8 +1948,50 @@ def run_epoch(
     amp_enabled: bool,
     grad_clip_norm: float | None,
     gate_regularization_weight: float,
+    iris_heatmap_weight: float = 0.0,
+    iris_heatmap_sigma_pixels: float = 1.0,
+    eye_keypoint_nll_weight: float = 0.0,
+    eye_keypoint_min_std_norm: float = 0.01,
+    eye_landmark_coordinate_weight: float = 0.0,
+    eye_landmark_heatmap_weight: float = 0.0,
+    eye_landmark_visibility_weight: float = 0.0,
+    eye_landmark_equivariance_weight: float = 0.0,
+    eye_landmark_mirror_shape_weight: float = 0.0,
+    eye_landmark_huber_delta_norm: float = 0.02,
+    eye_landmark_heatmap_sigma_min_px: float = 1.0,
+    eye_landmark_heatmap_sigma_max_px: float = 3.0,
+    eye_landmark_equivariance_rotation_deg: float = 4.0,
+    eye_landmark_equivariance_translation_norm: float = 0.03,
+    eye_landmark_equivariance_scale_min: float = 0.97,
+    eye_landmark_equivariance_scale_max: float = 1.03,
+    eye_template_reprojection_weight: float = 0.0,
+    eye_template_binocular_pitch_weight: float = 0.0,
+    eye_template_pitch_huber_delta_deg: float = 2.0,
+    vertical_residual_regularization_weight: float = 0.0,
+    vertical_residual_supervision_weight: float = 0.0,
+    vertical_residual_huber_beta_mm: float = 30.0,
 ) -> tuple[dict[str, float], int]:
     is_train = optimizer is not None
+    runtime_model_config = getattr(model, "config", None)
+    use_eye_iris_auxiliary = bool(
+        getattr(runtime_model_config, "use_eye_iris_auxiliary", False)
+    )
+    use_eye_keypoint_auxiliary = bool(
+        getattr(runtime_model_config, "use_eye_keypoint_auxiliary", False)
+    )
+    use_low_dof_eye_template = bool(
+        getattr(runtime_model_config, "use_low_dof_eye_template", False)
+    )
+    use_pitch_to_v_residual = bool(
+        getattr(runtime_model_config, "use_pitch_to_v_residual", False)
+    )
+    use_vertical_geometry_residual = bool(
+        getattr(runtime_model_config, "use_vertical_geometry_residual", False)
+    )
+    use_landmark_guided_eye_fusion = bool(
+        getattr(runtime_model_config, "use_landmark_guided_eye_fusion", False)
+    )
+    use_vertical_residual = use_pitch_to_v_residual or use_vertical_geometry_residual
     model.train(is_train)
     if (
         is_train
@@ -1225,6 +2017,7 @@ def run_epoch(
     sample_count = 0
     predictions: list[Tensor] = []
     targets_mm: list[Tensor] = []
+    vertical_base_predictions: list[Tensor] = []
     geometry_metric_sums = {
         name: 0.0 for name in V4_GEOMETRY_METRIC_NAMES
     }
@@ -1235,12 +2028,62 @@ def run_epoch(
     v4_loss_metric_sums = {
         name: 0.0 for name in V4_LOSS_METRIC_NAMES
     }
+    iris_heatmap_loss_sum = 0.0
+    eye_keypoint_metric_sums = {
+        "eye_keypoint_nll": 0.0,
+        "eye_keypoint_mean_std_norm": 0.0,
+        "eye_keypoint_effective_weight_per_sample": 0.0,
+        "eye_landmark_coordinate_loss": 0.0,
+        "eye_landmark_heatmap_loss": 0.0,
+        "eye_landmark_visibility_loss": 0.0,
+        "eye_landmark_equivariance_loss": 0.0,
+        "eye_landmark_mirror_shape_loss": 0.0,
+        "eye_landmark_equivariance_error_norm": 0.0,
+    }
+    eye_landmark_predictions: list[Tensor] = []
+    eye_landmark_targets: list[Tensor] = []
+    eye_landmark_valid_masks: list[Tensor] = []
+    eye_landmark_teacher_qualities: list[Tensor] = []
+    eye_landmark_image_size: tuple[int, int] | None = None
+    eye_template_loss_sums = {
+        "eye_template_reprojection_loss": 0.0,
+        "eye_template_binocular_pitch_consistency_loss": 0.0,
+    }
+    eye_template_metric_outputs: dict[str, list[Tensor]] = {
+        "reprojection_error_norm": [],
+        "pitch_rad": [],
+        "pitch_variance": [],
+        "geometry_confidence": [],
+        "reference_confidence": [],
+        "iris_center_effective_visibility": [],
+        "iris_rim_effective_visibility": [],
+        "valid_mask": [],
+    }
+    eye_template_metric_weights: list[Tensor] = []
+    vertical_residual_regularization_sum = 0.0
+    vertical_residual_supervision_sum = 0.0
+    vertical_geometry_confidence_sum = 0.0
+    vertical_training_gate_sum = 0.0
+    vertical_learned_gate_sum = 0.0
+    vertical_delta_abs_sum_mm = 0.0
+    vertical_geometry_gate_sum = 0.0
+    vertical_camera_table_sensitivity_abs_sum = 0.0
+    vertical_camera_table_geometry_valid_sum = 0.0
+    vertical_geometric_pitch_delta_abs_sum = 0.0
+    vertical_fallback_sum = 0.0
+    landmark_guided_global_gate_sum = 0.0
+    landmark_guided_applied_gate_abs_sum = 0.0
+    landmark_guided_quality_sum = 0.0
+    landmark_guided_delta_norm_sum = 0.0
     optimizer_steps = 0
     optimizer_skipped_steps = 0
 
     for batch in loader:
         device_batch = move_batch_to_device(batch, device)
         batch_size = int(device_batch["uv_gt"].shape[0])
+        metric_target_mm = device_batch["uv_gt"]
+        if not torch.is_tensor(metric_target_mm):
+            raise TypeError("batch['uv_gt'] must be a tensor.")
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
@@ -1250,10 +2093,36 @@ def run_epoch(
                 use_gate_regularization = (
                     is_train and gate_regularization_weight > 0
                 )
-                model_output = model(
-                    device_batch,
-                    return_features=use_gate_regularization,
-                )
+                model_kwargs = {"return_features": use_gate_regularization}
+                if use_eye_iris_auxiliary or use_eye_keypoint_auxiliary:
+                    model_kwargs["return_auxiliary"] = True
+                model_output = model(device_batch, **model_kwargs)
+                if use_landmark_guided_eye_fusion:
+                    if not isinstance(model_output, Mapping):
+                        raise RuntimeError(
+                            "Landmark-guided fusion requires model mapping outputs."
+                        )
+                    landmark_guided_global_gate_sum += float(
+                        model_output["landmark_guided_global_gate"]
+                        .detach()
+                        .sum()
+                    )
+                    landmark_guided_applied_gate_abs_sum += float(
+                        model_output["landmark_guided_applied_gate"]
+                        .detach()
+                        .abs()
+                        .sum()
+                    )
+                    landmark_guided_quality_sum += float(
+                        model_output["landmark_guided_sample_quality"]
+                        .detach()
+                        .sum()
+                    )
+                    landmark_guided_delta_norm_sum += float(
+                        model_output["landmark_guided_delta_norm"]
+                        .detach()
+                        .sum()
+                    )
                 if isinstance(criterion, GazeGeometryLoss):
                     if not isinstance(model_output, Mapping):
                         raise TypeError("V4 model must return a geometry output mapping.")
@@ -1347,6 +2216,102 @@ def run_epoch(
                             geometry_metric_sums[
                                 "depth_log_correction_abs_mean"
                             ] += float(log_correction.abs().sum())
+                elif isinstance(
+                    criterion,
+                    (DirectTableUVLoss, DirectVirtualTableUVLoss),
+                ):
+                    direct_uv_pred = model_output
+                    loss_outputs = criterion(direct_uv_pred, device_batch)
+                    loss = loss_outputs["loss"]
+                    uv_pred_mm = loss_outputs["uv_pred_table_mm"]
+                    if use_vertical_residual:
+                        if not isinstance(model_output, Mapping):
+                            raise RuntimeError(
+                                "Vertical residual correction requires model mapping outputs."
+                            )
+                        residual_regularization = (
+                            pitch_to_v_residual_regularization(
+                                loss_outputs["vertical_delta_v_mm"],
+                                max_abs_delta_v_mm=(
+                                    runtime_model_config.pitch_to_v_max_abs_delta_mm
+                                    if use_pitch_to_v_residual
+                                    else runtime_model_config.vertical_geometry_residual_max_abs_delta_mm
+                                ),
+                            )
+                        )
+                        loss = (
+                            loss
+                            + vertical_residual_regularization_weight
+                            * residual_regularization
+                        )
+                        vertical_residual_regularization_sum += (
+                            float(residual_regularization.detach()) * batch_size
+                        )
+                        if (
+                            use_vertical_geometry_residual
+                            and vertical_residual_supervision_weight > 0
+                        ):
+                            residual_target = (
+                                device_batch["uv_gt_table_mm"][:, 1:2]
+                                - loss_outputs["uv_base_table_mm"][:, 1:2].detach()
+                            )
+                            max_abs_delta = (
+                                runtime_model_config.vertical_geometry_residual_max_abs_delta_mm
+                            )
+                            residual_target = residual_target.clamp(
+                                -max_abs_delta, max_abs_delta
+                            )
+                            per_sample_residual_loss = torch.nn.functional.smooth_l1_loss(
+                                loss_outputs["vertical_delta_v_mm"],
+                                residual_target,
+                                beta=vertical_residual_huber_beta_mm,
+                                reduction="none",
+                            )
+                            training_weight = model_output["vertical_training_gate"].detach()
+                            residual_supervision = (
+                                per_sample_residual_loss * training_weight
+                            ).sum() / training_weight.sum().clamp_min(1.0)
+                            loss = loss + vertical_residual_supervision_weight * residual_supervision
+                            vertical_residual_supervision_sum += float(residual_supervision.detach()) * batch_size
+                            vertical_geometry_confidence_sum += float(
+                                model_output["vertical_geometry_geometry_confidence"].detach().sum()
+                            )
+                            vertical_training_gate_sum += float(
+                                model_output["vertical_training_gate"].detach().sum()
+                            )
+                            vertical_learned_gate_sum += float(
+                                model_output["vertical_learned_gate"].detach().sum()
+                            )
+                        vertical_delta_abs_sum_mm += float(
+                            loss_outputs["vertical_delta_v_mm"].detach().abs().sum()
+                        )
+                        vertical_geometry_gate_sum += float(
+                            model_output["vertical_geometry_gate"].detach().sum()
+                        )
+                        vertical_camera_table_sensitivity_abs_sum += float(
+                            model_output[
+                                "vertical_camera_table_vertical_sensitivity_mm_per_rad"
+                            ].detach().abs().sum()
+                        )
+                        vertical_camera_table_geometry_valid_sum += float(
+                            model_output[
+                                "vertical_camera_table_geometry_valid_mask"
+                            ].detach().sum()
+                        )
+                        vertical_geometric_pitch_delta_abs_sum += float(
+                            model_output[
+                                "vertical_geometric_pitch_delta_v_mm"
+                            ].detach().abs().sum()
+                        )
+                        vertical_fallback_sum += float(
+                            model_output["vertical_fallback_mask"].detach().sum()
+                        )
+                        vertical_base_predictions.append(
+                            loss_outputs["uv_base_table_mm"].detach().cpu()
+                        )
+                    metric_target_mm = device_batch["uv_gt_table_mm"]
+                    if not torch.is_tensor(metric_target_mm):
+                        raise TypeError("batch['uv_gt_table_mm'] must be a tensor.")
                 else:
                     if isinstance(model_output, dict):
                         uv_pred = model_output["uv"]
@@ -1356,6 +2321,354 @@ def run_epoch(
                         raise TypeError("Legacy training requires UVRegressionLoss.")
                     loss = criterion(uv_pred, device_batch["uv_target"])
                     uv_pred_mm = criterion.normalizer.denormalize(uv_pred)
+                if use_eye_iris_auxiliary:
+                    if not isinstance(model_output, Mapping):
+                        raise TypeError("Iris auxiliary supervision requires model outputs.")
+                    iris_center_xy = device_batch.get("iris_center_xy")
+                    iris_center_valid_mask = device_batch.get(
+                        "iris_center_valid_mask"
+                    )
+                    if (
+                        not torch.is_tensor(iris_center_xy)
+                        or not torch.is_tensor(iris_center_valid_mask)
+                    ):
+                        raise RuntimeError(
+                            "Iris auxiliary supervision requires iris-center targets."
+                        )
+                    iris_loss = iris_heatmap_mse_loss(
+                        model_output["left_iris_heatmap"],
+                        model_output["right_iris_heatmap"],
+                        iris_center_xy,
+                        iris_center_valid_mask,
+                        sigma_pixels=iris_heatmap_sigma_pixels,
+                    )
+                    loss = loss + iris_heatmap_weight * iris_loss
+                    iris_heatmap_loss_sum += float(iris_loss.detach()) * batch_size
+                if use_eye_keypoint_auxiliary:
+                    if not isinstance(model_output, Mapping):
+                        raise TypeError(
+                            "Probabilistic eye-keypoint supervision requires "
+                            "model mapping outputs."
+                        )
+                    target_xy = device_batch.get("eye_pseudo_landmarks_xy")
+                    valid_mask = device_batch.get(
+                        "eye_pseudo_landmark_valid_mask"
+                    )
+                    eye_quality = device_batch.get(
+                        "eye_pseudo_effective_quality"
+                    )
+                    teacher_quality = device_batch.get(
+                        "eye_pseudo_eye_quality"
+                    )
+                    eye_valid_mask = device_batch.get(
+                        "eye_pseudo_eye_valid_mask"
+                    )
+                    if not all(
+                        torch.is_tensor(value)
+                        for value in (
+                            target_xy,
+                            valid_mask,
+                            eye_quality,
+                            teacher_quality,
+                            eye_valid_mask,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Probabilistic eye-keypoint supervision requires "
+                            "landmarks, post-augmentation masks, and quality."
+                        )
+                    predicted_mean_xy = stack_binocular_outputs(
+                        model_output, "mean_xy"
+                    )
+                    heatmap_logits = stack_binocular_outputs(
+                        model_output, "logits"
+                    )
+                    visibility_logits = stack_binocular_outputs(
+                        model_output, "visibility_logits"
+                    )
+                    supervision_outputs = (
+                        probabilistic_landmark_supervision_losses(
+                            predicted_mean_xy=predicted_mean_xy,
+                            heatmap_logits=heatmap_logits,
+                            visibility_logits=visibility_logits,
+                            target_xy=target_xy,
+                            valid_mask=valid_mask,
+                            teacher_quality=eye_quality,
+                            visibility_supervision_weight=(
+                                eye_valid_mask.float()
+                                * teacher_quality.float()
+                            ),
+                            huber_delta_norm=eye_landmark_huber_delta_norm,
+                            heatmap_sigma_min_px=(
+                                eye_landmark_heatmap_sigma_min_px
+                            ),
+                            heatmap_sigma_max_px=(
+                                eye_landmark_heatmap_sigma_max_px
+                            ),
+                        )
+                    )
+                    keypoint_outputs = probabilistic_eye_keypoint_nll(
+                        model_output["left_eye_keypoint_mean_xy"],
+                        model_output["right_eye_keypoint_mean_xy"],
+                        model_output["left_eye_keypoint_covariance"],
+                        model_output["right_eye_keypoint_covariance"],
+                        target_xy,
+                        valid_mask,
+                        eye_quality,
+                        min_std_norm=eye_keypoint_min_std_norm,
+                    )
+                    keypoint_loss = keypoint_outputs["loss"]
+                    mirror_loss = mirror_shape_consistency_loss(
+                        model_output["left_eye_keypoint_shape_embedding"],
+                        model_output["right_eye_keypoint_shape_embedding"],
+                        eye_valid_mask.float() * teacher_quality.float(),
+                    )
+                    left_eye_image = device_batch.get("left_eye")
+                    right_eye_image = device_batch.get("right_eye")
+                    if not torch.is_tensor(left_eye_image) or not torch.is_tensor(
+                        right_eye_image
+                    ):
+                        raise RuntimeError(
+                            "Eye-landmark equivariance requires left/right eye images."
+                        )
+                    equivariance_enabled = (
+                        eye_landmark_equivariance_weight > 0
+                    )
+                    transform1 = sample_eye_affine_matrices(
+                        batch_size,
+                        device=device,
+                        max_rotation_deg=(
+                            eye_landmark_equivariance_rotation_deg
+                            if equivariance_enabled
+                            else 0.0
+                        ),
+                        max_translation_norm=(
+                            eye_landmark_equivariance_translation_norm
+                            if equivariance_enabled
+                            else 0.0
+                        ),
+                        scale_min=(
+                            eye_landmark_equivariance_scale_min
+                            if equivariance_enabled
+                            else 1.0
+                        ),
+                        scale_max=(
+                            eye_landmark_equivariance_scale_max
+                            if equivariance_enabled
+                            else 1.0
+                        ),
+                        deterministic_sign=None if is_train else -1,
+                    )
+                    transform2 = sample_eye_affine_matrices(
+                        batch_size,
+                        device=device,
+                        max_rotation_deg=(
+                            eye_landmark_equivariance_rotation_deg
+                            if equivariance_enabled
+                            else 0.0
+                        ),
+                        max_translation_norm=(
+                            eye_landmark_equivariance_translation_norm
+                            if equivariance_enabled
+                            else 0.0
+                        ),
+                        scale_min=(
+                            eye_landmark_equivariance_scale_min
+                            if equivariance_enabled
+                            else 1.0
+                        ),
+                        scale_max=(
+                            eye_landmark_equivariance_scale_max
+                            if equivariance_enabled
+                            else 1.0
+                        ),
+                        deterministic_sign=None if is_train else 1,
+                    )
+                    predict_eye_landmarks = getattr(
+                        model, "predict_eye_landmarks", None
+                    )
+                    if not callable(predict_eye_landmarks) and equivariance_enabled:
+                        raise RuntimeError(
+                            "The model must expose predict_eye_landmarks for "
+                            "equivariant supervision."
+                        )
+                    if equivariance_enabled and callable(predict_eye_landmarks):
+                        augmented_output = predict_eye_landmarks(
+                            torch.cat(
+                                (
+                                    warp_eye_images(left_eye_image, transform1),
+                                    warp_eye_images(left_eye_image, transform2),
+                                ),
+                                dim=0,
+                            ),
+                            torch.cat(
+                                (
+                                    warp_eye_images(right_eye_image, transform1),
+                                    warp_eye_images(right_eye_image, transform2),
+                                ),
+                                dim=0,
+                            ),
+                            include_template=False,
+                        )
+                        view1_output = {
+                            name: value[:batch_size]
+                            for name, value in augmented_output.items()
+                        }
+                        view2_output = {
+                            name: value[batch_size:]
+                            for name, value in augmented_output.items()
+                        }
+                    else:
+                        view1_output = {
+                            "left_eye_keypoint_mean_xy": predicted_mean_xy[:, 0],
+                            "right_eye_keypoint_mean_xy": predicted_mean_xy[:, 1],
+                        }
+                        view2_output = view1_output
+                    equivariance_outputs = (
+                        equivariant_landmark_consistency_loss(
+                            stack_binocular_outputs(view1_output, "mean_xy"),
+                            stack_binocular_outputs(view2_output, "mean_xy"),
+                            transform1,
+                            transform2,
+                            eye_valid_mask.float() * teacher_quality.float(),
+                            huber_delta_norm=eye_landmark_huber_delta_norm,
+                        )
+                    )
+                    equivariance_loss = equivariance_outputs["loss"]
+                    loss = (
+                        loss
+                        + eye_keypoint_nll_weight * keypoint_loss
+                        + eye_landmark_coordinate_weight
+                        * supervision_outputs["coordinate_loss"]
+                        + eye_landmark_heatmap_weight
+                        * supervision_outputs["heatmap_loss"]
+                        + eye_landmark_visibility_weight
+                        * supervision_outputs["visibility_loss"]
+                        + eye_landmark_equivariance_weight * equivariance_loss
+                        + eye_landmark_mirror_shape_weight * mirror_loss
+                    )
+                    eye_keypoint_metric_sums["eye_keypoint_nll"] += (
+                        float(keypoint_loss.detach()) * batch_size
+                    )
+                    eye_keypoint_metric_sums[
+                        "eye_keypoint_mean_std_norm"
+                    ] += (
+                        float(keypoint_outputs["mean_std_norm"].detach())
+                        * batch_size
+                    )
+                    eye_keypoint_metric_sums[
+                        "eye_keypoint_effective_weight_per_sample"
+                    ] += float(keypoint_outputs["effective_weight"].detach())
+                    for metric_name, output_name in (
+                        ("eye_landmark_coordinate_loss", "coordinate_loss"),
+                        ("eye_landmark_heatmap_loss", "heatmap_loss"),
+                        ("eye_landmark_visibility_loss", "visibility_loss"),
+                    ):
+                        eye_keypoint_metric_sums[metric_name] += (
+                            float(supervision_outputs[output_name].detach())
+                            * batch_size
+                        )
+                    eye_keypoint_metric_sums[
+                        "eye_landmark_equivariance_loss"
+                    ] += float(equivariance_loss.detach()) * batch_size
+                    eye_keypoint_metric_sums[
+                        "eye_landmark_mirror_shape_loss"
+                    ] += float(mirror_loss.detach()) * batch_size
+                    eye_keypoint_metric_sums[
+                        "eye_landmark_equivariance_error_norm"
+                    ] += (
+                        float(
+                            equivariance_outputs[
+                                "mean_error_norm"
+                            ].detach()
+                        )
+                        * batch_size
+                    )
+                    eye_landmark_predictions.append(
+                        predicted_mean_xy.detach().float().cpu()
+                    )
+                    eye_landmark_targets.append(target_xy.detach().float().cpu())
+                    eye_landmark_valid_masks.append(
+                        valid_mask.detach().float().cpu()
+                    )
+                    eye_landmark_teacher_qualities.append(
+                        teacher_quality.detach().float().cpu()
+                    )
+                    eye_landmark_image_size = (
+                        int(left_eye_image.shape[-1]),
+                        int(left_eye_image.shape[-2]),
+                    )
+                    if use_low_dof_eye_template:
+                        template_outputs = {
+                            name[len("eye_template_") :]: value
+                            for name, value in model_output.items()
+                            if name.startswith("eye_template_")
+                            and torch.is_tensor(value)
+                        }
+                        required_template_outputs = {
+                            "reprojection_error_norm",
+                            "pitch_rad",
+                            "pitch_variance",
+                            "geometry_confidence",
+                            "reference_confidence",
+                            "iris_center_effective_visibility",
+                            "iris_rim_effective_visibility",
+                            "valid_mask",
+                        }
+                        missing_template_outputs = (
+                            required_template_outputs.difference(template_outputs)
+                        )
+                        if missing_template_outputs:
+                            raise RuntimeError(
+                                "Low-DOF eye template is missing outputs: "
+                                f"{sorted(missing_template_outputs)}."
+                            )
+                        template_eye_weight = (
+                            eye_valid_mask.float() * teacher_quality.float()
+                        )
+                        template_losses = low_dof_eye_template_losses(
+                            template_outputs,
+                            template_eye_weight,
+                            huber_delta_rad=math.radians(
+                                eye_template_pitch_huber_delta_deg
+                            ),
+                        )
+                        loss = (
+                            loss
+                            + eye_template_reprojection_weight
+                            * template_losses["reprojection_loss"]
+                            + eye_template_binocular_pitch_weight
+                            * template_losses[
+                                "binocular_pitch_consistency_loss"
+                            ]
+                        )
+                        eye_template_loss_sums[
+                            "eye_template_reprojection_loss"
+                        ] += (
+                            float(
+                                template_losses[
+                                    "reprojection_loss"
+                                ].detach()
+                            )
+                            * batch_size
+                        )
+                        eye_template_loss_sums[
+                            "eye_template_binocular_pitch_consistency_loss"
+                        ] += (
+                            float(
+                                template_losses[
+                                    "binocular_pitch_consistency_loss"
+                                ].detach()
+                            )
+                            * batch_size
+                        )
+                        for name in eye_template_metric_outputs:
+                            eye_template_metric_outputs[name].append(
+                                template_outputs[name].detach().float().cpu()
+                            )
+                        eye_template_metric_weights.append(
+                            template_eye_weight.detach().float().cpu()
+                        )
                 if use_gate_regularization:
                     gate_delta = model_output.get("eye_geometry_gate_delta")
                     valid_mask = device_batch.get("eye_geometry_valid_mask")
@@ -1391,7 +2704,7 @@ def run_epoch(
         total_loss += float(loss.detach()) * batch_size
         sample_count += batch_size
         predictions.append(uv_pred_mm.detach().cpu())
-        targets_mm.append(device_batch["uv_gt"].detach().cpu())
+        targets_mm.append(metric_target_mm.detach().cpu())
 
     if sample_count == 0:
         raise RuntimeError("DataLoader yielded no samples.")
@@ -1418,6 +2731,171 @@ def run_epoch(
                 for name, total in v4_loss_metric_sums.items()
             }
         )
+    if use_eye_iris_auxiliary:
+        metrics["iris_heatmap_loss"] = iris_heatmap_loss_sum / sample_count
+        metrics["weighted_iris_heatmap_loss"] = (
+            iris_heatmap_weight * metrics["iris_heatmap_loss"]
+        )
+    if use_eye_keypoint_auxiliary:
+        metrics.update(
+            {
+                name: total / sample_count
+                for name, total in eye_keypoint_metric_sums.items()
+            }
+        )
+        metrics["weighted_eye_keypoint_nll"] = (
+            eye_keypoint_nll_weight * metrics["eye_keypoint_nll"]
+        )
+        weight_by_metric = {
+            "eye_landmark_coordinate_loss": eye_landmark_coordinate_weight,
+            "eye_landmark_heatmap_loss": eye_landmark_heatmap_weight,
+            "eye_landmark_visibility_loss": eye_landmark_visibility_weight,
+            "eye_landmark_equivariance_loss": (
+                eye_landmark_equivariance_weight
+            ),
+            "eye_landmark_mirror_shape_loss": (
+                eye_landmark_mirror_shape_weight
+            ),
+        }
+        for metric_name, metric_weight in weight_by_metric.items():
+            metrics[f"weighted_{metric_name}"] = (
+                metric_weight * metrics[metric_name]
+            )
+        if eye_landmark_image_size is None:
+            raise RuntimeError("Eye-landmark validation received no image size.")
+        validation_metrics = eye_landmark_validation_metrics(
+            torch.cat(eye_landmark_predictions),
+            torch.cat(eye_landmark_targets),
+            torch.cat(eye_landmark_valid_masks),
+            torch.cat(eye_landmark_teacher_qualities),
+            eye_image_size=eye_landmark_image_size,
+        )
+        metrics.update(
+            {name: float(value) for name, value in validation_metrics.items()}
+        )
+    if use_landmark_guided_eye_fusion:
+        metrics.update(
+            {
+                "landmark_guided_global_gate_mean": (
+                    landmark_guided_global_gate_sum / sample_count
+                ),
+                "landmark_guided_applied_gate_abs_mean": (
+                    landmark_guided_applied_gate_abs_sum / sample_count
+                ),
+                "landmark_guided_quality_mean": (
+                    landmark_guided_quality_sum / sample_count
+                ),
+                "landmark_guided_delta_norm_mean": (
+                    landmark_guided_delta_norm_sum / sample_count
+                ),
+            }
+        )
+    if use_low_dof_eye_template:
+        metrics.update(
+            {
+                name: total / sample_count
+                for name, total in eye_template_loss_sums.items()
+            }
+        )
+        metrics["weighted_eye_template_reprojection_loss"] = (
+            eye_template_reprojection_weight
+            * metrics["eye_template_reprojection_loss"]
+        )
+        metrics[
+            "weighted_eye_template_binocular_pitch_consistency_loss"
+        ] = (
+            eye_template_binocular_pitch_weight
+            * metrics["eye_template_binocular_pitch_consistency_loss"]
+        )
+        if not eye_template_metric_weights:
+            raise RuntimeError("Eye-template validation received no samples.")
+        concatenated_template_outputs = {
+            name: torch.cat(values)
+            for name, values in eye_template_metric_outputs.items()
+        }
+        template_metrics = low_dof_eye_template_metrics(
+            concatenated_template_outputs,
+            torch.cat(eye_template_metric_weights),
+        )
+        metrics.update(
+            {name: float(value) for name, value in template_metrics.items()}
+        )
+    if use_vertical_residual:
+        if not vertical_base_predictions:
+            raise RuntimeError("Pitch-to-v metrics received no base predictions.")
+        base_prediction = torch.cat(vertical_base_predictions)
+        corrected_prediction = torch.cat(predictions)
+        target_prediction = torch.cat(targets_mm)
+        base_metrics = compute_uv_metrics_mm(
+            base_prediction,
+            target_prediction,
+        )
+        metrics.update(
+            {
+                "vertical_base_epe_mm": float(base_metrics["epe_mm"]),
+                "vertical_base_mae_u_mm": float(base_metrics["mae_u_mm"]),
+                "vertical_base_mae_v_mm": float(base_metrics["mae_v_mm"]),
+                "vertical_delta_abs_mean_mm": (
+                    vertical_delta_abs_sum_mm / sample_count
+                ),
+                "vertical_geometry_gate_mean": (
+                    vertical_geometry_gate_sum / sample_count
+                ),
+                "vertical_camera_table_sensitivity_abs_mean_mm_per_rad": (
+                    vertical_camera_table_sensitivity_abs_sum / sample_count
+                ),
+                "vertical_camera_table_geometry_valid_rate": (
+                    vertical_camera_table_geometry_valid_sum / sample_count
+                ),
+                "vertical_geometric_pitch_delta_abs_mean_mm": (
+                    vertical_geometric_pitch_delta_abs_sum / sample_count
+                ),
+                "vertical_fallback_rate": vertical_fallback_sum / sample_count,
+                "vertical_v_improvement_mm": float(
+                    (
+                        (base_prediction[:, 1] - target_prediction[:, 1]).abs()
+                        - (
+                            corrected_prediction[:, 1]
+                            - target_prediction[:, 1]
+                        ).abs()
+                    ).mean()
+                ),
+                "vertical_u_invariance_max_mm": float(
+                    (
+                        corrected_prediction[:, 0] - base_prediction[:, 0]
+                    ).abs().max()
+                ),
+                "vertical_residual_regularization_loss": (
+                    vertical_residual_regularization_sum / sample_count
+                ),
+            }
+        )
+        metrics["weighted_vertical_residual_regularization_loss"] = (
+            vertical_residual_regularization_weight
+            * metrics["vertical_residual_regularization_loss"]
+        )
+        if use_vertical_geometry_residual:
+            metrics.update(
+                {
+                    "vertical_residual_supervision_loss": (
+                        vertical_residual_supervision_sum / sample_count
+                    ),
+                    "weighted_vertical_residual_supervision_loss": (
+                        vertical_residual_supervision_weight
+                        * vertical_residual_supervision_sum
+                        / sample_count
+                    ),
+                    "vertical_geometry_confidence_mean": (
+                        vertical_geometry_confidence_sum / sample_count
+                    ),
+                    "vertical_training_gate_mean": (
+                        vertical_training_gate_sum / sample_count
+                    ),
+                    "vertical_learned_gate_mean": (
+                        vertical_learned_gate_sum / sample_count
+                    ),
+                }
+            )
     metrics["seconds"] = elapsed
     metrics["samples_per_second"] = sample_count / elapsed if elapsed > 0 else 0.0
     return metrics, sample_count
@@ -1461,6 +2939,7 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.cuda.amp.GradScaler,
     normalizer: UVTargetNormalizer | None,
+    virtual_distance_scale_normalizer: VirtualDistanceScaleNormalizer | None,
     eye_geometry_normalizer: EyeGeometryNormalizer | None,
     eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None,
     depth_correction_geometry_normalizer: EyeGeometryNormalizer | None,
@@ -1479,6 +2958,11 @@ def save_checkpoint(
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
         "normalizer": normalizer.state_dict() if normalizer is not None else None,
+        "virtual_distance_scale_normalizer": (
+            virtual_distance_scale_normalizer.state_dict()
+            if virtual_distance_scale_normalizer is not None
+            else None
+        ),
         "eye_geometry_normalizer": (
             eye_geometry_normalizer.state_dict()
             if eye_geometry_normalizer is not None
@@ -1555,6 +3039,7 @@ def load_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.cuda.amp.GradScaler,
     normalizer: UVTargetNormalizer | None,
+    virtual_distance_scale_normalizer: VirtualDistanceScaleNormalizer | None,
     eye_geometry_normalizer: EyeGeometryNormalizer | None,
     eye_geometry_quality_normalizer: EyeGeometryQualityNormalizer | None,
     depth_correction_geometry_normalizer: EyeGeometryNormalizer | None,
@@ -1584,6 +3069,33 @@ def load_checkpoint(
                 "Resume checkpoint uses different UV normalization statistics. "
                 "Use the original split/config for this checkpoint."
             )
+    saved_scale_state = checkpoint.get("virtual_distance_scale_normalizer")
+    if virtual_distance_scale_normalizer is None:
+        if saved_scale_state is not None:
+            raise ValueError(
+                "Resume checkpoint uses virtual-distance FiLM, but the current "
+                "config disables it."
+            )
+    else:
+        if saved_scale_state is None:
+            raise ValueError(
+                "Resume checkpoint has no virtual-distance normalization statistics."
+            )
+        saved_scale_normalizer = VirtualDistanceScaleNormalizer.from_state_dict(
+            saved_scale_state
+        )
+        if not torch.allclose(
+            saved_scale_normalizer.mean_log_scale,
+            virtual_distance_scale_normalizer.mean_log_scale,
+        ) or not torch.allclose(
+            saved_scale_normalizer.std_log_scale,
+            virtual_distance_scale_normalizer.std_log_scale,
+        ):
+            raise ValueError(
+                "Resume checkpoint uses different virtual-distance log-scale "
+                "normalization statistics. Use the original split/config."
+            )
+
     saved_eye_geometry_state = checkpoint.get("eye_geometry_normalizer")
     if eye_geometry_normalizer is None:
         if saved_eye_geometry_state is not None:
@@ -1805,14 +3317,34 @@ def main() -> int:
     uses_gaze_geometry = (
         model_config.prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY
     )
-    dataset_csv_path, deca_cache_path, depth_prior_csv_path = (
-        resolve_numbered_dataset_artifacts(
+    direct_uv_target_frame = canonical_direct_uv_target_frame(
+        data_config.get(
+            "direct_uv_target_frame",
+            DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+        )
+    )
+    preprocessed_v2_virtual_manifests: list[Path] = []
+    if data_config.get("preprocessed_v2_root") is not None:
+        (
+            dataset_csv_path,
+            deca_cache_path,
+            depth_prior_csv_path,
+            preprocessed_v2_virtual_manifests,
+        ) = resolve_preprocessed_v2_artifacts(
             data_config,
             run_dir,
             require_deca_features=uses_deca_features,
             require_depth_prior=model_config.use_eye_geometry or uses_gaze_geometry,
         )
-    )
+    else:
+        dataset_csv_path, deca_cache_path, depth_prior_csv_path = (
+            resolve_numbered_dataset_artifacts(
+                data_config,
+                run_dir,
+                require_deca_features=uses_deca_features,
+                require_depth_prior=model_config.use_eye_geometry or uses_gaze_geometry,
+            )
+        )
     if deca_cache_path is not None:
         validate_deca_cache_preprocess(deca_cache_path, data_config)
     require_depth_uncertainty = (
@@ -1833,7 +3365,62 @@ def main() -> int:
     virtual_camera_manifest_path = resolve_virtual_camera_manifest_path(
         data_config,
         run_dir,
+        fallback_paths=(
+            preprocessed_v2_virtual_manifests
+            if canonical_image_source(
+                data_config.get("image_source", IMAGE_SOURCE_LEGACY)
+            )
+            == IMAGE_SOURCE_VIRTUAL_CAMERA
+            else None
+        ),
     )
+    sample_id_filter_manifest_path = resolve_sample_id_filter_manifest_path(
+        data_config,
+        run_dir,
+        fallback_paths=(
+            preprocessed_v2_virtual_manifests
+            if canonical_image_source(
+                data_config.get("image_source", IMAGE_SOURCE_LEGACY)
+            )
+            == IMAGE_SOURCE_LEGACY
+            else None
+        ),
+    )
+    allowed_sample_ids = (
+        frozenset(
+            VirtualCameraManifest.load(sample_id_filter_manifest_path).records
+        )
+        if sample_id_filter_manifest_path is not None
+        else None
+    )
+    iris_supervision_csv_paths = None
+    raw_iris_paths = data_config.get("iris_supervision_csv_paths")
+    if model_config.use_eye_iris_auxiliary and raw_iris_paths:
+        iris_supervision_csv_paths = [
+            resolve_project_path(path) for path in raw_iris_paths
+        ]
+        missing_iris_paths = [
+            path for path in iris_supervision_csv_paths if not path.is_file()
+        ]
+        if missing_iris_paths:
+            raise FileNotFoundError(
+                "Iris-supervision CSVs do not exist: "
+                f"{missing_iris_paths}"
+            )
+    eye_geometry_pseudo_label_paths = None
+    raw_eye_geometry_paths = data_config.get("eye_geometry_pseudo_label_paths")
+    if raw_eye_geometry_paths:
+        eye_geometry_pseudo_label_paths = [
+            resolve_project_path(path) for path in raw_eye_geometry_paths
+        ]
+        missing_eye_geometry_paths = [
+            path for path in eye_geometry_pseudo_label_paths if not path.is_file()
+        ]
+        if missing_eye_geometry_paths:
+            raise FileNotFoundError(
+                "Eye-geometry pseudo-label NPZ files do not exist: "
+                f"{missing_eye_geometry_paths}"
+            )
     train_loader, val_loader = build_modelv1_dataloaders(
         csv_path=dataset_csv_path,
         train_datasets=data_config.get("train_datasets", ("3", "4")),
@@ -1847,6 +3434,7 @@ def main() -> int:
         pin_memory=bool(data_config["pin_memory"]),
         normalize_images=bool(data_config["normalize_images"]),
         load_face_image=bool(data_config["load_face_image"]),
+        eye_image_size=tuple(data_config.get("eye_image_size", (60, 36))),
         train_paired_eye_transform=eye_augmentation,
         deca_cache_path=deca_cache_path,
         require_deca_features=uses_deca_features,
@@ -1867,14 +3455,45 @@ def main() -> int:
         image_source=str(
             data_config.get("image_source", IMAGE_SOURCE_LEGACY)
         ),
+        eye_image_source=str(
+            data_config.get(
+                "eye_image_source",
+                data_config.get("image_source", IMAGE_SOURCE_LEGACY),
+            )
+        ),
         virtual_camera_manifest_path=virtual_camera_manifest_path,
         filter_invalid_virtual_camera_samples=bool(
             data_config.get("skip_invalid_virtual_camera_samples", False)
+        ),
+        allowed_sample_ids=allowed_sample_ids,
+        direct_uv_target_frame=str(
+            data_config.get(
+                "direct_uv_target_frame",
+                DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+            )
+        ),
+        use_virtual_distance_film=model_config.use_virtual_distance_film,
+        use_virtual_pose_film=model_config.use_virtual_pose_film,
+        iris_supervision_csv_paths=iris_supervision_csv_paths,
+        eye_geometry_pseudo_label_paths=eye_geometry_pseudo_label_paths,
+        require_eye_geometry_pseudo_labels=bool(
+            data_config.get("require_eye_geometry_pseudo_labels", False)
         ),
     )
     normalizer = get_uv_target_normalizer(train_loader.dataset)
     if not uses_gaze_geometry and normalizer is None:
         raise RuntimeError("Training requires normalized UV targets.")
+    virtual_distance_scale_normalizer = (
+        get_virtual_distance_scale_normalizer(train_loader.dataset)
+    )
+    if (
+        model_config.use_virtual_distance_film
+        and not model_config.use_virtual_pose_film
+        and virtual_distance_scale_normalizer is None
+    ):
+        raise RuntimeError(
+            "Virtual-distance FiLM requires training-fitted log-scale statistics."
+        )
     eye_geometry_normalizer = get_eye_geometry_normalizer(train_loader.dataset)
     if model_config.use_eye_geometry and eye_geometry_normalizer is None:
         raise RuntimeError(
@@ -1932,11 +3551,107 @@ def main() -> int:
     gate_regularization_weight = float(
         loss_config.pop("gate_regularization_weight", 0.0)
     )
+    iris_heatmap_weight = float(loss_config.pop("iris_heatmap_weight", 0.0))
+    iris_heatmap_sigma_pixels = float(
+        loss_config.pop("iris_heatmap_sigma_pixels", 1.0)
+    )
+    eye_keypoint_nll_weight = float(
+        loss_config.pop("eye_keypoint_nll_weight", 0.0)
+    )
+    eye_keypoint_min_std_norm = float(
+        loss_config.pop("eye_keypoint_min_std_norm", 0.01)
+    )
+    eye_landmark_loss_kwargs = {
+        "eye_landmark_coordinate_weight": float(
+            loss_config.pop("eye_landmark_coordinate_weight", 0.0)
+        ),
+        "eye_landmark_heatmap_weight": float(
+            loss_config.pop("eye_landmark_heatmap_weight", 0.0)
+        ),
+        "eye_landmark_visibility_weight": float(
+            loss_config.pop("eye_landmark_visibility_weight", 0.0)
+        ),
+        "eye_landmark_equivariance_weight": float(
+            loss_config.pop("eye_landmark_equivariance_weight", 0.0)
+        ),
+        "eye_landmark_mirror_shape_weight": float(
+            loss_config.pop("eye_landmark_mirror_shape_weight", 0.0)
+        ),
+        "eye_landmark_huber_delta_norm": float(
+            loss_config.pop("eye_landmark_huber_delta_norm", 0.02)
+        ),
+        "eye_landmark_heatmap_sigma_min_px": float(
+            loss_config.pop("eye_landmark_heatmap_sigma_min_px", 1.0)
+        ),
+        "eye_landmark_heatmap_sigma_max_px": float(
+            loss_config.pop("eye_landmark_heatmap_sigma_max_px", 3.0)
+        ),
+        "eye_landmark_equivariance_rotation_deg": float(
+            loss_config.pop("eye_landmark_equivariance_rotation_deg", 4.0)
+        ),
+        "eye_landmark_equivariance_translation_norm": float(
+            loss_config.pop(
+                "eye_landmark_equivariance_translation_norm", 0.03
+            )
+        ),
+        "eye_landmark_equivariance_scale_min": float(
+            loss_config.pop("eye_landmark_equivariance_scale_min", 0.97)
+        ),
+        "eye_landmark_equivariance_scale_max": float(
+            loss_config.pop("eye_landmark_equivariance_scale_max", 1.03)
+        ),
+        "eye_template_reprojection_weight": float(
+            loss_config.pop("eye_template_reprojection_weight", 0.0)
+        ),
+        "eye_template_binocular_pitch_weight": float(
+            loss_config.pop("eye_template_binocular_pitch_weight", 0.0)
+        ),
+        "eye_template_pitch_huber_delta_deg": float(
+            loss_config.pop("eye_template_pitch_huber_delta_deg", 2.0)
+        ),
+        "vertical_residual_regularization_weight": float(
+            loss_config.pop("vertical_residual_regularization_weight", 0.0)
+        ),
+        "vertical_residual_supervision_weight": float(
+            loss_config.pop("vertical_residual_supervision_weight", 0.0)
+        ),
+        "vertical_residual_huber_beta_mm": float(
+            loss_config.pop("vertical_residual_huber_beta_mm", 30.0)
+        ),
+    }
     if (
         model_config.eye_geometry_gate_mode
         != EYE_GEOMETRY_GATE_LEARNED_RESIDUAL
     ):
         gate_regularization_weight = 0.0
+    if not model_config.use_eye_iris_auxiliary:
+        iris_heatmap_weight = 0.0
+    if not model_config.use_eye_keypoint_auxiliary:
+        eye_keypoint_nll_weight = 0.0
+        for weight_name in (
+            "eye_landmark_coordinate_weight",
+            "eye_landmark_heatmap_weight",
+            "eye_landmark_visibility_weight",
+            "eye_landmark_equivariance_weight",
+            "eye_landmark_mirror_shape_weight",
+        ):
+            eye_landmark_loss_kwargs[weight_name] = 0.0
+    if not model_config.use_low_dof_eye_template:
+        eye_landmark_loss_kwargs["eye_template_reprojection_weight"] = 0.0
+        eye_landmark_loss_kwargs[
+            "eye_template_binocular_pitch_weight"
+        ] = 0.0
+    if not (
+        model_config.use_pitch_to_v_residual
+        or model_config.use_vertical_geometry_residual
+    ):
+        eye_landmark_loss_kwargs[
+            "vertical_residual_regularization_weight"
+        ] = 0.0
+    if not model_config.use_vertical_geometry_residual:
+        eye_landmark_loss_kwargs[
+            "vertical_residual_supervision_weight"
+        ] = 0.0
     if uses_gaze_geometry:
         criterion: nn.Module = GazeGeometryLoss(
             GazeGeometryLossConfig(**loss_config)
@@ -1944,7 +3659,15 @@ def main() -> int:
         gate_regularization_weight = 0.0
     else:
         assert normalizer is not None
-        criterion = UVRegressionLoss(normalizer, UVLossConfig(**loss_config))
+        uv_loss_config = UVLossConfig(**loss_config)
+        if direct_uv_target_frame == DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA:
+            criterion = DirectVirtualTableUVLoss(
+                normalizer,
+                uv_loss_config,
+                table_distance_scale_mm=model_config.table_distance_scale_mm,
+            )
+        else:
+            criterion = DirectTableUVLoss(normalizer, uv_loss_config)
     optimizer_config = config["training"]["optimizer"]
     if optimizer_config["name"].lower() != "adamw":
         raise ValueError("Only AdamW is supported by the V1 training config.")
@@ -1967,6 +3690,9 @@ def main() -> int:
             scheduler=scheduler,
             scaler=scaler,
             normalizer=normalizer,
+            virtual_distance_scale_normalizer=(
+                virtual_distance_scale_normalizer
+            ),
             eye_geometry_normalizer=eye_geometry_normalizer,
             eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
             depth_correction_geometry_normalizer=(
@@ -1992,13 +3718,54 @@ def main() -> int:
         f"face_image_backbone={FACE_IMAGE_BACKBONE} "
         f"face_image_pretrained={FACE_IMAGE_PRETRAINED_DATASET} "
         f"freeze_face_image_backbone={model_config.freeze_face_image_backbone} "
+        f"face_feature_mode={model_config.face_feature_mode} "
         f"visual_attention={model_config.visual_attention_heads}x"
         f"{model_config.visual_attention_dim} "
+        f"binocular_self_attention={model_config.use_binocular_self_attention} "
+        f"binocular_attention_heads={model_config.binocular_attention_heads} "
+        f"use_eye_iris_auxiliary={model_config.use_eye_iris_auxiliary} "
+        f"iris_feature_stage={model_config.eye_iris_auxiliary_feature_stage} "
+        f"iris_heatmap_weight={iris_heatmap_weight} "
+        f"iris_heatmap_sigma_pixels={iris_heatmap_sigma_pixels} "
+        f"use_eye_keypoint_auxiliary={model_config.use_eye_keypoint_auxiliary} "
+        f"eye_keypoint_count={model_config.eye_keypoint_count} "
+        f"eye_keypoint_features=layer2+layer3 "
+        f"eye_keypoint_heatmap_size={model_config.eye_keypoint_heatmap_size} "
+        f"eye_keypoint_nll_weight={eye_keypoint_nll_weight} "
+        f"eye_keypoint_min_std_norm={eye_keypoint_min_std_norm} "
+        f"eye_landmark_losses={eye_landmark_loss_kwargs} "
+        f"use_landmark_guided_eye_fusion="
+        f"{model_config.use_landmark_guided_eye_fusion} "
+        f"landmark_guided_fusion_heads="
+        f"{model_config.landmark_guided_fusion_heads} "
+        f"landmark_guided_fusion_gate_init="
+        f"{model_config.landmark_guided_fusion_gate_init} "
+        f"use_low_dof_eye_template={model_config.use_low_dof_eye_template} "
+        f"eye_template_grid={model_config.eye_template_pitch_bins}x"
+        f"{model_config.eye_template_yaw_bins} "
+        f"use_pitch_to_v_residual={model_config.use_pitch_to_v_residual} "
+        f"pitch_to_v_max_abs_delta_mm="
+        f"{model_config.pitch_to_v_max_abs_delta_mm} "
+        f"use_vertical_geometry_residual="
+        f"{model_config.use_vertical_geometry_residual} "
+        f"vertical_geometry_residual_max_abs_delta_mm="
+        f"{model_config.vertical_geometry_residual_max_abs_delta_mm} "
+        f"visual_token_pooling={model_config.visual_token_pooling} "
+        f"visual_token_pooling_hidden_dim="
+        f"{model_config.visual_token_pooling_hidden_dim} "
         f"eye_backbone={model_config.eye_backbone} "
+        f"eye_stem_mode={model_config.eye_stem_mode} "
+        f"eye_feature_mode={model_config.eye_feature_mode} "
+        f"eye_token_grid={model_config.eye_token_grid} "
         f"eye_backbone_weights={model_config.eye_backbone_weights} "
+        f"eye_image_size={tuple(data_config.get('eye_image_size', (60, 36)))} "
         f"eye_augmentation={eye_augmentation is not None} "
         f"image_source={data_config.get('image_source', IMAGE_SOURCE_LEGACY)} "
+        f"eye_image_source={data_config.get('eye_image_source', data_config.get('image_source', IMAGE_SOURCE_LEGACY))} "
+        f"direct_uv_target_frame="
+        f"{data_config.get('direct_uv_target_frame', DIRECT_UV_TARGET_FRAME_TABLE_LOCAL)} "
         f"gaze_prediction_frame={model_config.gaze_prediction_frame} "
+        f"use_virtual_pose_film={model_config.use_virtual_pose_film} "
         f"use_crop_cam={model_config.use_crop_cam} "
         f"scene_representation={model_config.scene_representation} "
         f"eye_geometry_gate_mode={model_config.eye_geometry_gate_mode} "
@@ -2033,15 +3800,40 @@ def main() -> int:
             "freeze_face_image_backbone": (
                 model_config.freeze_face_image_backbone
             ),
+            "face_feature_mode": model_config.face_feature_mode,
             "visual_attention_dim": model_config.visual_attention_dim,
             "visual_attention_heads": model_config.visual_attention_heads,
+            "use_eye_iris_auxiliary": model_config.use_eye_iris_auxiliary,
+            "eye_iris_auxiliary_feature_stage": (
+                model_config.eye_iris_auxiliary_feature_stage
+            ),
+            "iris_heatmap_weight": iris_heatmap_weight,
+            "iris_heatmap_sigma_pixels": iris_heatmap_sigma_pixels,
+            "use_eye_keypoint_auxiliary": (
+                model_config.use_eye_keypoint_auxiliary
+            ),
+            "eye_keypoint_count": model_config.eye_keypoint_count,
+            "eye_keypoint_auxiliary_feature_stage": (
+                model_config.eye_keypoint_auxiliary_feature_stage
+            ),
+            "eye_keypoint_nll_weight": eye_keypoint_nll_weight,
+            "eye_keypoint_min_std_norm": eye_keypoint_min_std_norm,
             "eye_backbone": model_config.eye_backbone,
             "eye_backbone_weights": model_config.eye_backbone_weights,
             "eye_augmentation": eye_augmentation is not None,
             "image_source": data_config.get(
                 "image_source", IMAGE_SOURCE_LEGACY
             ),
+            "eye_image_source": data_config.get(
+                "eye_image_source",
+                data_config.get("image_source", IMAGE_SOURCE_LEGACY),
+            ),
+            "direct_uv_target_frame": data_config.get(
+                "direct_uv_target_frame",
+                DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+            ),
             "gaze_prediction_frame": model_config.gaze_prediction_frame,
+            "use_virtual_pose_film": model_config.use_virtual_pose_film,
             "parameters_total": total_parameter_count,
             "parameters_trainable": trainable_parameter_count,
         },
@@ -2078,6 +3870,11 @@ def main() -> int:
                 amp_enabled=amp_enabled,
                 grad_clip_norm=grad_clip_norm,
                 gate_regularization_weight=gate_regularization_weight,
+                iris_heatmap_weight=iris_heatmap_weight,
+                iris_heatmap_sigma_pixels=iris_heatmap_sigma_pixels,
+                eye_keypoint_nll_weight=eye_keypoint_nll_weight,
+                eye_keypoint_min_std_norm=eye_keypoint_min_std_norm,
+                **eye_landmark_loss_kwargs,
             )
             optimizer_steps = int(train_metrics.pop("optimizer_steps"))
             optimizer_skipped_steps = int(
@@ -2109,6 +3906,11 @@ def main() -> int:
                 amp_enabled=amp_enabled,
                 grad_clip_norm=None,
                 gate_regularization_weight=0.0,
+                iris_heatmap_weight=iris_heatmap_weight,
+                iris_heatmap_sigma_pixels=iris_heatmap_sigma_pixels,
+                eye_keypoint_nll_weight=eye_keypoint_nll_weight,
+                eye_keypoint_min_std_norm=eye_keypoint_min_std_norm,
+                **eye_landmark_loss_kwargs,
             )
             scheduler.step()
 
@@ -2151,6 +3953,9 @@ def main() -> int:
                     scheduler=scheduler,
                     scaler=scaler,
                     normalizer=normalizer,
+                    virtual_distance_scale_normalizer=(
+                        virtual_distance_scale_normalizer
+                    ),
                     eye_geometry_normalizer=eye_geometry_normalizer,
                     eye_geometry_quality_normalizer=eye_geometry_quality_normalizer,
                     depth_correction_geometry_normalizer=(
@@ -2176,6 +3981,9 @@ def main() -> int:
                         scheduler=scheduler,
                         scaler=scaler,
                         normalizer=normalizer,
+                        virtual_distance_scale_normalizer=(
+                            virtual_distance_scale_normalizer
+                        ),
                         eye_geometry_normalizer=eye_geometry_normalizer,
                         eye_geometry_quality_normalizer=(
                             eye_geometry_quality_normalizer

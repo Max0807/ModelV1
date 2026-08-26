@@ -2,22 +2,175 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: Current File",
+      "name": "Preprocess v2: Full selected depth pipeline",
       "type": "debugpy",
       "request": "launch",
-      "program": "${file}",
+      "program": "${workspaceFolder}\\scripts\\prepare_modelv1_preprocessing.py",
+      "cwd": "${workspaceFolder}",
+      "python": "D:\\software\\Anaconda\\envs\\cross_gaze\\python.exe",
       "console": "integratedTerminal",
       "justMyCode": false,
-      "envFile": "${workspaceFolder}/.env"
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "MKL_THREADING_LAYER": "SEQUENTIAL"
+      },
+      "args": [
+        "--dataset-id",
+        "${input:preprocessDatasetId}",
+        "--depth-method",
+        "${input:preprocessDepthMethod}",
+        "--source-root",
+        "${input:preprocessSourceRoot}",
+        "--output-root",
+        "data\\${input:preprocessOutputVersion}\\dataset${input:preprocessDatasetId}",
+        "--device",
+        "cuda",
+        "--deca-batch-size",
+        "8",
+        "--calibration-start",
+        "${input:preprocessCalibrationStart}",
+        "--calibration-stop",
+        "${input:preprocessCalibrationStop}",
+        "--calibration-index-mode",
+        "frame_idx"
+      ]
     },
     {
-      "name": "Python: Module",
+      "name": "Stage3: Debug one virtual-camera sample",
       "type": "debugpy",
       "request": "launch",
-      "module": "${input:moduleName}",
+      "program": "${workspaceFolder}\\scripts\\generate_virtual_camera_normalized_images.py",
+      "cwd": "${workspaceFolder}",
+      "python": "D:\\software\\Anaconda\\envs\\cross_gaze\\python.exe",
       "console": "integratedTerminal",
       "justMyCode": false,
-      "envFile": "${workspaceFolder}/.env"
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "MKL_THREADING_LAYER": "SEQUENTIAL"
+      },
+      "args": [
+        "--dataset-csv",
+        "data\\validation_stage1\\modelv1_dataset${input:stage3DatasetId}.csv",
+        "--depth-prior-csv",
+        "data\\manual_stage2\\depth_priors_pnp_v2_dataset${input:stage3DatasetId}.csv",
+        "--landmark-csv",
+        "data\\manual_stage2\\mediapipe_pnp_landmarks_v2_dataset${input:stage3DatasetId}.csv",
+        "--output-root",
+        "data\\manual_stage3\\virtual_camera_pnp_v2_dataset${input:stage3DatasetId}_debug",
+        "--limit-per-dataset",
+        "1",
+        "--overwrite"
+      ]
+    },
+    {
+      "name": "Stage3: Generate 5-sample smoke",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\generate_virtual_camera_normalized_images.py",
+      "cwd": "${workspaceFolder}",
+      "python": "D:\\software\\Anaconda\\envs\\cross_gaze\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "MKL_THREADING_LAYER": "SEQUENTIAL"
+      },
+      "args": [
+        "--dataset-csv",
+        "data\\validation_stage1\\modelv1_dataset${input:stage3DatasetId}.csv",
+        "--depth-prior-csv",
+        "data\\manual_stage2\\depth_priors_pnp_v2_dataset${input:stage3DatasetId}.csv",
+        "--landmark-csv",
+        "data\\manual_stage2\\mediapipe_pnp_landmarks_v2_dataset${input:stage3DatasetId}.csv",
+        "--output-root",
+        "data\\manual_stage3\\virtual_camera_pnp_v2_dataset${input:stage3DatasetId}_smoke",
+        "--limit-per-dataset",
+        "5",
+        "--overwrite"
+      ]
+    },
+    {
+      "name": "Stage3: Generate formal full dataset",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\generate_virtual_camera_normalized_images.py",
+      "cwd": "${workspaceFolder}",
+      "python": "D:\\software\\Anaconda\\envs\\cross_gaze\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "MKL_THREADING_LAYER": "SEQUENTIAL"
+      },
+      "args": [
+        "--dataset-csv",
+        "data\\validation_stage1\\modelv1_dataset${input:stage3DatasetId}.csv",
+        "--depth-prior-csv",
+        "data\\manual_stage2\\depth_priors_pnp_v2_dataset${input:stage3DatasetId}.csv",
+        "--landmark-csv",
+        "data\\manual_stage2\\mediapipe_pnp_landmarks_v2_dataset${input:stage3DatasetId}.csv",
+        "--output-root",
+        "data\\manual_stage3\\virtual_camera_pnp_v2_dataset${input:stage3DatasetId}"
+      ]
+    },
+    {
+      "name": "Stage3: Test normalization and manifest",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "unittest",
+      "cwd": "${workspaceFolder}",
+      "python": "D:\\software\\Anaconda\\envs\\cross_gaze\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "MKL_THREADING_LAYER": "SEQUENTIAL"
+      },
+      "args": [
+        "-v",
+        "tests.test_virtual_camera_normalization",
+        "tests.test_virtual_camera_manifest"
+      ]
+    },
+    {
+      "name": "Stage3: Test g_N to g_C",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "unittest",
+      "cwd": "${workspaceFolder}",
+      "python": "D:\\software\\Anaconda\\envs\\cross_gaze\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "MKL_THREADING_LAYER": "SEQUENTIAL"
+      },
+      "args": [
+        "-v",
+        "tests.test_v4_model.V4ModelTests.test_virtual_camera_gaze_and_sigma_points_rotate_back_to_camera",
+        "tests.test_v4_model.V4ModelTests.test_virtual_camera_gaze_requires_rotation"
+      ]
+    },
+    {
+      "name": "Stage3: Training dry-run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}\\scripts\\train_modelv1.py",
+      "cwd": "${workspaceFolder}",
+      "python": "D:\\software\\Anaconda\\envs\\cross_gaze\\python.exe",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "MKL_THREADING_LAYER": "SEQUENTIAL"
+      },
+      "args": [
+        "--config",
+        "${input:stage3TrainConfig}",
+        "--device",
+        "cuda",
+        "--dry-run"
+      ]
     },
     {
       "name": "Python: Attach to debugpy",
@@ -32,10 +185,61 @@
   ],
   "inputs": [
     {
-      "id": "moduleName",
+      "id": "preprocessDatasetId",
       "type": "promptString",
-      "description": "Python module to run, for example: package.module",
-      "default": "main"
+      "description": "Collection dataset numeric ID",
+      "default": "11"
+    },
+    {
+      "id": "preprocessDepthMethod",
+      "type": "pickString",
+      "description": "Training depth prior; both is recommended for a controlled comparison",
+      "options": [
+        "both",
+        "pnp1010",
+        "iris65"
+      ],
+      "default": "both"
+    },
+    {
+      "id": "preprocessSourceRoot",
+      "type": "promptString",
+      "description": "Root containing dataset_dual_rigid_body_<ID>",
+      "default": "D:\\GithubCode\\CrossGaze-main\\CrossGaze-main\\data_collection"
+    },
+    {
+      "id": "preprocessOutputVersion",
+      "type": "promptString",
+      "description": "New output folder name; change this when the raw dataset changes again",
+      "default": "preprocessed_v2"
+    },
+    {
+      "id": "preprocessCalibrationStart",
+      "type": "promptString",
+      "description": "Iris65 calibration start frame_idx; ignored by pnp1010",
+      "default": "70"
+    },
+    {
+      "id": "preprocessCalibrationStop",
+      "type": "promptString",
+      "description": "Iris65 calibration stop frame_idx; verify for the changed dataset",
+      "default": "170"
+    },
+    {
+      "id": "stage3DatasetId",
+      "type": "pickString",
+      "description": "Dataset for Stage 3 debugging",
+      "options": [
+        "11",
+        "3"
+      ],
+      "default": "11"
+    },
+    {
+      "id": "stage3TrainConfig",
+      "type": "promptString",
+      "description": "Dataset11-train / Dataset3-val virtual-camera config",
+      "default": "configs\\modelv1\\train_dataset11_val_dataset3_v4_virtual_camera_pnp_v2.yaml"
     }
   ]
 }

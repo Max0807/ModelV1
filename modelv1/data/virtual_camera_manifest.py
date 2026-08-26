@@ -10,6 +10,8 @@ from typing import Iterable
 import torch
 from torch import Tensor
 
+from modelv1.depth_prior.pnp import PNP_GEOMETRY_VERSION
+
 
 IMAGE_SOURCE_LEGACY = "legacy"
 IMAGE_SOURCE_VIRTUAL_CAMERA = "virtual_camera"
@@ -39,6 +41,7 @@ class VirtualCameraRecord:
     left_eye_path: Path
     right_eye_path: Path
     rotation_n_from_c: Tensor
+    virtual_distance_scale: Tensor
 
     @property
     def rotation_c_from_n(self) -> Tensor:
@@ -114,6 +117,13 @@ class VirtualCameraManifest:
                 "landmark_eye_side_conversion must be "
                 f"{LEGACY_EYE_SIDE_CONVERSION!r}, got {conversion or 'missing'!r}."
             )
+        pnp_version = row.get("pnp_geometry_version", "").strip()
+        if pnp_version != PNP_GEOMETRY_VERSION:
+            raise ValueError(
+                "pnp_geometry_version must be "
+                f"{PNP_GEOMETRY_VERSION!r}, got {pnp_version or 'missing'!r}; "
+                "regenerate the normalized images from the verified PnP solver."
+            )
 
         face_path = _resolve_image_path(
             row.get("normalized_face_path", ""),
@@ -144,12 +154,22 @@ class VirtualCameraManifest:
             raise ValueError("rotation_n_from_c must be orthonormal")
         if not torch.isclose(torch.linalg.det(rotation), rotation.new_tensor(1.0), atol=2e-4):
             raise ValueError("rotation_n_from_c must have determinant +1")
+        try:
+            distance_scale = torch.tensor(
+                [float(row["virtual_distance_scale"])],
+                dtype=torch.float32,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid virtual_distance_scale") from exc
+        if not torch.isfinite(distance_scale).all() or torch.any(distance_scale <= 0):
+            raise ValueError("virtual_distance_scale must be finite and positive")
         return VirtualCameraRecord(
             sample_id=sample_id,
             face_path=face_path,
             left_eye_path=left_eye_path,
             right_eye_path=right_eye_path,
             rotation_n_from_c=rotation,
+            virtual_distance_scale=distance_scale,
         )
 
     def __len__(self) -> int:

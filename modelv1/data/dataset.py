@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import copy
 from pathlib import Path
-from typing import Callable, Iterable, Literal, Tuple
+from typing import Callable, Collection, Iterable, Literal, Tuple
 
 from modelv1.deca_cache import (
     DECA_FEATURE_REPRESENTATION_FULL236,
@@ -21,13 +21,18 @@ from modelv1.data.depth_prior import (
     build_eye_geometry_vector,
     canonical_eye_geometry_representation,
 )
+from modelv1.data.eye_geometry_pseudo_labels import (
+    EYE_PSEUDO_IRIS_CENTER_INDEX,
+    EyeGeometryPseudoLabelRecord,
+    EyeGeometryPseudoLabelTable,
+)
 from modelv1.data.normalization import (
     EYE_GEOMETRY_DIM,
     EYE_GEOMETRY_QUALITY_DIM,
     EyeGeometryNormalizer,
     EyeGeometryQualityNormalizer,
     UVTargetNormalizer,
-    fit_uv_target_normalizer,
+    VirtualDistanceScaleNormalizer,
 )
 from modelv1.data.virtual_camera_manifest import (
     IMAGE_SOURCE_LEGACY,
@@ -92,6 +97,172 @@ PairedImageTransform = Callable[
 SplitMode = Literal["random_80_20", "dataset_5", "explicit_datasets"]
 
 
+def load_iris_centres(
+    csv_paths: Iterable[str | Path],
+) -> dict[str, tuple[tuple[float, float], tuple[float, float]]]:
+    """Load successful MediaPipe iris observations keyed by ``sample_id``."""
+
+    centres: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {}
+    required = {
+        "sample_id",
+        "status",
+        "iris_group_468_x",
+        "iris_group_468_y",
+        "iris_group_473_x",
+        "iris_group_473_y",
+    }
+    for value in csv_paths:
+        path = Path(value)
+        if not path.is_file():
+            raise FileNotFoundError(f"Iris-supervision CSV does not exist: {path}")
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        if not rows or not required.issubset(rows[0]):
+            raise ValueError(
+                f"Iris-supervision CSV lacks required columns: {path}"
+            )
+        for row in rows:
+            if row["status"].strip().lower() != "success":
+                continue
+            sample_id = row["sample_id"].strip()
+            if not sample_id or sample_id in centres:
+                continue
+            try:
+                centres[sample_id] = (
+                    (float(row["iris_group_468_x"]), float(row["iris_group_468_y"])),
+                    (float(row["iris_group_473_x"]), float(row["iris_group_473_y"])),
+                )
+            except ValueError:
+                continue
+    if not centres:
+        raise ValueError("No successful iris centres found in iris-supervision CSVs.")
+    return centres
+
+
+def iris_centres_in_eye_crops(
+    row: dict[str, str],
+    centres: tuple[tuple[float, float], tuple[float, float]] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map source-image iris points to normalized left/right eye crop coordinates."""
+
+    targets = torch.zeros((2, 2), dtype=torch.float32)
+    valid = torch.zeros(2, dtype=torch.float32)
+    if centres is None:
+        return targets, valid
+    for eye_index, prefix in enumerate(("left_eye_bbox", "right_eye_bbox")):
+        try:
+            x0 = float(row[f"{prefix}_x"])
+            y0 = float(row[f"{prefix}_y"])
+            width = float(row[f"{prefix}_w"])
+            height = float(row[f"{prefix}_h"])
+        except (KeyError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        candidates = [
+            ((x - x0) / width, (y - y0) / height)
+            for x, y in centres
+        ]
+        candidates = [
+            point for point in candidates if 0.0 <= point[0] <= 1.0 and 0.0 <= point[1] <= 1.0
+        ]
+        if not candidates:
+            continue
+        # MediaPipe group IDs use image-side naming; choose by geometric crop
+        # membership rather than assuming a fixed anatomical left/right order.
+        x, y = min(candidates, key=lambda point: (point[0] - 0.5) ** 2 + (point[1] - 0.5) ** 2)
+        targets[eye_index] = torch.tensor((x, y), dtype=torch.float32)
+        valid[eye_index] = 1.0
+    return targets, valid
+
+
+def canonical_eye_image_size(value: Iterable[int]) -> tuple[int, int]:
+    """Validate an eye image size expressed as ``(width, height)``."""
+
+    if isinstance(value, (str, bytes)):
+        raise ValueError("eye_image_size must be a two-item (width, height) sequence.")
+    try:
+        width, height = tuple(int(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "eye_image_size must be a two-item (width, height) sequence."
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"eye_image_size dimensions must be positive, got {(width, height)}."
+        )
+    return width, height
+
+DIRECT_UV_TARGET_FRAME_TABLE_LOCAL = "table_local"
+DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA = "virtual_camera"
+DIRECT_UV_TARGET_FRAMES = (
+    DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+    DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA,
+)
+GAZE_TARGET_CAMERA_COLUMNS = [
+    "gaze_cam_recomputed_x_mm",
+    "gaze_cam_recomputed_y_mm",
+    "gaze_cam_recomputed_z_mm",
+]
+
+
+def canonical_direct_uv_target_frame(value: str) -> str:
+    """Validate the coordinate frame used by the learned direct-UV target."""
+
+    frame = str(value).strip().lower()
+    if frame not in DIRECT_UV_TARGET_FRAMES:
+        supported = ", ".join(DIRECT_UV_TARGET_FRAMES)
+        raise ValueError(
+            f"Unknown direct_uv_target_frame={value!r}; expected one of: "
+            f"{supported}."
+        )
+    return frame
+
+
+def transform_gaze_target_to_virtual_camera_uv(
+    gaze_target_camera_mm: torch.Tensor,
+    rotation_n_from_c: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``(x_N, y_N)`` after rotating a camera-space target into N.
+
+    The virtual-camera homography uses ``diag(1, 1, s) @ R_NC``. Its depth
+    normalization therefore does not change the metric x/y coordinates; only
+    the rigid rotation is required for this two-dimensional supervision.
+    """
+
+    target = torch.as_tensor(gaze_target_camera_mm, dtype=torch.float32).flatten()
+    rotation = torch.as_tensor(rotation_n_from_c, dtype=torch.float32)
+    if target.shape != (3,):
+        raise ValueError(
+            "gaze_target_camera_mm must have shape (3,), got "
+            f"{tuple(target.shape)}"
+        )
+    if rotation.shape != (3, 3):
+        raise ValueError(
+            "rotation_n_from_c must have shape (3, 3), got "
+            f"{tuple(rotation.shape)}"
+        )
+    if not torch.isfinite(target).all() or not torch.isfinite(rotation).all():
+        raise ValueError("Virtual-camera target inputs must contain only finite values.")
+    identity = torch.eye(3, dtype=rotation.dtype, device=rotation.device)
+    if not torch.allclose(
+        rotation @ rotation.transpose(0, 1),
+        identity,
+        atol=2e-4,
+        rtol=0.0,
+    ):
+        raise ValueError("rotation_n_from_c must be orthonormal.")
+    if not torch.isclose(
+        torch.linalg.det(rotation),
+        rotation.new_tensor(1.0),
+        atol=2e-4,
+        rtol=0.0,
+    ):
+        raise ValueError("rotation_n_from_c must have determinant +1.")
+    target_n = rotation @ target
+    return target_n[:2]
+
+
 class ModelV1Dataset(Dataset):
     """Dataset backed by `data/processed/modelv1_dataset.csv`.
 
@@ -107,10 +278,15 @@ class ModelV1Dataset(Dataset):
     - gated modes also return confidence/mask and, for learned mode, 4D quality.
     - V4 returns raw binocular PnP coordinates in mm, label-free log-depth
       uncertainty, TableFrame7, and optional train-normalized PnP quality.
-    - `uv_gt`: 2D table-local gaze target in millimeters.
+    - `uv_gt`: active 2D gaze target in millimeters. It is table-local by
+      default, or virtual-camera ``(x_N, y_N)`` when requested by direct UV.
+    - `uv_gt_table_mm`: original table-local target retained for auditing.
     - `uv_target`: z-score-normalized target used by the UV head.
     - virtual-camera mode additionally returns `rotation_n_from_c` and its
       transpose `rotation_c_from_n`, both as 3x3 tensors.
+    - optional MediaPipe supervision returns 15 crop-normalized and eye-local
+      points per anatomical eye, geometry features, quality, and both original
+      and post-augmentation visibility masks.
     - extra metadata for validation and debugging.
     """
 
@@ -124,6 +300,7 @@ class ModelV1Dataset(Dataset):
         paired_eye_transform: PairedImageTransform | None = None,
         return_paths: bool = True,
         load_face_image: bool = True,
+        eye_image_size: tuple[int, int] = EYE_SIZE,
         deca_cache_path: str | Path | None = DEFAULT_DECA_CACHE_PATH,
         require_deca_features: bool = True,
         target_normalizer: UVTargetNormalizer | None = None,
@@ -144,9 +321,20 @@ class ModelV1Dataset(Dataset):
         scene_representation: str = SCENE_REPRESENTATION_FULL25,
         deca_feature_representation: str = DECA_FEATURE_REPRESENTATION_FULL236,
         image_source: str = IMAGE_SOURCE_LEGACY,
+        eye_image_source: str | None = None,
         virtual_camera_manifest_path: str | Path | None = None,
         virtual_camera_manifest: VirtualCameraManifest | None = None,
         filter_invalid_virtual_camera_samples: bool = False,
+        allowed_sample_ids: Collection[str] | None = None,
+        direct_uv_target_frame: str = DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+        use_virtual_distance_film: bool = False,
+        use_virtual_pose_film: bool = False,
+        virtual_distance_scale_normalizer: VirtualDistanceScaleNormalizer | None = None,
+        fit_virtual_distance_scale_normalizer: bool = True,
+        iris_supervision_csv_paths: Iterable[str | Path] | None = None,
+        eye_geometry_pseudo_label_paths: Iterable[str | Path] | None = None,
+        eye_geometry_pseudo_label_table: EyeGeometryPseudoLabelTable | None = None,
+        require_eye_geometry_pseudo_labels: bool = False,
     ) -> None:
         self.csv_path = Path(csv_path)
         self.normalize_images = normalize_images
@@ -155,12 +343,89 @@ class ModelV1Dataset(Dataset):
         self.paired_eye_transform = paired_eye_transform
         self.return_paths = return_paths
         self.load_face_image = load_face_image
+        self.eye_image_size = canonical_eye_image_size(eye_image_size)
         self.image_source = canonical_image_source(image_source)
+        # Keep the historical behaviour unless the caller explicitly requests
+        # a mixed source: legacy eyes may be paired with a virtual face image.
+        self.eye_image_source = canonical_image_source(
+            image_source if eye_image_source is None else eye_image_source
+        )
+        if (
+            self.eye_image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
+            and self.image_source != IMAGE_SOURCE_VIRTUAL_CAMERA
+        ):
+            raise ValueError(
+                "eye_image_source='virtual_camera' requires "
+                "image_source='virtual_camera'."
+            )
         self.filter_invalid_virtual_camera_samples = (
             filter_invalid_virtual_camera_samples
         )
+        self.allowed_sample_ids = (
+            frozenset(str(sample_id).strip() for sample_id in allowed_sample_ids)
+            if allowed_sample_ids is not None
+            else None
+        )
         self.use_eye_geometry = use_eye_geometry
         self.use_gaze_geometry = use_gaze_geometry
+        self.direct_uv_target_frame = canonical_direct_uv_target_frame(
+            direct_uv_target_frame
+        )
+        self.use_virtual_distance_film = use_virtual_distance_film
+        self.use_virtual_pose_film = use_virtual_pose_film
+        self.virtual_distance_scale_normalizer = (
+            virtual_distance_scale_normalizer
+        )
+        if (
+            eye_geometry_pseudo_label_paths is not None
+            and eye_geometry_pseudo_label_table is not None
+        ):
+            raise ValueError(
+                "Provide either eye_geometry_pseudo_label_paths or "
+                "eye_geometry_pseudo_label_table, not both."
+            )
+        if eye_geometry_pseudo_label_table is None and eye_geometry_pseudo_label_paths is not None:
+            eye_geometry_pseudo_label_table = EyeGeometryPseudoLabelTable.load(
+                eye_geometry_pseudo_label_paths
+            )
+        if require_eye_geometry_pseudo_labels and eye_geometry_pseudo_label_table is None:
+            raise ValueError(
+                "require_eye_geometry_pseudo_labels=True requires at least one "
+                "eye-geometry pseudo-label NPZ."
+            )
+        has_eye_landmark_supervision = (
+            eye_geometry_pseudo_label_table is not None
+            or iris_supervision_csv_paths is not None
+        )
+        if has_eye_landmark_supervision and self.eye_image_source != IMAGE_SOURCE_LEGACY:
+            raise ValueError(
+                "MediaPipe eye landmark supervision is defined on legacy eye "
+                "crops; set eye_image_source='legacy' or regenerate labels in the "
+                "virtual-camera eye coordinate frame."
+            )
+        if has_eye_landmark_supervision and eye_transform is not None:
+            raise ValueError(
+                "eye_transform cannot be used with eye landmark supervision "
+                "because it cannot synchronize point coordinates/visibility. Use the "
+                "appearance-only paired_eye_transform instead."
+            )
+        if has_eye_landmark_supervision and paired_eye_transform is not None:
+            if not bool(
+                getattr(paired_eye_transform, "preserves_keypoint_coordinates", False)
+            ) or not callable(getattr(paired_eye_transform, "apply_with_keypoints", None)):
+                raise ValueError(
+                    "paired_eye_transform must preserve keypoint coordinates and "
+                    "implement apply_with_keypoints when eye pseudo-labels are used."
+                )
+        self.eye_geometry_pseudo_label_table = eye_geometry_pseudo_label_table
+        self.require_eye_geometry_pseudo_labels = bool(
+            require_eye_geometry_pseudo_labels
+        )
+        self.iris_centres_by_sample_id = (
+            load_iris_centres(iris_supervision_csv_paths)
+            if iris_supervision_csv_paths is not None
+            else None
+        )
         self.require_depth_uncertainty = require_depth_uncertainty
         self.require_pnp_quality = require_pnp_quality
         self.use_depth_correction = use_depth_correction
@@ -178,6 +443,36 @@ class ModelV1Dataset(Dataset):
                 "Legacy learned eye geometry and V4 geometric eye hypotheses "
                 "cannot be enabled together."
             )
+        if self.use_virtual_distance_film and self.use_gaze_geometry:
+            raise ValueError(
+                "Virtual-distance FiLM is only supported by direct_uv mode."
+            )
+        if self.use_virtual_pose_film and self.use_gaze_geometry:
+            raise ValueError(
+                "Virtual-camera pose FiLM is only supported by direct_uv mode."
+            )
+        if (
+            self.direct_uv_target_frame
+            == DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA
+        ):
+            if self.use_gaze_geometry:
+                raise ValueError(
+                    "direct_uv_target_frame='virtual_camera' is only supported "
+                    "by direct_uv mode."
+                )
+            if self.image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+                raise ValueError(
+                    "direct_uv_target_frame='virtual_camera' requires "
+                    "image_source='virtual_camera'."
+                )
+            if (
+                canonical_scene_representation(scene_representation)
+                != SCENE_REPRESENTATION_TABLE_FRAME7
+            ):
+                raise ValueError(
+                    "direct_uv_target_frame='virtual_camera' requires "
+                    "scene_representation='table_frame7'."
+                )
         self.eye_geometry_normalizer = eye_geometry_normalizer
         self.eye_geometry_representation = canonical_eye_geometry_representation(
             eye_geometry_representation
@@ -245,11 +540,46 @@ class ModelV1Dataset(Dataset):
                 "image_source='virtual_camera'."
             )
         self.virtual_camera_manifest = virtual_camera_manifest
+        if self.use_virtual_distance_film:
+            if self.image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+                raise ValueError(
+                    "Virtual-distance FiLM requires image_source='virtual_camera'."
+                )
+            if self.scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7:
+                raise ValueError(
+                    "Virtual-distance FiLM requires "
+                    "scene_representation='table_frame7'."
+                )
+        if self.use_virtual_pose_film:
+            if self.image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+                raise ValueError(
+                    "Virtual-camera pose FiLM requires image_source='virtual_camera'."
+                )
+            if self.scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7:
+                raise ValueError(
+                    "Virtual-camera pose FiLM requires "
+                    "scene_representation='table_frame7'."
+                )
 
         requested = normalize_dataset_names(datasets)
         self.rows = read_rows(self.csv_path)
         if requested is not None:
             self.rows = [row for row in self.rows if row["dataset"] in requested]
+        if self.allowed_sample_ids is not None:
+            before_count = len(self.rows)
+            self.rows = [
+                row
+                for row in self.rows
+                if row["sample_id"] in self.allowed_sample_ids
+            ]
+            skipped_count = before_count - len(self.rows)
+            if skipped_count:
+                print(
+                    "Filtered "
+                    f"{skipped_count} samples outside the explicit sample-id "
+                    f"filter from {self.csv_path}.",
+                    flush=True,
+                )
 
         if self.image_source == IMAGE_SOURCE_VIRTUAL_CAMERA:
             assert self.virtual_camera_manifest is not None
@@ -275,10 +605,13 @@ class ModelV1Dataset(Dataset):
 
         if not self.rows:
             raise ValueError(f"No samples found in {self.csv_path}")
-
         validate_required_columns(
             self.rows[0],
             require_gaze_geometry=self.use_gaze_geometry,
+            require_gaze_target_camera=(
+                self.direct_uv_target_frame
+                == DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA
+            ),
         )
         if self.use_eye_geometry or self.use_gaze_geometry:
             depth_representation = (
@@ -353,9 +686,42 @@ class ModelV1Dataset(Dataset):
                         "Depth-prior CSV has no valid PnP quality for "
                         f"{len(missing_quality)} required samples."
                     )
+        if (
+            self.require_eye_geometry_pseudo_labels
+            and self.eye_geometry_pseudo_label_table is not None
+        ):
+            # Check the final row set, after every requested sample filter.
+            self.eye_geometry_pseudo_label_table.require_sample_ids(
+                row["sample_id"] for row in self.rows
+            )
         self.target_normalizer = target_normalizer
         if self.target_normalizer is None and fit_target_normalizer:
-            self.target_normalizer = fit_uv_target_normalizer(self.rows)
+            self.target_normalizer = UVTargetNormalizer.fit(
+                torch.stack(
+                    [
+                        self.raw_uv_target(index)
+                        for index in range(len(self.rows))
+                    ],
+                    dim=0,
+                )
+            )
+        if (
+            self.use_virtual_distance_film
+            and not self.use_virtual_pose_film
+            and self.virtual_distance_scale_normalizer is None
+            and fit_virtual_distance_scale_normalizer
+        ):
+            self.virtual_distance_scale_normalizer = (
+                VirtualDistanceScaleNormalizer.fit(
+                    torch.stack(
+                        [
+                            self.raw_virtual_distance_scale(index)
+                            for index in range(len(self.rows))
+                        ],
+                        dim=0,
+                    )
+                )
+            )
         if require_deca_features and not self.uses_deca_features:
             raise ValueError(
                 "require_deca_features must be False when "
@@ -393,12 +759,18 @@ class ModelV1Dataset(Dataset):
         )
         left_eye_path = (
             str(virtual_record.left_eye_path)
-            if virtual_record is not None
+            if (
+                virtual_record is not None
+                and self.eye_image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
+            )
             else row["left_eye_path"]
         )
         right_eye_path = (
             str(virtual_record.right_eye_path)
-            if virtual_record is not None
+            if (
+                virtual_record is not None
+                and self.eye_image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
+            )
             else row["right_eye_path"]
         )
 
@@ -407,13 +779,43 @@ class ModelV1Dataset(Dataset):
             if self.load_face_image
             else None
         )
-        left_eye = self._load_image(left_eye_path, EYE_SIZE)
-        right_eye = self._load_image(right_eye_path, EYE_SIZE)
+        left_eye = self._load_image(left_eye_path, self.eye_image_size)
+        right_eye = self._load_image(right_eye_path, self.eye_image_size)
+
+        pseudo_record: EyeGeometryPseudoLabelRecord | None = None
+        pseudo_points: torch.Tensor | None = None
+        pseudo_base_valid: torch.Tensor | None = None
+        pseudo_augmented_valid: torch.Tensor | None = None
+        if self.eye_geometry_pseudo_label_table is not None:
+            if self.eye_geometry_pseudo_label_table.contains(row["sample_id"]):
+                pseudo_record = self.eye_geometry_pseudo_label_table.lookup(
+                    row["sample_id"]
+                )
+            else:
+                pseudo_record = self.eye_geometry_pseudo_label_table.empty(
+                    row["sample_id"]
+                )
+            pseudo_points = pseudo_record.landmarks_crop_norm
+            pseudo_base_valid = pseudo_record.landmark_valid_mask
+            pseudo_augmented_valid = pseudo_base_valid.clone()
 
         if face is not None and self.face_transform is not None:
             face = self.face_transform(face)
         if self.paired_eye_transform is not None:
-            left_eye, right_eye = self.paired_eye_transform(left_eye, right_eye)
+            if pseudo_record is not None:
+                (
+                    left_eye,
+                    right_eye,
+                    pseudo_points,
+                    pseudo_augmented_valid,
+                ) = self.paired_eye_transform.apply_with_keypoints(
+                    left_eye,
+                    right_eye,
+                    pseudo_points,
+                    pseudo_augmented_valid,
+                )
+            else:
+                left_eye, right_eye = self.paired_eye_transform(left_eye, right_eye)
         elif self.eye_transform is not None:
             left_eye = self.eye_transform(left_eye)
             right_eye = self.eye_transform(right_eye)
@@ -426,17 +828,32 @@ class ModelV1Dataset(Dataset):
             left_eye = self._normalize_image(left_eye)
             right_eye = self._normalize_image(right_eye)
 
-        uv_gt = float_tensor(row, ["uv_gt_u_mm", "uv_gt_v_mm"])
+        uv_gt_table_mm = float_tensor(row, ["uv_gt_u_mm", "uv_gt_v_mm"])
+        uv_gt = self.raw_uv_target(index)
         scene_vec = build_scene_input_vector(
             float_tensor(row, SCENE_COLUMNS),
             self.scene_representation,
         )
+        table_frame7_n = None
+        if (
+            self.use_virtual_distance_film
+            or self.use_virtual_pose_film
+            or self.direct_uv_target_frame
+            == DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA
+        ):
+            assert virtual_record is not None
+            table_frame7_n = transform_table_frame7_to_virtual_camera(
+                scene_vec,
+                virtual_record.rotation_n_from_c,
+            )
+            scene_vec = table_frame7_n
         item: dict[str, object] = {
             "left_eye": left_eye,
             "right_eye": right_eye,
             "crop_cam_vec": float_tensor(row, CROP_CAM_COLUMNS),
             "scene_vec": scene_vec,
             "uv_gt": uv_gt,
+            "uv_gt_table_mm": uv_gt_table_mm,
             "uv_target": (
                 self.target_normalizer.normalize(uv_gt)
                 if self.target_normalizer is not None
@@ -456,9 +873,80 @@ class ModelV1Dataset(Dataset):
         }
         if face is not None:
             item["face"] = face
+        if pseudo_record is not None:
+            assert pseudo_points is not None
+            assert pseudo_base_valid is not None
+            assert pseudo_augmented_valid is not None
+            eye_quality = pseudo_record.geometry_features[:, -1].clamp(0.0, 1.0)
+            visible_fraction = pseudo_augmented_valid.mean(dim=1)
+            item["eye_pseudo_landmarks_xy"] = pseudo_points
+            item["eye_pseudo_landmarks_local"] = pseudo_record.landmarks_local
+            item["eye_pseudo_landmark_base_valid_mask"] = pseudo_base_valid
+            item["eye_pseudo_landmark_valid_mask"] = pseudo_augmented_valid
+            item["eye_pseudo_occluded_mask"] = (
+                (pseudo_base_valid > 0.5) & (pseudo_augmented_valid <= 0.5)
+            ).to(dtype=torch.float32)
+            item["eye_pseudo_geometry_features"] = pseudo_record.geometry_features
+            item["eye_pseudo_eye_valid_mask"] = pseudo_record.eye_valid_mask
+            item["eye_pseudo_detection_mask"] = pseudo_record.detection_success
+            item["eye_pseudo_sample_valid_mask"] = pseudo_record.sample_valid
+            item["eye_pseudo_sample_quality"] = pseudo_record.sample_quality
+            item["eye_pseudo_eye_quality"] = eye_quality
+            item["eye_pseudo_effective_quality"] = (
+                eye_quality * pseudo_record.eye_valid_mask * visible_fraction
+            )
+            item["iris_center_xy"] = pseudo_points[
+                :, EYE_PSEUDO_IRIS_CENTER_INDEX, :
+            ].clone()
+            item["iris_center_valid_mask"] = (
+                pseudo_augmented_valid[:, EYE_PSEUDO_IRIS_CENTER_INDEX]
+                * pseudo_record.eye_valid_mask
+            )
+        elif self.iris_centres_by_sample_id is not None:
+            iris_xy, iris_valid = iris_centres_in_eye_crops(
+                row,
+                self.iris_centres_by_sample_id.get(row["sample_id"]),
+            )
+            item["iris_center_xy"] = iris_xy
+            item["iris_center_valid_mask"] = iris_valid
         if virtual_record is not None:
             item["rotation_n_from_c"] = virtual_record.rotation_n_from_c.clone()
             item["rotation_c_from_n"] = virtual_record.rotation_c_from_n.clone()
+            item["virtual_distance_scale"] = (
+                virtual_record.virtual_distance_scale.clone()
+            )
+        if table_frame7_n is not None:
+            item["table_frame7_n"] = table_frame7_n
+        if self.use_virtual_distance_film and not self.use_virtual_pose_film:
+            if self.virtual_distance_scale_normalizer is None:
+                raise RuntimeError(
+                    "Virtual-distance FiLM requires a fitted scale normalizer."
+                )
+            assert virtual_record is not None
+            assert table_frame7_n is not None
+            item["virtual_log_scale_normalized"] = (
+                self.virtual_distance_scale_normalizer.normalize(
+                    virtual_record.virtual_distance_scale
+                )
+            )
+        if self.use_virtual_pose_film:
+            assert table_frame7_n is not None
+            item["virtual_camera_pose_table"] = (
+                build_virtual_camera_pose_table_feature(table_frame7_n)
+            )
+        if (
+            self.direct_uv_target_frame
+            == DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA
+        ):
+            assert virtual_record is not None
+            gaze_target_camera_mm = float_tensor(
+                row,
+                GAZE_TARGET_CAMERA_COLUMNS,
+            )
+            item["gaze_target_camera_mm"] = gaze_target_camera_mm
+            item["gaze_target_virtual_camera_mm"] = (
+                virtual_record.rotation_n_from_c @ gaze_target_camera_mm
+            )
         if self.deca_cache is not None:
             item["deca_feat"] = torch.from_numpy(
                 select_deca_feature_representation(
@@ -604,6 +1092,38 @@ class ModelV1Dataset(Dataset):
             raise RuntimeError("This dataset was created without eye geometry.")
         return self.depth_prior_table.lookup(self.rows[index]["sample_id"]).clone()
 
+    def raw_virtual_distance_scale(self, index: int) -> torch.Tensor:
+        if self.virtual_camera_manifest is None:
+            raise RuntimeError(
+                "This dataset was created without a virtual-camera manifest."
+            )
+        return self.virtual_camera_manifest.lookup(
+            self.rows[index]["sample_id"]
+        ).virtual_distance_scale.clone()
+
+    def raw_uv_target(self, index: int) -> torch.Tensor:
+        """Return the unnormalized target in the configured direct-UV frame."""
+
+        row = self.rows[index]
+        table_local_uv_mm = float_tensor(
+            row,
+            ["uv_gt_u_mm", "uv_gt_v_mm"],
+        )
+        if (
+            self.direct_uv_target_frame
+            == DIRECT_UV_TARGET_FRAME_TABLE_LOCAL
+        ):
+            return table_local_uv_mm
+        if self.virtual_camera_manifest is None:
+            raise RuntimeError(
+                "Virtual-camera UV targets require a virtual-camera manifest."
+            )
+        record = self.virtual_camera_manifest.lookup(row["sample_id"])
+        return transform_gaze_target_to_virtual_camera_uv(
+            float_tensor(row, GAZE_TARGET_CAMERA_COLUMNS),
+            record.rotation_n_from_c,
+        )
+
     def raw_eye_geometry_quality(self, index: int) -> torch.Tensor:
         if self.depth_prior_table is None:
             raise RuntimeError("This dataset was created without eye geometry.")
@@ -644,6 +1164,7 @@ def build_modelv1_dataloaders(
     pin_memory: bool | None = None,
     normalize_images: bool = True,
     load_face_image: bool = True,
+    eye_image_size: tuple[int, int] = EYE_SIZE,
     train_paired_eye_transform: PairedImageTransform | None = None,
     deca_cache_path: str | Path | None = DEFAULT_DECA_CACHE_PATH,
     require_deca_features: bool = True,
@@ -664,8 +1185,18 @@ def build_modelv1_dataloaders(
     scene_representation: str = SCENE_REPRESENTATION_FULL25,
     deca_feature_representation: str = DECA_FEATURE_REPRESENTATION_FULL236,
     image_source: str = IMAGE_SOURCE_LEGACY,
+    eye_image_source: str | None = None,
     virtual_camera_manifest_path: str | Path | None = None,
     filter_invalid_virtual_camera_samples: bool = False,
+    allowed_sample_ids: Collection[str] | None = None,
+    direct_uv_target_frame: str = DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
+    use_virtual_distance_film: bool = False,
+    use_virtual_pose_film: bool = False,
+    virtual_distance_scale_normalizer: VirtualDistanceScaleNormalizer | None = None,
+    iris_supervision_csv_paths: Iterable[str | Path] | None = None,
+    eye_geometry_pseudo_label_paths: Iterable[str | Path] | None = None,
+    eye_geometry_pseudo_label_table: EyeGeometryPseudoLabelTable | None = None,
+    require_eye_geometry_pseudo_labels: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """Create train/validation loaders.
 
@@ -687,6 +1218,19 @@ def build_modelv1_dataloaders(
 
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
+    if (
+        eye_geometry_pseudo_label_paths is not None
+        and eye_geometry_pseudo_label_table is not None
+    ):
+        raise ValueError(
+            "Provide either eye_geometry_pseudo_label_paths or "
+            "eye_geometry_pseudo_label_table, not both."
+        )
+    if eye_geometry_pseudo_label_table is None and eye_geometry_pseudo_label_paths is not None:
+        eye_geometry_pseudo_label_table = EyeGeometryPseudoLabelTable.load(
+            eye_geometry_pseudo_label_paths
+        )
+    eye_image_size = canonical_eye_image_size(eye_image_size)
     eye_geometry_gate_mode = canonical_eye_geometry_gate_mode(
         eye_geometry_gate_mode
     )
@@ -698,6 +1242,20 @@ def build_modelv1_dataloaders(
         deca_feature_representation
     )
     image_source = canonical_image_source(image_source)
+    eye_image_source = canonical_image_source(
+        image_source if eye_image_source is None else eye_image_source
+    )
+    if (
+        eye_image_source == IMAGE_SOURCE_VIRTUAL_CAMERA
+        and image_source != IMAGE_SOURCE_VIRTUAL_CAMERA
+    ):
+        raise ValueError(
+            "eye_image_source='virtual_camera' requires "
+            "image_source='virtual_camera'."
+        )
+    direct_uv_target_frame = canonical_direct_uv_target_frame(
+        direct_uv_target_frame
+    )
     uses_deca_features = (
         deca_feature_representation != DECA_FEATURE_REPRESENTATION_NONE
     )
@@ -724,6 +1282,50 @@ def build_modelv1_dataloaders(
         raise ValueError(
             "use_depth_correction=True requires require_pnp_quality=True."
         )
+    if use_virtual_distance_film:
+        if use_gaze_geometry:
+            raise ValueError(
+                "Virtual-distance FiLM is only supported by direct_uv mode."
+            )
+        if image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+            raise ValueError(
+                "Virtual-distance FiLM requires image_source='virtual_camera'."
+            )
+        if scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7:
+            raise ValueError(
+                "Virtual-distance FiLM requires "
+                "scene_representation='table_frame7'."
+            )
+        if use_virtual_pose_film:
+            if use_gaze_geometry:
+                raise ValueError(
+                    "Virtual-camera pose FiLM is only supported by direct_uv mode."
+                )
+            if image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+                raise ValueError(
+                    "Virtual-camera pose FiLM requires image_source='virtual_camera'."
+                )
+            if scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7:
+                raise ValueError(
+                    "Virtual-camera pose FiLM requires "
+                    "scene_representation='table_frame7'."
+                )
+    if direct_uv_target_frame == DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA:
+        if use_gaze_geometry:
+            raise ValueError(
+                "direct_uv_target_frame='virtual_camera' is only supported "
+                "by direct_uv mode."
+            )
+        if image_source != IMAGE_SOURCE_VIRTUAL_CAMERA:
+            raise ValueError(
+                "direct_uv_target_frame='virtual_camera' requires "
+                "image_source='virtual_camera'."
+            )
+        if scene_representation != SCENE_REPRESENTATION_TABLE_FRAME7:
+            raise ValueError(
+                "direct_uv_target_frame='virtual_camera' requires "
+                "scene_representation='table_frame7'."
+            )
     depth_prior_table = None
     if use_eye_geometry or use_gaze_geometry:
         if depth_prior_csv_path is None:
@@ -760,6 +1362,7 @@ def build_modelv1_dataloaders(
             normalize_images=normalize_images,
             paired_eye_transform=train_paired_eye_transform,
             load_face_image=load_face_image,
+            eye_image_size=eye_image_size,
             deca_cache_path=deca_cache_path,
             require_deca_features=require_deca_features,
             fit_target_normalizer=False,
@@ -775,9 +1378,23 @@ def build_modelv1_dataloaders(
             scene_representation=scene_representation,
             deca_feature_representation=deca_feature_representation,
             image_source=image_source,
+            eye_image_source=eye_image_source,
             virtual_camera_manifest=virtual_camera_manifest,
             filter_invalid_virtual_camera_samples=(
                 filter_invalid_virtual_camera_samples
+            ),
+            allowed_sample_ids=allowed_sample_ids,
+            direct_uv_target_frame=direct_uv_target_frame,
+            use_virtual_distance_film=use_virtual_distance_film,
+            use_virtual_pose_film=use_virtual_pose_film,
+            virtual_distance_scale_normalizer=(
+                virtual_distance_scale_normalizer
+            ),
+            fit_virtual_distance_scale_normalizer=False,
+            iris_supervision_csv_paths=iris_supervision_csv_paths,
+            eye_geometry_pseudo_label_table=eye_geometry_pseudo_label_table,
+            require_eye_geometry_pseudo_labels=(
+                require_eye_geometry_pseudo_labels
             ),
         )
         val_count = int(round(len(all_set) * val_ratio))
@@ -788,10 +1405,32 @@ def build_modelv1_dataloaders(
         train_indices = indices[val_count:]
         normalizer = target_normalizer
         if normalize_uv_targets and normalizer is None:
-            normalizer = fit_uv_target_normalizer(
-                [all_set.rows[index] for index in train_indices]
+            normalizer = UVTargetNormalizer.fit(
+                torch.stack(
+                    [
+                        all_set.raw_uv_target(index)
+                        for index in train_indices
+                    ],
+                    dim=0,
+                )
             )
         all_set.target_normalizer = normalizer
+        scale_normalizer = virtual_distance_scale_normalizer
+        if (
+            use_virtual_distance_film
+            and not use_virtual_pose_film
+            and scale_normalizer is None
+        ):
+            scale_normalizer = VirtualDistanceScaleNormalizer.fit(
+                torch.stack(
+                    [
+                        all_set.raw_virtual_distance_scale(index)
+                        for index in train_indices
+                    ],
+                    dim=0,
+                )
+            )
+        all_set.virtual_distance_scale_normalizer = scale_normalizer
         valid_train_indices = (
             [
                 index
@@ -873,6 +1512,7 @@ def build_modelv1_dataloaders(
             normalize_images=normalize_images,
             paired_eye_transform=train_paired_eye_transform,
             load_face_image=load_face_image,
+            eye_image_size=eye_image_size,
             deca_cache_path=deca_cache_path,
             require_deca_features=require_deca_features,
             fit_target_normalizer=False,
@@ -888,9 +1528,23 @@ def build_modelv1_dataloaders(
             scene_representation=scene_representation,
             deca_feature_representation=deca_feature_representation,
             image_source=image_source,
+            eye_image_source=eye_image_source,
             virtual_camera_manifest=virtual_camera_manifest,
             filter_invalid_virtual_camera_samples=(
                 filter_invalid_virtual_camera_samples
+            ),
+            allowed_sample_ids=allowed_sample_ids,
+            direct_uv_target_frame=direct_uv_target_frame,
+            use_virtual_distance_film=use_virtual_distance_film,
+            use_virtual_pose_film=use_virtual_pose_film,
+            virtual_distance_scale_normalizer=(
+                virtual_distance_scale_normalizer
+            ),
+            fit_virtual_distance_scale_normalizer=False,
+            iris_supervision_csv_paths=iris_supervision_csv_paths,
+            eye_geometry_pseudo_label_table=eye_geometry_pseudo_label_table,
+            require_eye_geometry_pseudo_labels=(
+                require_eye_geometry_pseudo_labels
             ),
         )
         val_set = ModelV1Dataset(
@@ -898,6 +1552,7 @@ def build_modelv1_dataloaders(
             datasets=normalized_val_datasets,
             normalize_images=normalize_images,
             load_face_image=load_face_image,
+            eye_image_size=eye_image_size,
             deca_cache_path=deca_cache_path,
             require_deca_features=require_deca_features,
             fit_target_normalizer=False,
@@ -913,16 +1568,55 @@ def build_modelv1_dataloaders(
             scene_representation=scene_representation,
             deca_feature_representation=deca_feature_representation,
             image_source=image_source,
+            eye_image_source=eye_image_source,
             virtual_camera_manifest=virtual_camera_manifest,
             filter_invalid_virtual_camera_samples=(
                 filter_invalid_virtual_camera_samples
             ),
+            allowed_sample_ids=allowed_sample_ids,
+            direct_uv_target_frame=direct_uv_target_frame,
+            use_virtual_distance_film=use_virtual_distance_film,
+            use_virtual_pose_film=use_virtual_pose_film,
+            virtual_distance_scale_normalizer=(
+                virtual_distance_scale_normalizer
+            ),
+            fit_virtual_distance_scale_normalizer=False,
+            iris_supervision_csv_paths=iris_supervision_csv_paths,
+            eye_geometry_pseudo_label_table=eye_geometry_pseudo_label_table,
+            require_eye_geometry_pseudo_labels=(
+                require_eye_geometry_pseudo_labels
+            ),
         )
         normalizer = target_normalizer
         if normalize_uv_targets and normalizer is None:
-            normalizer = fit_uv_target_normalizer(train_set.rows)
+            normalizer = UVTargetNormalizer.fit(
+                torch.stack(
+                    [
+                        train_set.raw_uv_target(index)
+                        for index in range(len(train_set))
+                    ],
+                    dim=0,
+                )
+            )
         train_set.target_normalizer = normalizer
         val_set.target_normalizer = normalizer
+        scale_normalizer = virtual_distance_scale_normalizer
+        if (
+            use_virtual_distance_film
+            and not use_virtual_pose_film
+            and scale_normalizer is None
+        ):
+            scale_normalizer = VirtualDistanceScaleNormalizer.fit(
+                torch.stack(
+                    [
+                        train_set.raw_virtual_distance_scale(index)
+                        for index in range(len(train_set))
+                    ],
+                    dim=0,
+                )
+            )
+        train_set.virtual_distance_scale_normalizer = scale_normalizer
+        val_set.virtual_distance_scale_normalizer = scale_normalizer
         valid_train_indices = (
             [
                 index
@@ -1010,6 +1704,17 @@ def get_uv_target_normalizer(dataset: Dataset) -> UVTargetNormalizer | None:
     return base_dataset.target_normalizer
 
 
+def get_virtual_distance_scale_normalizer(
+    dataset: Dataset,
+) -> VirtualDistanceScaleNormalizer | None:
+    """Return the train-fitted virtual-camera log-scale normalizer."""
+
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    if not isinstance(base_dataset, ModelV1Dataset):
+        raise TypeError("Expected a ModelV1Dataset or a torch.utils.data.Subset of one.")
+    return base_dataset.virtual_distance_scale_normalizer
+
+
 def build_scene_input_vector(
     full_scene_vec: torch.Tensor,
     representation: str,
@@ -1063,6 +1768,100 @@ def build_scene_input_vector(
     if table_frame.shape != (7,) or not torch.isfinite(table_frame).all():
         raise ValueError("Derived TableFrame scene vector must be finite 7D.")
     return table_frame
+
+
+def transform_table_frame7_to_virtual_camera(
+    table_frame7_c: torch.Tensor,
+    rotation_n_from_c: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate a camera-frame TableFrame7 into the virtual camera frame.
+
+    The virtual camera shares the real camera origin. A pure rotation therefore
+    changes the two basis vectors while preserving the signed plane distance.
+    The image-only depth scaling matrix is deliberately not applied.
+    """
+
+    frame = torch.as_tensor(table_frame7_c, dtype=torch.float32).flatten()
+    rotation = torch.as_tensor(rotation_n_from_c, dtype=torch.float32)
+    if frame.shape != (7,):
+        raise ValueError(f"table_frame7_c must have shape (7,), got {tuple(frame.shape)}")
+    if rotation.shape != (3, 3):
+        raise ValueError(
+            "rotation_n_from_c must have shape (3, 3), got "
+            f"{tuple(rotation.shape)}"
+        )
+    if not torch.isfinite(frame).all() or not torch.isfinite(rotation).all():
+        raise ValueError("Virtual TableFrame inputs must contain only finite values.")
+    identity = torch.eye(3, dtype=rotation.dtype, device=rotation.device)
+    if not torch.allclose(rotation @ rotation.transpose(0, 1), identity, atol=2e-4):
+        raise ValueError("rotation_n_from_c must be orthonormal.")
+    if not torch.isclose(
+        torch.linalg.det(rotation),
+        rotation.new_tensor(1.0),
+        atol=2e-4,
+    ):
+        raise ValueError("rotation_n_from_c must have determinant +1.")
+
+    e1_n = rotation @ frame[:3]
+    e2_n = rotation @ frame[3:6]
+    result = torch.cat((e1_n, e2_n, frame[6:7]), dim=0)
+    n_n = torch.cross(e1_n, e2_n, dim=0)
+    if (
+        not torch.isfinite(result).all()
+        or abs(float(torch.linalg.vector_norm(e1_n)) - 1.0) > 1e-3
+        or abs(float(torch.linalg.vector_norm(e2_n)) - 1.0) > 1e-3
+        or abs(float(torch.dot(e1_n, e2_n))) > 1e-3
+        or abs(float(torch.linalg.vector_norm(n_n)) - 1.0) > 1e-3
+    ):
+        raise ValueError("Virtual TableFrame7 must remain orthonormal and finite.")
+    return result
+
+
+def build_virtual_camera_pose_table_feature(
+    table_frame7_n: torch.Tensor,
+) -> torch.Tensor:
+    """Return ``[R_6D, t_3D]`` for the virtual camera in table coordinates.
+
+    ``R_6D`` stores the first two columns of ``R_table_from_N``. ``t_3D`` is
+    the N/camera origin in the per-sample table frame, using the same metre
+    scaling as the TableFrame distance component.
+    """
+
+    frame = torch.as_tensor(table_frame7_n, dtype=torch.float32).flatten()
+    if frame.shape != (7,):
+        raise ValueError(
+            "table_frame7_n must have shape (7,), got "
+            f"{tuple(frame.shape)}"
+        )
+    if not torch.isfinite(frame).all():
+        raise ValueError("table_frame7_n must contain only finite values.")
+    e1_n = frame[:3]
+    e2_n = frame[3:6]
+    normal_n = torch.cross(e1_n, e2_n, dim=0)
+    if (
+        abs(float(torch.linalg.vector_norm(e1_n)) - 1.0) > 1e-3
+        or abs(float(torch.linalg.vector_norm(e2_n)) - 1.0) > 1e-3
+        or abs(float(torch.dot(e1_n, e2_n))) > 1e-3
+        or abs(float(torch.linalg.vector_norm(normal_n)) - 1.0) > 1e-3
+    ):
+        raise ValueError("table_frame7_n must contain an orthonormal basis.")
+    rotation_table_from_n = torch.stack((e1_n, e2_n, normal_n), dim=0)
+    rotation_6d = torch.cat(
+        (
+            rotation_table_from_n[:, 0],
+            rotation_table_from_n[:, 1],
+        ),
+        dim=0,
+    )
+    translation_table_m = torch.tensor(
+        [0.0, 0.0, -float(frame[6])],
+        dtype=frame.dtype,
+        device=frame.device,
+    )
+    result = torch.cat((rotation_6d, translation_table_m), dim=0)
+    if result.shape != (9,) or not torch.isfinite(result).all():
+        raise ValueError("Virtual-camera table pose feature must be finite 9D.")
+    return result
 
 
 def get_eye_geometry_normalizer(
@@ -1124,6 +1923,7 @@ def validate_required_columns(
     row: dict[str, str],
     *,
     require_gaze_geometry: bool = False,
+    require_gaze_target_camera: bool = False,
 ) -> None:
     required = [
         "sample_id",
@@ -1142,14 +1942,8 @@ def validate_required_columns(
         "table_origin_w_y_mm",
         "table_origin_w_z_mm",
     ]
-    if require_gaze_geometry:
-        required.extend(
-            [
-                "gaze_cam_recomputed_x_mm",
-                "gaze_cam_recomputed_y_mm",
-                "gaze_cam_recomputed_z_mm",
-            ]
-        )
+    if require_gaze_geometry or require_gaze_target_camera:
+        required.extend(GAZE_TARGET_CAMERA_COLUMNS)
     missing = [
         column
         for column in required + CROP_CAM_COLUMNS + SCENE_COLUMNS

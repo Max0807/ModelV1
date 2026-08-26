@@ -20,12 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from modelv1.processed_artifacts import processed_dataset_artifacts
+from modelv1.depth_prior.pnp import PNP_GEOMETRY_VERSION
 
-DEFAULT_DATASET = PROJECT_ROOT / "data" / "processed" / "modelv1_dataset.csv"
-DEFAULT_OLD_PRIOR = PROJECT_ROOT / "data" / "processed" / "depth_priors_deca_crop_v1.csv"
-DEFAULT_IPD_PRIOR = PROJECT_ROOT / "data" / "processed" / "depth_priors_iris_ipd_65mm_v1.csv"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "processed" / "modelv1_dataset_depth_prior_common.csv"
 EYE_COLUMNS = (
     "left_eye_camera_x_mm", "left_eye_camera_y_mm", "left_eye_camera_z_mm",
     "right_eye_camera_x_mm", "right_eye_camera_y_mm", "right_eye_camera_z_mm",
@@ -36,29 +32,20 @@ TRAINING_IMAGE_FIELDS = ("face_path", "left_eye_path", "right_eye_path")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-csv", type=Path, default=DEFAULT_DATASET)
-    parser.add_argument("--prior-csv", type=Path, nargs="+", default=[DEFAULT_OLD_PRIOR, DEFAULT_IPD_PRIOR])
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--dataset-id", default=None, help="Derive all input/output names from one dataset ID.")
-    parser.add_argument("--processed-dir", type=Path, default=PROJECT_ROOT / "data" / "processed")
+    parser.add_argument("--dataset-csv", type=Path, required=True)
     parser.add_argument(
-        "--prior-kind",
-        choices=("both", "iris_ipd_65mm", "pnp1010"),
-        default="both",
-        help="With --dataset-id, choose which valid prior table(s) define the retained rows.",
+        "--prior-csv",
+        type=Path,
+        nargs="+",
+        required=True,
+        help=(
+            "Versioned prior CSVs to compare, normally one verified pnp1010 "
+            "table and one regenerated iris65 table."
+        ),
     )
+    parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
-    args = parser.parse_args()
-    if args.dataset_id is not None:
-        artifacts = processed_dataset_artifacts(args.dataset_id, args.processed_dir)
-        args.dataset_csv = artifacts.dataset_csv
-        args.prior_csv = {
-            "both": [artifacts.pnp_depth_prior, artifacts.iris_ipd_depth_prior],
-            "iris_ipd_65mm": [artifacts.iris_ipd_depth_prior],
-            "pnp1010": [artifacts.pnp_depth_prior],
-        }[args.prior_kind]
-        args.output = artifacts.common_depth_prior_dataset_csv
-    return args
+    return parser.parse_args()
 
 
 def read_rows(path: Path) -> tuple[list[dict[str, str]], list[str]]:
@@ -71,7 +58,12 @@ def read_rows(path: Path) -> tuple[list[dict[str, str]], list[str]]:
 
 def valid_ids(path: Path) -> set[str]:
     rows, fields = read_rows(path)
-    required = {"sample_id", *EYE_COLUMNS}
+    required = {
+        "sample_id",
+        "pnp_geometry_version",
+        "pnp_min_object_depth_mm",
+        *EYE_COLUMNS,
+    }
     missing = required.difference(fields)
     if missing:
         raise ValueError(f"Prior CSV lacks {sorted(missing)}: {path}")
@@ -80,11 +72,20 @@ def valid_ids(path: Path) -> set[str]:
         status = row.get("depth_prior_status", row.get("status", "success")).strip().lower()
         if status not in VALID_STATUSES:
             continue
+        if row.get("pnp_geometry_version", "").strip() != PNP_GEOMETRY_VERSION:
+            continue
         try:
             values = [float(row[column]) for column in EYE_COLUMNS]
+            min_object_depth = float(row["pnp_min_object_depth_mm"])
         except (TypeError, ValueError):
             continue
-        if all(math.isfinite(value) for value in values):
+        if (
+            all(math.isfinite(value) for value in values)
+            and values[2] > 0.0
+            and values[5] > 0.0
+            and math.isfinite(min_object_depth)
+            and min_object_depth > 0.0
+        ):
             valid.add(row["sample_id"])
     return valid
 
@@ -105,8 +106,6 @@ def write_atomic(path: Path, rows: list[dict[str, str]], fields: list[str]) -> N
 
 def main() -> int:
     args = parse_args()
-    if not args.prior_csv:
-        raise ValueError("Provide at least one --prior-csv file.")
     if args.output.exists() and not args.overwrite:
         raise FileExistsError(f"Output exists: {args.output}. Use --overwrite to replace it.")
     dataset_rows, dataset_fields = read_rows(args.dataset_csv)

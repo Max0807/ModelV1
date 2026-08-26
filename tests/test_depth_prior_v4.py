@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 
 from modelv1.data.depth_prior import DepthPriorTable
+from modelv1.depth_prior.pnp import PNP_GEOMETRY_VERSION
 
 
 class DepthPriorV4Tests(unittest.TestCase):
@@ -15,6 +16,9 @@ class DepthPriorV4Tests(unittest.TestCase):
         row = {
             "sample_id": "dataset/frame",
             "depth_prior_status": "success",
+            "pnp_geometry_version": PNP_GEOMETRY_VERSION,
+            "pnp_min_object_depth_mm": "580",
+            "pnp_tvec_z_mm": "600",
             "left_eye_camera_x_mm": "-30",
             "left_eye_camera_y_mm": "1",
             "left_eye_camera_z_mm": "600",

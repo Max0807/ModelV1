@@ -14,7 +14,6 @@ import csv
 import json
 import os
 import sys
-import zlib
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,16 +26,20 @@ if str(PROJECT_ROOT) not in sys.path:
 from modelv1.depth_prior import (
     CROSSGAZE_CAMERA_MATRIX,
     CROSSGAZE_DIST_COEFFS,
+    CROSSGAZE_IMAGE_HEIGHT_PX,
+    CROSSGAZE_IMAGE_WIDTH_PX,
     DEFAULT_DECA_CROP_SCALE,
     DecaFlameConfig,
     DecaFlameExtractor,
     FACE_PREPROCESS_CHOICES,
     FACE_PREPROCESS_DECA,
     FACE_PREPROCESS_LEGACY,
+    MEDIAPIPE_PNP_LANDMARK_INDICES,
     PnpCamera,
     PnpConfig,
     prepare_deca_face_image,
     solve_pnp_face_depth,
+    validate_crossgaze_image_size,
 )
 from modelv1.processed_artifacts import processed_dataset_artifacts
 
@@ -47,16 +50,7 @@ DEFAULT_OUTPUT_PATH = (
 )
 DEFAULT_FIXED_SCALE_MM_PER_FLAME_UNIT = 1010.0
 
-PNP_LABELS = (
-    "left_eye_outer",
-    "left_eye_inner",
-    "right_eye_inner",
-    "right_eye_outer",
-    "nose_tip",
-    "mouth_left",
-    "mouth_right",
-    "chin",
-)
+PNP_LABELS = tuple(MEDIAPIPE_PNP_LANDMARK_INDICES)
 
 OUTPUT_FIELDS = (
     "sample_id",
@@ -99,6 +93,10 @@ OUTPUT_FIELDS = (
     "pnp_num_points",
     "pnp_inlier_count",
     "pnp_confidence",
+    "pnp_geometry_version",
+    "pnp_solver_method",
+    "pnp_candidate_count",
+    "pnp_min_object_depth_mm",
     "depth_is_plausible",
     "scale_mm_per_flame_unit",
     "outer_scale_mm_per_flame_unit",
@@ -106,15 +104,6 @@ OUTPUT_FIELDS = (
     "outer_flame_distance",
     "inner_flame_distance",
     "scale_disagreement_ratio",
-    "depth_uncertainty_status",
-    "depth_uncertainty_reason",
-    "depth_log_scale_std",
-    "depth_scale_p05",
-    "depth_scale_p50",
-    "depth_scale_p95",
-    "depth_uncertainty_sample_count",
-    "depth_bootstrap_success_count",
-    "depth_jackknife_success_count",
 )
 
 FIELD_TYPES = {
@@ -158,6 +147,10 @@ FIELD_TYPES = {
     "pnp_num_points": "integer",
     "pnp_inlier_count": "integer",
     "pnp_confidence": "float in [0, 1], heuristic quality score",
+    "pnp_geometry_version": "string: versioned PnP geometry contract",
+    "pnp_solver_method": "string: selected OpenCV candidate/refinement",
+    "pnp_candidate_count": "integer: physically valid candidates considered",
+    "pnp_min_object_depth_mm": "float: minimum selected landmark depth, mm",
     "depth_is_plausible": "boolean",
     "scale_mm_per_flame_unit": "float: mm per FLAME unit",
     "outer_scale_mm_per_flame_unit": "float: diagnostic mm per FLAME unit",
@@ -165,15 +158,6 @@ FIELD_TYPES = {
     "outer_flame_distance": "float: FLAME unit",
     "inner_flame_distance": "float: FLAME unit",
     "scale_disagreement_ratio": "float: relative disagreement",
-    "depth_uncertainty_status": "string: success or failed",
-    "depth_uncertainty_reason": "string",
-    "depth_log_scale_std": "float: sample std of common binocular log-depth scale",
-    "depth_scale_p05": "float: empirical common depth-scale 5th percentile",
-    "depth_scale_p50": "float: empirical common depth-scale median",
-    "depth_scale_p95": "float: empirical common depth-scale 95th percentile",
-    "depth_uncertainty_sample_count": "integer",
-    "depth_bootstrap_success_count": "integer",
-    "depth_jackknife_success_count": "integer",
 }
 
 
@@ -242,18 +226,6 @@ def parse_args() -> argparse.Namespace:
         help="Do not use a fixed scale; average the measured inner/outer scales per frame.",
     )
     parser.add_argument("--use-ransac", action="store_true")
-    parser.add_argument(
-        "--uncertainty-bootstrap-samples",
-        type=int,
-        default=64,
-        help="Residual-bootstrap PnP solves per sample (confirmed scheme: 64).",
-    )
-    parser.add_argument(
-        "--uncertainty-seed",
-        type=int,
-        default=42,
-        help="Global deterministic seed mixed with sample_id for PnP bootstrap.",
-    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -388,6 +360,7 @@ def load_deca_face_tensor(
         raise FileNotFoundError(f"Source image does not exist: {source_path}")
     with image_cls.open(source_path) as image:
         source_image = np.asarray(image.convert("RGB"))
+    validate_crossgaze_image_size(source_image.shape[1], source_image.shape[0])
 
     legacy_face_image = None
     if face_preprocess == FACE_PREPROCESS_LEGACY:
@@ -437,19 +410,11 @@ def result_record(
     landmark_csv: Path,
     result: Any,
     crop_transform: Any,
-    uncertainty: Any | None,
-    uncertainty_reason: str,
 ) -> dict[str, Any]:
     record = empty_record(row, "success", "", face_preprocess=crop_transform.mode)
     record["pnp_landmark_csv"] = str(landmark_csv)
     record.update(crop_transform.as_record())
     record.update(result.as_record())
-    if uncertainty is not None:
-        record.update(uncertainty.as_record())
-        record["depth_uncertainty_reason"] = ""
-    else:
-        record["depth_uncertainty_status"] = "failed"
-        record["depth_uncertainty_reason"] = uncertainty_reason
     record["outer_flame_distance"] = float(result.scale.outer_flame_distance)
     record["inner_flame_distance"] = float(result.scale.inner_flame_distance)
 
@@ -512,8 +477,6 @@ def main() -> int:
         raise ValueError("Measured eye distances must be positive")
     if args.deca_crop_scale <= 0:
         raise ValueError("--deca-crop-scale must be positive")
-    if args.uncertainty_bootstrap_samples < 2:
-        raise ValueError("--uncertainty-bootstrap-samples must be at least 2")
 
     metadata_path = args.metadata_output or args.output.with_suffix(
         args.output.suffix + ".metadata.json"
@@ -597,25 +560,18 @@ def main() -> int:
             try:
                 result = solve_pnp_face_depth(
                     image_points_by_label=image_points,
-                    landmarks3d=output.landmarks3d[index].numpy(),
+                    landmarks3d=output.head_local_landmarks3d[index].numpy(),
                     camera=camera,
                     scale_mm_per_flame_unit=scale_for_pnp,
                     outer_eye_distance_mm=args.outer_eye_distance_mm,
                     inner_eye_distance_mm=args.inner_eye_distance_mm,
                     config=pnp_config,
                 )
-                # This legacy PnP exporter provides a point prior only.  Its
-                # former uncertainty helper is not part of the current PnP
-                # implementation, so do not fabricate a depth distribution.
-                uncertainty = None
-                uncertainty_reason = "not generated by the legacy point-prior exporter"
                 records_by_id[row["sample_id"]] = result_record(
                     row,
                     landmark_csv,
                     result,
                     crop_transform,
-                    uncertainty,
-                    uncertainty_reason,
                 )
             except Exception as error:
                 records_by_id[row["sample_id"]] = empty_record(
@@ -635,12 +591,19 @@ def main() -> int:
         "field_types": FIELD_TYPES,
         "coordinate_convention": {
             "input_2d": "Original-image pixels from saved MediaPipe Face Mesh PnP landmarks.",
-            "flame_3d": "DECA-FLAME local coordinates scaled into millimetres before PnP.",
+            "flame_3d": (
+                "DECA-FLAME head-local coordinates with global pose zeroed, "
+                "scaled into millimetres before PnP."
+            ),
             "output_3d": "OpenCV camera coordinates in millimetres.",
         },
         "camera": {
             "camera_matrix": CROSSGAZE_CAMERA_MATRIX,
             "dist_coeffs": CROSSGAZE_DIST_COEFFS,
+            "calibrated_image_size_px": [
+                CROSSGAZE_IMAGE_WIDTH_PX,
+                CROSSGAZE_IMAGE_HEIGHT_PX,
+            ],
         },
         "scale_policy": {
             "mode": "per_frame_measured" if scale_for_pnp is None else "fixed",
@@ -650,15 +613,17 @@ def main() -> int:
         },
         "pnp": {
             "use_ransac": args.use_ransac,
-            "model": "OpenCV solvePnP iterative",
-        },
-        "depth_uncertainty": {
-            "method": "centered image-residual bootstrap plus leave-one-landmark-out jackknife",
-            "bootstrap_samples": args.uncertainty_bootstrap_samples,
-            "seed": args.uncertainty_seed,
-            "quantity": "common binocular log-depth scale around the fixed-scale PnP solution",
-            "uses_depth_gt": False,
-            "uses_uv_gt": False,
+            "model": "physical multistart ITERATIVE/EPNP/SQPNP solvePnP",
+            "selection": "all landmarks in front; minimum mean reprojection error",
+            "hard_acceptance": {
+                "origin_depth_mm": [
+                    pnp_config.min_plausible_depth_mm,
+                    pnp_config.max_plausible_depth_mm,
+                ],
+                "reprojection_error_mean_px_max": pnp_config.max_reprojection_error_mean_px,
+                "reprojection_error_max_px_max": pnp_config.max_reprojection_error_max_px,
+                "scale_disagreement_ratio_max": pnp_config.max_scale_disagreement_ratio,
+            },
         },
         "deca": {
             "root": str(args.deca_root.resolve()),
@@ -670,10 +635,7 @@ def main() -> int:
                 "when face_preprocess=deca; float32 pixels in [0, 1]"
             ),
         },
-        "uncertainty_note": (
-            "pnp_confidence remains a heuristic quality score. "
-            "depth_log_scale_std is an empirical, label-free PnP perturbation estimate."
-        ),
+        "quality_note": "pnp_confidence is a bounded heuristic, not a calibrated probability.",
     }
     write_csv_atomic(args.output, records)
     write_json_atomic(metadata_path, metadata)

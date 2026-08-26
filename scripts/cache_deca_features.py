@@ -14,7 +14,9 @@ import hashlib
 import importlib
 import json
 import os
+import pickle
 import sys
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -240,6 +242,25 @@ def load_encoder(deca_root: Path, checkpoint: Path, device: str, torch: Any) -> 
         checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=True)
     except TypeError:  # PyTorch before the weights_only argument
         checkpoint_data = torch.load(checkpoint, map_location="cpu")
+    except pickle.UnpicklingError as exc:
+        canonical_checkpoint = (deca_root / "data" / "deca_model.tar").resolve()
+        if checkpoint.resolve() != canonical_checkpoint:
+            raise RuntimeError(
+                "The custom DECA checkpoint cannot be loaded with "
+                "weights_only=True. Refusing an automatic legacy-pickle fallback "
+                f"for an untrusted custom checkpoint: {checkpoint}"
+            ) from exc
+        warnings.warn(
+            "The canonical DECA checkpoint uses a legacy serialization format "
+            "that PyTorch's weights_only loader cannot read. Falling back to the "
+            "official DECA full-checkpoint loading mode for this repository-local file.",
+            RuntimeWarning,
+        )
+        checkpoint_data = torch.load(
+            checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
     if not isinstance(checkpoint_data, dict) or "E_flame" not in checkpoint_data:
         raise ValueError(f"Checkpoint lacks the expected E_flame state dict: {checkpoint}")
     result = encoder.load_state_dict(checkpoint_data["E_flame"], strict=True)

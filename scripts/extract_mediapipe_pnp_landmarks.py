@@ -20,6 +20,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modelv1.depth_prior.dataset_assets import resolve_image_asset_path
+from modelv1.depth_prior.pnp import (
+    MEDIAPIPE_PNP_LANDMARK_INDICES,
+    validate_crossgaze_image_size,
+)
 from modelv1.processed_artifacts import processed_dataset_artifacts
 
 
@@ -30,18 +34,10 @@ DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "processed" / "mediapipe_pnp_landmarks.
 # are image-right. They are not anatomical subject-left/subject-right labels.
 # Consumers that produce anatomical left/right eye outputs must swap the two
 # groups, as the virtual-camera generator does.
-LANDMARK_INDICES = {
-    "left_eye_outer": 33,
-    "left_eye_inner": 133,
-    "right_eye_inner": 362,
-    "right_eye_outer": 263,
-    "nose_tip": 1,
-    "mouth_left": 61,
-    "mouth_right": 291,
-    "chin": 152,
-}
+LANDMARK_INDICES = MEDIAPIPE_PNP_LANDMARK_INDICES
 FIELDS = (
     "sample_id", "dataset", "image_name", "source_image_path", "status", "reason",
+    "image_width_px", "image_height_px",
     *(f"{label}_{axis}" for label in LANDMARK_INDICES for axis in ("x", "y")),
 )
 
@@ -83,10 +79,13 @@ def main() -> int:
                 image_path = resolve_image_asset_path(row, "source_image_path", args.image_root)
                 with Image.open(image_path) as image:
                     rgb = np.asarray(image.convert("RGB"))
+                height, width = rgb.shape[:2]
+                record["image_width_px"] = width
+                record["image_height_px"] = height
+                validate_crossgaze_image_size(width, height)
                 result = face_mesh.process(rgb)
                 if not result.multi_face_landmarks:
                     raise RuntimeError("MediaPipe Face Mesh found no face")
-                height, width = rgb.shape[:2]
                 landmarks = result.multi_face_landmarks[0].landmark
                 for label, landmark_index in LANDMARK_INDICES.items():
                     point = landmarks[landmark_index]

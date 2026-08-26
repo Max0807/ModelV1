@@ -1,19 +1,18 @@
 """Generate shared virtual-camera face/eye images without touching old data.
 
-Example (small smoke run)::
+Example (small verified-PnP smoke run)::
 
     python scripts/generate_virtual_camera_normalized_images.py \
-        --dataset-csv data/processed/modelv1_dataset3.csv \
-                      data/processed/modelv1_dataset4.csv \
-        --depth-prior-csv data/processed/depth_priors_deca_crop_v1.csv \
-        --landmark-csv data/processed/mediapipe_pnp_landmarks_3.csv \
-                       data/processed/mediapipe_pnp_landmarks_4.csv \
+        --dataset-csv data/validation_stage1/modelv1_dataset11.csv \
+        --depth-prior-csv data/manual_stage2/depth_priors_pnp_v2_dataset11.csv \
+        --landmark-csv data/manual_stage2/mediapipe_pnp_landmarks_v2_dataset11.csv \
+        --output-root data/manual_stage3/virtual_camera_pnp_v2_dataset11_smoke \
         --limit-per-dataset 5
 
-The default output root is
-``data/processed/virtual_camera_v2_anatomical_eyes``. Existing files are never
-overwritten unless ``--overwrite`` is explicitly supplied. Version 2 uses
-anatomical subject-left/subject-right eye directory semantics.
+Input and output paths are mandatory so a formal run cannot silently fall back
+to an unversioned historical PnP table or virtual-camera directory. Existing
+files are never overwritten unless ``--overwrite`` is explicitly supplied.
+Version 2 uses anatomical subject-left/subject-right eye directory semantics.
 """
 
 from __future__ import annotations
@@ -45,14 +44,9 @@ from modelv1.data.virtual_camera import (  # noqa: E402
 from modelv1.depth_prior import (  # noqa: E402
     CROSSGAZE_CAMERA_MATRIX,
     CROSSGAZE_DIST_COEFFS,
-)
-
-
-DEFAULT_OUTPUT_ROOT = (
-    PROJECT_ROOT / "data" / "processed" / "virtual_camera_v2_anatomical_eyes"
-)
-DEFAULT_DEPTH_PRIOR_CSV = (
-    PROJECT_ROOT / "data" / "processed" / "depth_priors_deca_crop_v1.csv"
+    PNP_GEOMETRY_VERSION,
+    PnpConfig,
+    validate_crossgaze_image_size,
 )
 
 
@@ -70,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--depth-prior-csv",
         type=Path,
-        default=DEFAULT_DEPTH_PRIOR_CSV,
-        help="CSV containing successful PnP rotation and tvec columns.",
+        required=True,
+        help="Verified, versioned CSV containing successful PnP rotation and tvec columns.",
     )
     parser.add_argument(
         "--landmark-csv",
@@ -80,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="One or more MediaPipe PnP landmark CSVs containing eye canthi.",
     )
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--face-width", type=int, default=224)
     parser.add_argument("--face-height", type=int, default=224)
     parser.add_argument("--virtual-focal-length-px", type=float, default=480.0)
@@ -146,11 +140,54 @@ def rotation_from_depth_row(row: dict[str, str]) -> np.ndarray:
 
 
 def center_from_depth_row(row: dict[str, str]) -> np.ndarray:
-    # Initial infrastructure intentionally uses the face-origin tvec from PnP.
+    # The metric FLAME head-local origin transformed by PnP is the one and only
+    # virtual-camera normalization centre.
     return np.array(
         [finite_float(row, f"tvec_{axis}_mm") for axis in "xyz"],
         dtype=np.float64,
     )
+
+
+def validate_depth_row_for_normalization(
+    row: dict[str, str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Enforce the versioned, front-facing PnP contract before image warping."""
+
+    version = row.get("pnp_geometry_version", "").strip()
+    if version != PNP_GEOMETRY_VERSION:
+        raise ValueError(
+            "pnp_geometry_version_mismatch:"
+            f"expected={PNP_GEOMETRY_VERSION},actual={version or 'missing'}"
+        )
+    if finite_float(row, "pnp_min_object_depth_mm") <= 0.0:
+        raise ValueError("pnp_landmarks_not_in_front")
+    thresholds = PnpConfig()
+    center = center_from_depth_row(row)
+    face_depth = center[2]
+    if not (
+        thresholds.min_plausible_depth_mm
+        <= face_depth
+        <= thresholds.max_plausible_depth_mm
+    ):
+        raise ValueError("pnp_face_origin_depth_implausible")
+    for side in ("left", "right"):
+        if finite_float(row, f"{side}_eye_camera_z_mm") <= 0.0:
+            raise ValueError(f"pnp_{side}_eye_not_in_front")
+    mean_error = finite_float(row, "reprojection_error_mean_px")
+    max_error = finite_float(row, "reprojection_error_max_px")
+    scale_disagreement = finite_float(row, "scale_disagreement_ratio")
+    if mean_error > thresholds.max_reprojection_error_mean_px:
+        raise ValueError("pnp_mean_reprojection_error_too_large")
+    if max_error > thresholds.max_reprojection_error_max_px:
+        raise ValueError("pnp_max_reprojection_error_too_large")
+    if scale_disagreement > thresholds.max_scale_disagreement_ratio:
+        raise ValueError("pnp_scale_disagreement_too_large")
+    rotation = rotation_from_depth_row(row)
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5):
+        raise ValueError("pnp_rotation_not_orthonormal")
+    if not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5):
+        raise ValueError("pnp_rotation_not_proper")
+    return rotation, center
 
 
 def eye_corners_from_landmark_row(
@@ -339,6 +376,7 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
             "normalization_status": "failed",
             "normalization_reason": "",
             "center_source": "pnp_tvec",
+            "pnp_geometry_version": PNP_GEOMETRY_VERSION,
             "eye_side_semantics": "anatomical_subject_left_right",
             "landmark_eye_side_conversion": "legacy_image_side_to_anatomical",
         }
@@ -352,6 +390,9 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
             depth_status = depth_row.get("depth_prior_status", depth_row.get("status", ""))
             if depth_status.strip().lower() != "success":
                 raise ValueError(f"invalid_depth_prior_status:{depth_status or 'missing'}")
+            rotation_camera_from_head, face_center_camera_mm = (
+                validate_depth_row_for_normalization(depth_row)
+            )
             if landmark_row.get("status", "").strip().lower() != "success":
                 raise ValueError(
                     "invalid_landmark_status:"
@@ -360,10 +401,11 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
 
             source_path = choose_source_image(dataset_row, landmark_row, depth_row)
             source_image = read_image(source_path)
+            validate_crossgaze_image_size(source_image.shape[1], source_image.shape[0])
             transform = build_virtual_camera_transform(
                 calibration=calibration,
-                head_rotation_camera_from_head=rotation_from_depth_row(depth_row),
-                face_center_camera_mm=center_from_depth_row(depth_row),
+                head_rotation_camera_from_head=rotation_camera_from_head,
+                face_center_camera_mm=face_center_camera_mm,
                 config=virtual_config,
             )
             left_source, right_source = eye_corners_from_landmark_row(landmark_row)
@@ -391,12 +433,12 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
                     "eye_width": eye_config.output_width,
                     "eye_height": eye_config.output_height,
                     "eye_span_scale": eye_config.horizontal_span_scale,
-                    "pnp_reprojection_error_mean_px": depth_row.get(
-                        "reprojection_error_mean_px", ""
-                    ),
-                    "pnp_reprojection_error_max_px": depth_row.get(
-                        "reprojection_error_max_px", ""
-                    ),
+                    "pnp_reprojection_error_mean_px": depth_row[
+                        "reprojection_error_mean_px"
+                    ],
+                    "pnp_reprojection_error_max_px": depth_row[
+                        "reprojection_error_max_px"
+                    ],
                     "pnp_confidence": depth_row.get("pnp_confidence", ""),
                     **transform.as_record(),
                     **point_record(
@@ -433,6 +475,21 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
         "landmark_csvs": [str(path.resolve()) for path in args.landmark_csv],
         "output_root": str(output_root),
         "center_source": "pnp_tvec",
+        "pnp_geometry_version": PNP_GEOMETRY_VERSION,
+        "pnp_quality_policy": {
+            "hard_filter": [
+                "depth_prior_status=success",
+                "matching pnp_geometry_version",
+                "positive face-origin and landmark depths",
+                "positive left/right eye depths",
+                "proper orthonormal rotation",
+                "mean/max reprojection error <= 8/20 px",
+                "inner/outer eye scale disagreement <= 0.25",
+            ],
+            "diagnostic_only": [
+                "pnp_confidence",
+            ],
+        },
         "eye_side_semantics": "anatomical_subject_left_right",
         "landmark_eye_side_conversion": "legacy_image_side_to_anatomical",
         "shared_virtual_camera": True,

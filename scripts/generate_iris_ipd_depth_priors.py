@@ -32,9 +32,12 @@ from modelv1.depth_prior import (
     DecaFlameConfig,
     DecaFlameExtractor,
     PnpCamera,
+    PNP_GEOMETRY_VERSION,
+    MEDIAPIPE_PNP_LANDMARK_INDICES,
     compute_eye_canthus_midpoints,
     prepare_deca_face_image,
     solve_pnp_face_depth,
+    validate_crossgaze_image_size,
 )
 from modelv1.depth_prior.eye_proxy_validation import (
     detect_iris_centres_rgb,
@@ -61,7 +64,15 @@ FIELDS = (
     "measured_ipd_mm", "iris_left_group", "iris_right_group", "iris_assignment_cost_px",
     "iris_baseline_residual_mm", "iris_ray_system_condition",
     "pnp_reprojection_error_mean_px", "pnp_reprojection_error_max_px",
+    "reprojection_error_mean_px", "reprojection_error_max_px",
     "pnp_rvec_x_rad", "pnp_rvec_y_rad", "pnp_rvec_z_rad",
+    "pnp_tvec_x_mm", "pnp_tvec_y_mm", "pnp_tvec_z_mm",
+    "pnp_rotation_00", "pnp_rotation_01", "pnp_rotation_02",
+    "pnp_rotation_10", "pnp_rotation_11", "pnp_rotation_12",
+    "pnp_rotation_20", "pnp_rotation_21", "pnp_rotation_22",
+    "pnp_geometry_version", "pnp_solver_method", "pnp_candidate_count",
+    "pnp_min_object_depth_mm", "pnp_num_points", "pnp_inlier_count",
+    "pnp_confidence", "pnp_scale_disagreement_ratio", "scale_disagreement_ratio",
     "pnp_scale_mm_per_flame_unit", "fixed_shape_calibration_count",
     "depth_uncertainty_status", "depth_uncertainty_reason",
     "depth_log_scale_std", "depth_scale_p05", "depth_scale_p50",
@@ -77,10 +88,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-id", default=None, help="Derive dataset, iris, and output paths from one dataset ID.")
     parser.add_argument("--processed-dir", type=Path, default=PROJECT_ROOT / "data" / "processed")
     parser.add_argument("--ipd-mm", type=float, default=65.0)
-    parser.add_argument("--max-ipd-residual-mm", type=float, default=3.0)
+    parser.add_argument("--max-ipd-residual-mm", type=float, default=4.0)
     parser.add_argument("--max-ray-condition", type=float, default=250.0)
     parser.add_argument("--pnp-scale-mm-per-flame-unit", type=float, default=1010.0)
-    parser.add_argument("--calibration-dataset", default="dataset_dual_rigid_body_3")
+    parser.add_argument("--calibration-dataset")  # , default="dataset_dual_rigid_body_3")
     parser.add_argument("--calibration-start", type=int, default=129)
     parser.add_argument("--calibration-stop", type=int, default=231)
     parser.add_argument(
@@ -192,7 +203,7 @@ def read_pnp_points(
     item = cache[path].get(row["image_name"])
     if item is None or item.get("status") != "success":
         raise RuntimeError("No successful saved MediaPipe PnP observation.")
-    labels = ("left_eye_outer", "left_eye_inner", "right_eye_inner", "right_eye_outer", "nose_tip", "mouth_left", "mouth_right", "chin")
+    labels = tuple(MEDIAPIPE_PNP_LANDMARK_INDICES)
     return {label: (float(item[f"{label}_x"]), float(item[f"{label}_y"])) for label in labels}
 
 
@@ -210,6 +221,7 @@ def load_deca_input(
     source_image_path = resolve_image_asset_path(row, "source_image_path", image_root)
     with image_cls.open(source_image_path) as image:
         source = np.asarray(image.convert("RGB"))
+    validate_crossgaze_image_size(source.shape[1], source.shape[0])
     legacy = None
     if face_preprocess != FACE_PREPROCESS_DECA:
         face_path = resolve_image_asset_path(row, "face_path", image_root)
@@ -504,7 +516,7 @@ def main() -> int:
             if args.trace_stages:
                 print(f"[{index}/{len(processing_rows)}] DECA inference", flush=True)
             output = extractor.extract(tensor, fixed_shape_params=fixed_shape)
-            landmarks = output.landmarks3d[0].numpy()
+            landmarks = output.head_local_landmarks3d[0].numpy()
             if args.trace_stages:
                 print(f"[{index}/{len(processing_rows)}] saved PnP points + solvePnP", flush=True)
             pnp_points = read_pnp_points(row, pnp_cache, args.pnp_landmark_csv)
@@ -539,7 +551,23 @@ def main() -> int:
                 "measured_ipd_mm": args.ipd_mm, "iris_left_group": assigned["left_group"], "iris_right_group": assigned["right_group"], "iris_assignment_cost_px": assigned["assignment_cost_px"],
                 "iris_baseline_residual_mm": result.baseline_residual_mm, "iris_ray_system_condition": result.ray_system_condition,
                 "pnp_reprojection_error_mean_px": pnp.reprojection_error_mean_px, "pnp_reprojection_error_max_px": pnp.reprojection_error_max_px,
+                # Unprefixed aliases implement DepthPriorTable's shared PnP-quality contract.
+                "reprojection_error_mean_px": pnp.reprojection_error_mean_px, "reprojection_error_max_px": pnp.reprojection_error_max_px,
                 "pnp_rvec_x_rad": float(pnp.rvec[0]), "pnp_rvec_y_rad": float(pnp.rvec[1]), "pnp_rvec_z_rad": float(pnp.rvec[2]),
+                "pnp_tvec_x_mm": float(pnp.tvec_mm[0]), "pnp_tvec_y_mm": float(pnp.tvec_mm[1]), "pnp_tvec_z_mm": float(pnp.tvec_mm[2]),
+                **{
+                    f"pnp_rotation_{r}{c}": float(pnp.rotation_matrix[r, c])
+                    for r in range(3) for c in range(3)
+                },
+                "pnp_geometry_version": PNP_GEOMETRY_VERSION,
+                "pnp_solver_method": pnp.pnp_solver_method,
+                "pnp_candidate_count": pnp.pnp_candidate_count,
+                "pnp_min_object_depth_mm": pnp.pnp_min_object_depth_mm,
+                "pnp_num_points": pnp.pnp_num_points,
+                "pnp_inlier_count": pnp.pnp_inlier_count,
+                "pnp_confidence": pnp.pnp_confidence,
+                "pnp_scale_disagreement_ratio": pnp.scale.scale_disagreement_ratio,
+                "scale_disagreement_ratio": pnp.scale.scale_disagreement_ratio,
                 "pnp_scale_mm_per_flame_unit": args.pnp_scale_mm_per_flame_unit, "fixed_shape_calibration_count": len(calibration_rows),
             })
             if args.estimate_depth_uncertainty:
@@ -574,7 +602,13 @@ def main() -> int:
             "count": len(calibration_rows),
             "missing_frame_indices": missing_calibration_indices,
         },
-        "pnp": {"role": "head rotation and canthus direction only", "scale_mm_per_flame_unit": args.pnp_scale_mm_per_flame_unit},
+        "pnp": {
+            "role": "head rotation, face origin, and canthus direction",
+            "geometry_version": PNP_GEOMETRY_VERSION,
+            "flame_frame": "head-local with DECA global pose zeroed",
+            "selection": "physical multistart, all landmarks in front, minimum mean reprojection error",
+            "scale_mm_per_flame_unit": args.pnp_scale_mm_per_flame_unit,
+        },
         "depth_uncertainty": {
             "enabled": args.estimate_depth_uncertainty,
             "method": "centered PnP reprojection-residual bootstrap plus Gaussian iris-centre perturbation",

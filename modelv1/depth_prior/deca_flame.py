@@ -15,11 +15,6 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DECA_ROOT = PROJECT_ROOT / "DECA-master"
 
-# These are the FLAME vertex ids used by the existing CrossGaze baseline.
-FLAME_LEFT_EYE_CENTER_VERTEX = 3933
-FLAME_RIGHT_EYE_CENTER_VERTEX = 3930
-
-
 class DecaFlameDependencyError(RuntimeError):
     """Raised when the local official DECA dependency is unavailable."""
 
@@ -37,8 +32,6 @@ class DecaFlameConfig:
     pretrained_model_path: Path | str | None = None
     device: str | None = None
     image_size: int = 224
-    left_eye_vertex_index: int = FLAME_LEFT_EYE_CENTER_VERTEX
-    right_eye_vertex_index: int = FLAME_RIGHT_EYE_CENTER_VERTEX
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "deca_root", Path(self.deca_root).resolve())
@@ -50,31 +43,28 @@ class DecaFlameConfig:
             )
         if self.image_size <= 0:
             raise ValueError("image_size must be positive")
-        if self.left_eye_vertex_index < 0 or self.right_eye_vertex_index < 0:
-            raise ValueError("eye vertex indices must be non-negative")
 
 
 @dataclass(frozen=True)
 class DecaFlameOutput:
     """DECA-FLAME geometry in FLAME local coordinates.
 
-    The tensors have batch-first layout. ``vertices`` is normally
-    ``[B, 5023, 3]`` and ``landmarks3d`` is normally ``[B, 68, 3]``.
-    ``landmarks2d`` is FLAME's dynamic 2D landmark set, but its values are
-    still 3D FLAME-local coordinates. None of these outputs are camera-space
-    coordinates or millimetres yet.
+    ``head_local_landmarks3d`` has shape ``[B, 68, 3]`` and is evaluated with
+    DECA's global head rotation zeroed while retaining shape, expression, and
+    jaw pose. It is the only landmark set that may be passed to solvePnP.
+    These values are not camera-space coordinates or millimetres yet.
+
+    The former full mesh, globally posed landmarks, and two hard-coded eye
+    vertices were removed because no ModelV1 consumer used them and the extra
+    FLAME forward pass could accidentally reintroduce posed object points.
     """
 
-    vertices: Any
-    landmarks2d: Any
-    landmarks3d: Any
-    left_eye_vertex: Any
-    right_eye_vertex: Any
+    head_local_landmarks3d: Any
     parameters: Any
 
     @property
     def batch_size(self) -> int:
-        return int(self.vertices.shape[0])
+        return int(self.head_local_landmarks3d.shape[0])
 
 
 def _require_torch() -> Any:
@@ -205,6 +195,25 @@ def _split_deca_parameters(parameters: Any, param_sizes: dict[str, int]) -> dict
     return dict(zip(ordered_names, values))
 
 
+def head_local_pose_parameters(pose_parameters: Any) -> Any:
+    """Copy a DECA pose and remove only its global head rotation.
+
+    The remaining jaw pose is part of the non-rigid landmark configuration;
+    solvePnP must estimate the removed global rotation from 2D observations.
+    """
+
+    torch = _require_torch()
+    pose = torch.as_tensor(pose_parameters)
+    if pose.ndim != 2 or pose.shape[1] < 6:
+        raise ValueError(
+            "DECA pose parameters must have shape [B, >=6], got "
+            f"{tuple(pose.shape)}"
+        )
+    local_pose = pose.clone()
+    local_pose[:, :3] = 0.0
+    return local_pose
+
+
 class DecaFlameExtractor:
     """Run official DECA and FLAME once for each aligned face crop.
 
@@ -316,27 +325,14 @@ class DecaFlameExtractor:
                         f"the image batch size {images.shape[0]}."
                     )
                 code_dict["shape"] = fixed_shape
-            vertices, landmarks2d, landmarks3d = self.flame(
+            head_local_pose = head_local_pose_parameters(code_dict["pose"])
+            _, _, head_local_landmarks3d = self.flame(
                 shape_params=code_dict["shape"],
                 expression_params=code_dict["exp"],
-                pose_params=code_dict["pose"],
-            )
-
-        max_vertex_index = max(
-            self.config.left_eye_vertex_index,
-            self.config.right_eye_vertex_index,
-        )
-        if vertices.shape[1] <= max_vertex_index:
-            raise ValueError(
-                "Configured eye vertex index is outside the FLAME mesh: "
-                f"mesh has {vertices.shape[1]} vertices, required {max_vertex_index}."
+                pose_params=head_local_pose,
             )
 
         return DecaFlameOutput(
-            vertices=vertices.detach().cpu(),
-            landmarks2d=landmarks2d.detach().cpu(),
-            landmarks3d=landmarks3d.detach().cpu(),
-            left_eye_vertex=vertices[:, self.config.left_eye_vertex_index, :].detach().cpu(),
-            right_eye_vertex=vertices[:, self.config.right_eye_vertex_index, :].detach().cpu(),
+            head_local_landmarks3d=head_local_landmarks3d.detach().cpu(),
             parameters=parameters.detach().cpu(),
         )

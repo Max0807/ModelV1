@@ -30,21 +30,14 @@ PyTorch，以及本地 DECA 项目依赖列表中的其他包。
 
 1. 官方 DECA 的 `ResnetEncoder` 从人脸图像预测参数向量。
 2. 参数向量被拆分为形状、纹理、表情、姿态、相机和光照参数。
-3. 官方 `FLAME` Layer 接收形状、表情和姿态参数，输出人脸网格与关键点。
-4. 保留当前 CrossGaze 基线的两个网格顶点代理：`3933` 与 `3930`，仅用于
-   兼容性诊断；它们不再用于 PnP 的双眼参考点输出。
+3. 将 DECA 姿态向量的全局头部旋转前三维清零，但保留下颌姿态。
+4. 官方 `FLAME` Layer 输出头部局部坐标系中的 68 个三维关键点。
 
 ### 输出
 
 输出为 `DecaFlameOutput`，其中所有张量均已从计算图分离并迁移到 CPU：
 
-- `vertices`：通常为 `[B, 5023, 3]`，完整 FLAME 人脸网格顶点。
-- `landmarks3d`：通常为 `[B, 68, 3]`，68 个三维人脸关键点。
-- `landmarks2d`：官方 FLAME Layer 返回的动态二维关键点集合。其坐标值仍是
-  FLAME 局部三维坐标，并不是图像像素坐标；需要结合 DECA 的弱透视相机参数
-  才能叠加到 `224x224` Face 图上。
-- `left_eye_vertex`、`right_eye_vertex`：均为 `[B, 3]`，旧基线的网格顶点代理，
-  不应视为已验证的解剖学眼球中心。
+- `head_local_landmarks3d`：`[B, 68, 3]`，允许进入 PnP 的唯一三维点集。
 - `parameters`：原始 DECA 参数向量，用于调试和追溯。
 
 这些输出都处于 FLAME 局部坐标系，单位仍然是 FLAME unit；它们既不是
@@ -57,7 +50,7 @@ PyTorch，以及本地 DECA 项目依赖列表中的其他包。
 - `image_points_by_label`：检测到的二维像素关键点。默认键为
   `left_eye_outer`、`left_eye_inner`、`right_eye_inner`、
   `right_eye_outer`、`nose_tip`、`mouth_left`、`mouth_right`、`chin`。
-- `landmarks3d` 中的一条 `[68, 3]` 数据。
+- `head_local_landmarks3d` 中的一条 `[68, 3]` 数据。
 - `PnpCamera`：标定后的相机内参矩阵 `K` 和畸变系数。
 - 真实测量的眼角距离，或经独立验证后选定的固定尺度。
 
@@ -68,9 +61,8 @@ PyTorch，以及本地 DECA 项目依赖列表中的其他包。
    外眼角距离 `105.0 mm`，内眼角距离 `38.0 mm`。
 3. 构建默认的 2D-3D 对应关系，所用 FLAME 68 点索引为
    `36, 39, 42, 45, 30, 48, 54, 8`。
-4. 使用 OpenCV 的 `solvePnP` 求解投影模型 `s p = K [R|t] P` 中的旋转
-   `R` 和平移 `t`。
-5. 计算图像左眼 `FLAME[36, 39]` 与图像右眼 `FLAME[42, 45]` 的内外眼角
+4. 分别使用 ITERATIVE、EPNP、SQPNP 初始化，细化正深度候选并选择最低重投影误差解。
+5. 计算人物解剖左眼 `FLAME[42, 45]` 与解剖右眼 `FLAME[36, 39]` 的内外眼角
    三维中点，并用下式变换到相机坐标系：
    `X_camera_mm = R * (scale_mm_per_flame_unit * X_flame) + t_mm`。
 6. 将求得的三维点重新投影到图像，计算拟合质量指标。
@@ -79,7 +71,7 @@ PyTorch，以及本地 DECA 项目依赖列表中的其他包。
 
 输出为 `PnpFaceDepthResult`：
 
-- `left_eye_camera_xyz_mm [3]` 和 `right_eye_camera_xyz_mm [3]`：图像左/右眼的
+- `left_eye_camera_xyz_mm [3]` 和 `right_eye_camera_xyz_mm [3]`：人物解剖左/右眼的
   内外眼角三维中点在相机坐标系中的毫米坐标。字段名为兼容训练数据而保留；它们是
   gaze reference point，不应直接解释为解剖学眼球中心。
 - `face_depth_z_mm [1]`：`tvec_mm` 的 z 分量，即 FLAME 人脸局部原点的
@@ -94,8 +86,7 @@ PyTorch，以及本地 DECA 项目依赖列表中的其他包。
 
 ```text
 对齐后的人脸图像 --> DecaFlameExtractor
-                         |-- landmarks3d [68, 3]
-                         |-- vertices [5023, 3]
+                         |-- head_local_landmarks3d [68, 3]
 二维人脸关键点 ----------+
 相机内参与畸变参数 -------+--> solve_pnp_face_depth
 真实人脸尺度信息 ---------+         |-- left_eye_camera_xyz_mm
@@ -121,8 +112,7 @@ deca_output = deca.extract(face_batch_rgb_224)
 
 result = solve_pnp_face_depth(
     image_points_by_label=detected_2d_landmarks,
-    landmarks3d=deca_output.landmarks3d[0].numpy(),
-    vertices=deca_output.vertices[0].numpy(),
+    landmarks3d=deca_output.head_local_landmarks3d[0].numpy(),
     camera=PnpCamera.crossgaze_default(),
 )
 record = result.as_record()

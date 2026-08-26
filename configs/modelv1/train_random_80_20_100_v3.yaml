@@ -1,6 +1,6 @@
 experiment:
   run_name: null
-  description: "V3：使用VGGFace2预训练Inception-ResNet V1提取人脸空间特征，并以双眼token为Query、人脸token为Key/Value进行交叉注意力融合。"
+  description: "V3 H5+F1：眼图使用90x56输入、小目标3x3 stride-2 stem、无MaxPool、多尺度FPN 4x6 token；face图像分支使用Inception-ResNet V1 F1 padded mixed_7a，输出4x4 face token后与双眼token做CrossAttention。"
   diary_enabled: true
   diary_path: experiments/experiment_diary.md
   output_dir: outputs
@@ -22,6 +22,8 @@ data:
   num_workers: 0
   pin_memory: true
   normalize_images: true
+  # Eye size is (width, height). The tensor presented to the encoder is [B, 3, 56, 90].
+  eye_image_size: [90, 56]
   # V3必须读取CSV中的face_path图像；DataLoader会缩放到160x160。
   load_face_image: true
 
@@ -39,8 +41,10 @@ model:
   use_face_image: true
   # VGGFace2预训练的Inception-ResNet V1固定作为人脸骨干。
   freeze_face_image_backbone: false
+  # F1: pad mixed_7a downsampling so 160x160 face maps keep a 4x4 token grid.
+  face_feature_mode: padded_mixed7a_4x4
 
-  # 双眼图像分支，保持V2.2设置。
+  # 双眼图像分支：降级/固定为H5，不启用H6 binocular self-attention或H7 iris auxiliary。
   eye_embedding_dim: 128
   per_eye_embedding_dim: 96
   eye_backbone: resnet18
@@ -53,6 +57,19 @@ model:
   visual_attention_heads: 8
   visual_attention_ffn_dim: 256
   visual_attention_dropout: 0.1
+  use_binocular_self_attention: false
+  binocular_attention_heads: 4
+  binocular_attention_dropout: 0.1
+  use_eye_iris_auxiliary: false
+  eye_iris_auxiliary_feature_stage: layer3
+  eye_iris_auxiliary_hidden_channels: 128
+  visual_token_pooling: mean
+  visual_token_pooling_hidden_dim: 64
+  visual_token_pooling_dropout: 0.1
+  # H5: 3x3 stride-2 stem, no MaxPool; multiscale FPN aligns layer2/3/4 to 4x6.
+  eye_stem_mode: small_3x3_s2_no_maxpool
+  eye_feature_mode: multiscale_fpn24
+  eye_token_grid: [4, 6]
 
   crop_cam_dim: 36
   use_crop_cam: false
@@ -109,4 +126,4 @@ logging:
     project: ModelV1_random_80_20_V3
     entity: null
     mode: online
-    tags: [ModelV1, V3, deca_geometry156, deca_factorized_geometry, face_image_inception_resnet_v1_vggface2, face_eye_cross_attention, scene_table_frame7, no_crop_cam, eye_geometry_raw_eye6d, quality_gate, random_80_20]
+    tags: [ModelV1, V3, H5, F1, eye_input_90x56, eye_tokens_4x6, small_3x3_s2_no_maxpool, multiscale_fpn24, face_tokens_4x4, padded_mixed7a_4x4, deca_geometry156, face_image_inception_resnet_v1_vggface2, face_eye_cross_attention, scene_table_frame7, no_crop_cam, eye_geometry_raw_eye6d, quality_gate, random_80_20]

@@ -342,7 +342,7 @@ def build_virtual_camera_transform(
         raise ValueError("face_center_camera_mm must lie in front of the camera (+z).")
 
     z_axis_camera = center_camera / center_distance
-    head_x_axis_camera = rotation_camera_from_head[:, 0]
+    head_x_axis_camera = rotation_camera_from_head[:, 0]  # 头部局部坐标系 H 的 +X 轴，在相机坐标系 C 中的方向。
     y_axis_camera_raw = np.cross(z_axis_camera, head_x_axis_camera)
     if np.linalg.norm(y_axis_camera_raw) <= 1e-7:
         # Only relevant for an extreme/degenerate head pose. Choose the camera

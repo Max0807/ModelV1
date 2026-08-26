@@ -5,12 +5,21 @@ __all__ = [
     "InceptionResnetFaceEncoder",
     "ModelV1",
     "ModelV1Config",
+    "ProbabilisticEyeKeypointHead",
+    "ProbabilisticEyeLandmarkHead",
+    "ProbabilisticLandmarkTokenizer",
+    "LandmarkGuidedEyeFusion",
+    "LowDOFDifferentiableEyeballTemplate",
+    "PitchToTableVResidual",
+    "DirectTableUVLoss",
+    "DirectVirtualTableUVLoss",
     "GazeGeometryLoss",
     "GazeGeometryLossConfig",
     "UVLossConfig",
     "UVRegressionLoss",
     "build_modelv1",
     "compute_uv_metrics",
+    "probabilistic_eye_keypoint_nll",
     "predict_uv_mm",
 ]
 
@@ -27,6 +36,7 @@ def __getattr__(name: str):
         "InceptionResnetFaceEncoder",
         "ModelV1",
         "ModelV1Config",
+        "ProbabilisticEyeKeypointHead",
         "build_modelv1",
     }:
         from .model import (
@@ -34,6 +44,7 @@ def __getattr__(name: str):
             InceptionResnetFaceEncoder,
             ModelV1,
             ModelV1Config,
+            ProbabilisticEyeKeypointHead,
             build_modelv1,
         )
 
@@ -42,29 +53,66 @@ def __getattr__(name: str):
             "InceptionResnetFaceEncoder": InceptionResnetFaceEncoder,
             "ModelV1": ModelV1,
             "ModelV1Config": ModelV1Config,
+            "ProbabilisticEyeKeypointHead": ProbabilisticEyeKeypointHead,
             "build_modelv1": build_modelv1,
         }
         globals().update(exports)
         return exports[name]
+    if name == "ProbabilisticEyeLandmarkHead":
+        from .vertical_eye_geometry import ProbabilisticEyeLandmarkHead
+
+        globals()[name] = ProbabilisticEyeLandmarkHead
+        return ProbabilisticEyeLandmarkHead
+    if name in {"ProbabilisticLandmarkTokenizer", "LandmarkGuidedEyeFusion"}:
+        from .vertical_eye_geometry import (
+            LandmarkGuidedEyeFusion,
+            ProbabilisticLandmarkTokenizer,
+        )
+
+        exports = {
+            "ProbabilisticLandmarkTokenizer": ProbabilisticLandmarkTokenizer,
+            "LandmarkGuidedEyeFusion": LandmarkGuidedEyeFusion,
+        }
+        globals().update(exports)
+        return exports[name]
+    if name == "LowDOFDifferentiableEyeballTemplate":
+        from .vertical_eye_geometry import LowDOFDifferentiableEyeballTemplate
+
+        globals()[name] = LowDOFDifferentiableEyeballTemplate
+        return LowDOFDifferentiableEyeballTemplate
+    if name == "PitchToTableVResidual":
+        from .vertical_eye_geometry import PitchToTableVResidual
+
+        globals()[name] = PitchToTableVResidual
+        return PitchToTableVResidual
     if name in {
+        "DirectTableUVLoss",
+        "DirectVirtualTableUVLoss",
         "GazeGeometryLoss",
         "GazeGeometryLossConfig",
         "UVLossConfig",
         "UVRegressionLoss",
         "compute_uv_metrics",
+        "probabilistic_eye_keypoint_nll",
     }:
         from .losses import (
+            DirectTableUVLoss,
+            DirectVirtualTableUVLoss,
             GazeGeometryLoss,
             GazeGeometryLossConfig,
             UVLossConfig,
             UVRegressionLoss,
             compute_uv_metrics,
+            probabilistic_eye_keypoint_nll,
         )
 
         exports = {
+            "DirectTableUVLoss": DirectTableUVLoss,
+            "DirectVirtualTableUVLoss": DirectVirtualTableUVLoss,
             "UVLossConfig": UVLossConfig,
             "UVRegressionLoss": UVRegressionLoss,
             "compute_uv_metrics": compute_uv_metrics,
+            "probabilistic_eye_keypoint_nll": probabilistic_eye_keypoint_nll,
             "GazeGeometryLoss": GazeGeometryLoss,
             "GazeGeometryLossConfig": GazeGeometryLossConfig,
         }

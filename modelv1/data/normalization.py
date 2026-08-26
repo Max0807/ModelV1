@@ -13,6 +13,7 @@ UV_DIM = 2
 UV_TARGET_COLUMNS = ("uv_gt_u_mm", "uv_gt_v_mm")
 EYE_GEOMETRY_DIM = 6
 EYE_GEOMETRY_QUALITY_DIM = 4
+VIRTUAL_DISTANCE_SCALE_DIM = 1
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,91 @@ class UVTargetNormalizer:
             self.mean_mm.to(device=tensor.device, dtype=tensor.dtype),
             self.std_mm.to(device=tensor.device, dtype=tensor.dtype),
         )
+
+
+@dataclass(frozen=True)
+class VirtualDistanceScaleNormalizer:
+    """Training-fitted z-score normalization for ``log(distance_scale)``."""
+
+    mean_log_scale: Tensor
+    std_log_scale: Tensor
+
+    def __post_init__(self) -> None:
+        mean = torch.as_tensor(
+            self.mean_log_scale,
+            dtype=torch.float32,
+        ).flatten().clone()
+        std = torch.as_tensor(
+            self.std_log_scale,
+            dtype=torch.float32,
+        ).flatten().clone()
+        expected = (VIRTUAL_DISTANCE_SCALE_DIM,)
+        if mean.shape != expected or std.shape != expected:
+            raise ValueError(
+                "Virtual-distance normalization tensors must have shape "
+                f"{expected}, got mean={tuple(mean.shape)}, std={tuple(std.shape)}"
+            )
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+            raise ValueError(
+                "Virtual-distance normalization statistics must be finite."
+            )
+        if torch.any(std <= 0):
+            raise ValueError(
+                "Virtual-distance log-scale std must be strictly positive."
+            )
+        object.__setattr__(self, "mean_log_scale", mean)
+        object.__setattr__(self, "std_log_scale", std)
+
+    @classmethod
+    def fit(
+        cls,
+        distance_scale: Tensor,
+        min_std: float = 1e-6,
+    ) -> "VirtualDistanceScaleNormalizer":
+        scale = validate_virtual_distance_scale_tensor(
+            torch.as_tensor(distance_scale, dtype=torch.float32),
+            "distance_scale",
+        )
+        if scale.ndim != 2 or scale.shape[0] == 0:
+            raise ValueError("distance_scale must have shape [N, 1] with N > 0.")
+        if min_std <= 0:
+            raise ValueError("min_std must be positive.")
+        log_scale = torch.log(scale)
+        return cls(
+            mean_log_scale=log_scale.mean(dim=0),
+            std_log_scale=log_scale.std(dim=0, unbiased=False).clamp_min(min_std),
+        )
+
+    def normalize(self, distance_scale: Tensor) -> Tensor:
+        scale = validate_virtual_distance_scale_tensor(
+            distance_scale,
+            "distance_scale",
+        )
+        mean = self.mean_log_scale.to(device=scale.device, dtype=scale.dtype)
+        std = self.std_log_scale.to(device=scale.device, dtype=scale.dtype)
+        return (torch.log(scale) - mean) / std
+
+    def state_dict(self) -> dict[str, Tensor]:
+        return {
+            "mean_log_scale": self.mean_log_scale.clone(),
+            "std_log_scale": self.std_log_scale.clone(),
+        }
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state: Mapping[str, Tensor],
+    ) -> "VirtualDistanceScaleNormalizer":
+        try:
+            return cls(
+                mean_log_scale=state["mean_log_scale"],
+                std_log_scale=state["std_log_scale"],
+            )
+        except KeyError as exc:
+            raise KeyError(
+                "Virtual-distance normalizer state requires mean_log_scale "
+                "and std_log_scale."
+            ) from exc
 
 
 @dataclass(frozen=True)
@@ -258,6 +344,19 @@ def validate_uv_tensor(uv: Tensor, name: str) -> Tensor:
     if uv.ndim < 1 or uv.shape[-1] != UV_DIM:
         raise ValueError(f"{name} must end with dimension {UV_DIM}, got {tuple(uv.shape)}")
     return uv
+
+
+def validate_virtual_distance_scale_tensor(scale: Tensor, name: str) -> Tensor:
+    if not torch.is_tensor(scale):
+        raise TypeError(f"{name} must be a torch.Tensor.")
+    if scale.ndim < 1 or scale.shape[-1] != VIRTUAL_DISTANCE_SCALE_DIM:
+        raise ValueError(
+            f"{name} must end with dimension {VIRTUAL_DISTANCE_SCALE_DIM}, "
+            f"got {tuple(scale.shape)}"
+        )
+    if not torch.isfinite(scale).all() or torch.any(scale <= 0):
+        raise ValueError(f"{name} must contain only finite positive values.")
+    return scale
 
 
 def validate_eye_geometry_tensor(geometry: Tensor, name: str) -> Tensor:

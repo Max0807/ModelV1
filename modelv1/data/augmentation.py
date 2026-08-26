@@ -10,6 +10,9 @@ from torch import Tensor
 from torch.nn import functional as F
 
 
+EYE_AUGMENTATION_COORDINATE_POLICY = "normalized_eye_crop_appearance_only_v1"
+
+
 @dataclass(frozen=True)
 class EyeAppearanceAugmentationConfig:
     """Ranges and probabilities for safe eye-image appearance perturbations."""
@@ -32,6 +35,7 @@ class EyeAppearanceAugmentationConfig:
     occlusion_area_max: float
     occlusion_aspect_min: float
     occlusion_aspect_max: float
+    coordinate_policy: str = EYE_AUGMENTATION_COORDINATE_POLICY
 
     def __post_init__(self) -> None:
         for name in (
@@ -64,6 +68,12 @@ class EyeAppearanceAugmentationConfig:
             raise ValueError("noise_std_max must be non-negative.")
         if self.occlusion_area_max > 1:
             raise ValueError("occlusion_area_max must not exceed 1.")
+        if self.coordinate_policy != EYE_AUGMENTATION_COORDINATE_POLICY:
+            raise ValueError(
+                "Eye augmentation must remain appearance-only when crop-normalized "
+                "pseudo labels are enabled; expected coordinate_policy="
+                f"{EYE_AUGMENTATION_COORDINATE_POLICY!r}."
+            )
 
 
 class PairedEyeAppearanceAugmentation:
@@ -75,10 +85,58 @@ class PairedEyeAppearanceAugmentation:
     independently, as requested for local sensor/visibility variation.
     """
 
+    coordinate_policy = EYE_AUGMENTATION_COORDINATE_POLICY
+    preserves_keypoint_coordinates = True
+
     def __init__(self, config: EyeAppearanceAugmentationConfig) -> None:
         self.config = config
 
     def __call__(self, left: Tensor, right: Tensor) -> tuple[Tensor, Tensor]:
+        left, right, _, _ = self._apply_pair(left, right)
+        return left, right
+
+    def apply_with_keypoints(
+        self,
+        left: Tensor,
+        right: Tensor,
+        keypoints_xy: Tensor,
+        keypoint_valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Augment images and invalidate keypoints hidden by random occlusion.
+
+        ``keypoints_xy`` is ``[2, K, 2]`` in normalized eye-crop coordinates,
+        ordered anatomical left/right. Appearance operations never change these
+        coordinates. Mean-filled occlusion changes only the returned visibility
+        mask, using the exact sampled rectangle applied to each eye image.
+        """
+
+        points, valid = _validate_keypoints(keypoints_xy, keypoint_valid_mask)
+        left, right, left_box, right_box = self._apply_pair(left, right)
+        updated_valid = valid.clone()
+        for eye_index, (image, box) in enumerate(
+            ((left, left_box), (right, right_box))
+        ):
+            if box is None:
+                continue
+            hidden = _keypoints_inside_occlusion(
+                points[eye_index],
+                image_height=int(image.shape[-2]),
+                image_width=int(image.shape[-1]),
+                box=box,
+            )
+            updated_valid[eye_index, hidden] = 0.0
+        return left, right, points.clone(), updated_valid
+
+    def _apply_pair(
+        self,
+        left: Tensor,
+        right: Tensor,
+    ) -> tuple[
+        Tensor,
+        Tensor,
+        tuple[int, int, int, int] | None,
+        tuple[int, int, int, int] | None,
+    ]:
         left = _validate_eye(left, "left")
         right = _validate_eye(right, "right")
         if left.shape != right.shape:
@@ -108,24 +166,33 @@ class PairedEyeAppearanceAugmentation:
             left = _gaussian_blur(left, self.config.blur_kernel_size, sigma)
             right = _gaussian_blur(right, self.config.blur_kernel_size, sigma)
 
-        left = self._independent_local_corruptions(left)
-        right = self._independent_local_corruptions(right)
-        return left.clamp(0.0, 1.0), right.clamp(0.0, 1.0)
+        left, left_box = self._independent_local_corruptions(left)
+        right, right_box = self._independent_local_corruptions(right)
+        return (
+            left.clamp(0.0, 1.0),
+            right.clamp(0.0, 1.0),
+            left_box,
+            right_box,
+        )
 
-    def _independent_local_corruptions(self, image: Tensor) -> Tensor:
+    def _independent_local_corruptions(
+        self,
+        image: Tensor,
+    ) -> tuple[Tensor, tuple[int, int, int, int] | None]:
         if _bernoulli(self.config.noise_probability):
             std = _uniform(0.0, self.config.noise_std_max)
             image = image + torch.randn_like(image) * std
         image = image.clamp(0.0, 1.0)
+        occlusion_box = None
         if _bernoulli(self.config.occlusion_probability):
-            image = _mean_occlusion(
+            image, occlusion_box = _mean_occlusion(
                 image,
                 area_min=self.config.occlusion_area_min,
                 area_max=self.config.occlusion_area_max,
                 aspect_min=self.config.occlusion_aspect_min,
                 aspect_max=self.config.occlusion_aspect_max,
             )
-        return image
+        return image, occlusion_box
 
 
 def _validate_eye(image: Tensor, name: str) -> Tensor:
@@ -137,6 +204,47 @@ def _validate_eye(image: Tensor, name: str) -> Tensor:
     if torch.any(image < 0) or torch.any(image > 1):
         raise ValueError(f"{name} eye must lie in [0, 1] before augmentation.")
     return image
+
+
+def _validate_keypoints(
+    keypoints_xy: Tensor,
+    keypoint_valid_mask: Tensor,
+) -> tuple[Tensor, Tensor]:
+    points = torch.as_tensor(keypoints_xy, dtype=torch.float32)
+    valid = torch.as_tensor(keypoint_valid_mask, dtype=torch.float32)
+    if points.ndim != 3 or points.shape[0] != 2 or points.shape[-1] != 2:
+        raise ValueError(
+            "keypoints_xy must have shape [2, K, 2] in anatomical left/right order, "
+            f"got {tuple(points.shape)}."
+        )
+    if valid.shape != points.shape[:2]:
+        raise ValueError(
+            "keypoint_valid_mask must match keypoints_xy[:2], got "
+            f"{tuple(valid.shape)} and {tuple(points.shape)}."
+        )
+    if not torch.isfinite(points).all() or not torch.isfinite(valid).all():
+        raise ValueError("Keypoint inputs must contain only finite values.")
+    if torch.any(valid < 0.0) or torch.any(valid > 1.0):
+        raise ValueError("keypoint_valid_mask must lie in [0, 1].")
+    return points, valid
+
+
+def _keypoints_inside_occlusion(
+    points_xy: Tensor,
+    *,
+    image_height: int,
+    image_width: int,
+    box: tuple[int, int, int, int],
+) -> Tensor:
+    top, left, erase_height, erase_width = box
+    x_pixels = points_xy[:, 0] * image_width
+    y_pixels = points_xy[:, 1] * image_height
+    return (
+        (x_pixels >= left)
+        & (x_pixels < left + erase_width)
+        & (y_pixels >= top)
+        & (y_pixels < top + erase_height)
+    )
 
 
 def _bernoulli(probability: float) -> bool:
@@ -193,7 +301,7 @@ def _mean_occlusion(
     area_max: float,
     aspect_min: float,
     aspect_max: float,
-) -> Tensor:
+) -> tuple[Tensor, tuple[int, int, int, int]]:
     height, width = image.shape[-2:]
     area = _uniform(area_min, area_max) * height * width
     log_aspect = _uniform(math.log(aspect_min), math.log(aspect_max))
@@ -207,4 +315,4 @@ def _mean_occlusion(
     output = image.clone()
     fill = image.mean(dim=(-2, -1), keepdim=True)
     output[:, top : top + erase_height, left : left + erase_width] = fill
-    return output
+    return output, (top, left, erase_height, erase_width)

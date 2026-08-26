@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from modelv1.data.augmentation import (
+    EYE_AUGMENTATION_COORDINATE_POLICY,
     EyeAppearanceAugmentationConfig,
     PairedEyeAppearanceAugmentation,
 )
@@ -67,6 +68,58 @@ class PairedEyeAugmentationTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(right).all())
         self.assertTrue(torch.all((left >= 0) & (left <= 1)))
         self.assertTrue(torch.all((right >= 0) & (right <= 1)))
+
+    def test_keypoint_coordinates_are_bitwise_unchanged(self) -> None:
+        transform = PairedEyeAppearanceAugmentation(augmentation_config())
+        eye = torch.linspace(0.0, 1.0, 3 * 36 * 60).reshape(3, 36, 60)
+        points = torch.rand((2, 15, 2))
+        valid = torch.ones((2, 15))
+
+        _, _, augmented_points, augmented_valid = transform.apply_with_keypoints(
+            eye,
+            eye.clone(),
+            points,
+            valid,
+        )
+
+        self.assertTrue(torch.equal(augmented_points, points))
+        self.assertTrue(torch.equal(augmented_valid, valid))
+
+    def test_full_crop_occlusion_invalidates_visible_keypoints(self) -> None:
+        transform = PairedEyeAppearanceAugmentation(
+            augmentation_config(
+                photometric_probability=0.0,
+                blur_probability=0.0,
+                occlusion_probability=1.0,
+                occlusion_area_min=1.0,
+                occlusion_area_max=1.0,
+                occlusion_aspect_min=60.0 / 36.0,
+                occlusion_aspect_max=60.0 / 36.0,
+            )
+        )
+        eye = torch.full((3, 36, 60), 0.5)
+        points = torch.full((2, 15, 2), 0.5)
+        valid = torch.ones((2, 15))
+
+        _, _, augmented_points, augmented_valid = transform.apply_with_keypoints(
+            eye,
+            eye.clone(),
+            points,
+            valid,
+        )
+
+        self.assertTrue(torch.equal(augmented_points, points))
+        self.assertEqual(int(augmented_valid.count_nonzero()), 0)
+
+    def test_spatial_coordinate_policy_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "appearance-only"):
+            augmentation_config(
+                coordinate_policy="translate_and_rotate",  # type: ignore[arg-type]
+            )
+        self.assertEqual(
+            PairedEyeAppearanceAugmentation.coordinate_policy,
+            EYE_AUGMENTATION_COORDINATE_POLICY,
+        )
 
 
 class EyeBackboneFreezeTests(unittest.TestCase):

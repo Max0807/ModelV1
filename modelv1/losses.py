@@ -10,6 +10,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .data.normalization import UVTargetNormalizer, validate_uv_tensor
+from .geometry import virtual_camera_xy_to_table_uv
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,173 @@ class UVRegressionLoss(nn.Module):
         return compute_uv_metrics(uv_pred, uv_gt_mm, self.normalizer)
 
 
+class DirectTableUVLoss(nn.Module):
+    """Supervise a direct normalized table-UV prediction in physical mm.
+
+    This path performs only the target z-score inverse transform. It does not
+    reconstruct a 3D point or invoke any camera/table geometry after the model
+    prediction.
+    """
+
+    def __init__(
+        self,
+        normalizer: UVTargetNormalizer,
+        config: UVLossConfig | None = None,
+    ) -> None:
+        super().__init__()
+        self.normalizer = normalizer
+        self.config = config or UVLossConfig()
+
+    def forward(
+        self,
+        uv_table_pred_normalized: Tensor | Mapping[str, Tensor],
+        batch: Mapping[str, object],
+    ) -> dict[str, Tensor]:
+        uv_table_pred_normalized, delta_v_mm = _direct_uv_and_vertical_residual(
+            uv_table_pred_normalized
+        )
+        uv_table_pred_normalized = validate_uv_tensor(
+            uv_table_pred_normalized,
+            "uv_table_pred_normalized",
+        )
+        device_type = uv_table_pred_normalized.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            uv_base_table_mm = self.normalizer.denormalize(
+                uv_table_pred_normalized.float()
+            )
+            uv_pred_table_mm = _apply_table_v_residual(
+                uv_base_table_mm,
+                delta_v_mm,
+            )
+            uv_gt_table_mm = validate_uv_tensor(
+                _required_batch_tensor(batch, "uv_gt_table_mm"),
+                "uv_gt_table_mm",
+            ).to(device=uv_pred_table_mm.device, dtype=torch.float32)
+            loss = F.smooth_l1_loss(
+                uv_pred_table_mm,
+                uv_gt_table_mm,
+                beta=self.config.beta_mm,
+            )
+        return {
+            "loss": loss,
+            "uv_pred_table_mm": uv_pred_table_mm,
+            "uv_base_table_mm": uv_base_table_mm,
+            "vertical_delta_v_mm": delta_v_mm,
+        }
+
+
+class DirectVirtualTableUVLoss(nn.Module):
+    """Supervise predicted ``P_N[:2]`` after conversion to table-local UV.
+
+    The network output remains normalized virtual-camera x/y. Loss and metrics,
+    however, use the same physical table-UV coordinate system as the
+    gaze-plus-geometry path.
+    """
+
+    def __init__(
+        self,
+        normalizer: UVTargetNormalizer,
+        config: UVLossConfig | None = None,
+        *,
+        table_distance_scale_mm: float = 1000.0,
+    ) -> None:
+        super().__init__()
+        if table_distance_scale_mm <= 0:
+            raise ValueError("table_distance_scale_mm must be positive.")
+        self.normalizer = normalizer
+        self.config = config or UVLossConfig()
+        self.table_distance_scale_mm = float(table_distance_scale_mm)
+
+    def forward(
+        self,
+        point_xy_n_pred: Tensor | Mapping[str, Tensor],
+        batch: Mapping[str, object],
+    ) -> dict[str, Tensor]:
+        point_xy_n_pred, delta_v_mm = _direct_uv_and_vertical_residual(
+            point_xy_n_pred
+        )
+        point_xy_n_pred = validate_uv_tensor(
+            point_xy_n_pred,
+            "point_xy_n_pred",
+        )
+        device_type = point_xy_n_pred.device.type
+        # Plane reconstruction and millimetre-space Huber are deliberately
+        # float32 even when the learned image branches run under AMP.
+        with torch.autocast(device_type=device_type, enabled=False):
+            point_xy_n_mm = self.normalizer.denormalize(
+                point_xy_n_pred.float()
+            )
+            table_frame7_n = _required_batch_tensor(
+                batch,
+                "table_frame7_n",
+            ).to(device=point_xy_n_mm.device, dtype=torch.float32)
+            uv_gt_table_mm = validate_uv_tensor(
+                _required_batch_tensor(batch, "uv_gt_table_mm"),
+                "uv_gt_table_mm",
+            ).to(device=point_xy_n_mm.device, dtype=torch.float32)
+            uv_base_table_mm = virtual_camera_xy_to_table_uv(
+                point_xy_n_mm,
+                table_frame7_n,
+                distance_scale_mm=self.table_distance_scale_mm,
+            )
+            uv_pred_table_mm = _apply_table_v_residual(
+                uv_base_table_mm,
+                delta_v_mm,
+            )
+            loss = F.smooth_l1_loss(
+                uv_pred_table_mm,
+                uv_gt_table_mm,
+                beta=self.config.beta_mm,
+            )
+        return {
+            "loss": loss,
+            "uv_pred_table_mm": uv_pred_table_mm,
+            "uv_base_table_mm": uv_base_table_mm,
+            "vertical_delta_v_mm": delta_v_mm,
+            "point_xy_n_mm": point_xy_n_mm,
+        }
+
+
+def _direct_uv_and_vertical_residual(
+    prediction: Tensor | Mapping[str, Tensor],
+) -> tuple[Tensor, Tensor]:
+    if isinstance(prediction, Mapping):
+        uv_prediction = prediction.get("uv")
+        if not torch.is_tensor(uv_prediction):
+            raise TypeError("Direct-UV model mapping must contain tensor 'uv'.")
+        delta_v_mm = prediction.get("vertical_delta_v_mm")
+        if delta_v_mm is None:
+            delta_v_mm = uv_prediction.new_zeros((uv_prediction.shape[0], 1))
+        elif not torch.is_tensor(delta_v_mm):
+            raise TypeError("vertical_delta_v_mm must be a tensor.")
+    else:
+        uv_prediction = prediction
+        delta_v_mm = prediction.new_zeros((prediction.shape[0], 1))
+    uv_prediction = validate_uv_tensor(uv_prediction, "direct_uv_prediction")
+    delta_v_mm = delta_v_mm.to(
+        device=uv_prediction.device,
+        dtype=torch.float32,
+    )
+    if delta_v_mm.shape != (uv_prediction.shape[0], 1):
+        raise ValueError("vertical_delta_v_mm must have shape [B, 1].")
+    return uv_prediction, delta_v_mm
+
+
+def _apply_table_v_residual(
+    uv_base_table_mm: Tensor,
+    delta_v_mm: Tensor,
+) -> Tensor:
+    """Apply a physical vertical correction while preserving u bit-for-bit."""
+
+    return torch.stack(
+        (
+            uv_base_table_mm[:, 0],
+            uv_base_table_mm[:, 1] + delta_v_mm[:, 0],
+        ),
+        dim=-1,
+    )
+
+
 @torch.no_grad()
 def compute_uv_metrics(
     uv_pred: Tensor,
@@ -93,6 +261,166 @@ def batch_uv_targets(batch: Mapping[str, object]) -> tuple[Tensor, Tensor]:
     if not torch.is_tensor(uv_target) or not torch.is_tensor(uv_gt):
         raise TypeError("uv_target and uv_gt must be torch tensors.")
     return validate_uv_tensor(uv_target, "uv_target"), validate_uv_tensor(uv_gt, "uv_gt")
+
+
+def iris_heatmap_mse_loss(
+    left_logits: Tensor,
+    right_logits: Tensor,
+    iris_center_xy: Tensor,
+    iris_center_valid_mask: Tensor,
+    *,
+    sigma_pixels: float,
+) -> Tensor:
+    """Supervise one Gaussian iris-centre heatmap per eye.
+
+    ``iris_center_xy`` is normalized to each eye crop and ordered left/right.
+    Invalid MediaPipe observations are masked out rather than treated as a
+    negative/background label.
+    """
+
+    if sigma_pixels <= 0:
+        raise ValueError("sigma_pixels must be positive.")
+    if left_logits.ndim != 4 or right_logits.ndim != 4:
+        raise ValueError("Iris heatmap logits must have shape [B, 1, H, W].")
+    if left_logits.shape != right_logits.shape or left_logits.shape[1] != 1:
+        raise ValueError("Left/right iris logits must share shape [B, 1, H, W].")
+    batch_size, _, height, width = left_logits.shape
+    if iris_center_xy.shape != (batch_size, 2, 2):
+        raise ValueError("iris_center_xy must have shape [B, 2, 2].")
+    if iris_center_valid_mask.shape != (batch_size, 2):
+        raise ValueError("iris_center_valid_mask must have shape [B, 2].")
+    centres = iris_center_xy.to(device=left_logits.device, dtype=torch.float32)
+    valid = iris_center_valid_mask.to(device=left_logits.device, dtype=torch.float32)
+    if not torch.isfinite(centres).all() or not torch.isfinite(valid).all():
+        raise ValueError("Iris auxiliary targets must be finite.")
+    if torch.any(valid < 0) or torch.any(valid > 1):
+        raise ValueError("iris_center_valid_mask must lie in [0, 1].")
+
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(height, device=left_logits.device, dtype=torch.float32),
+        torch.arange(width, device=left_logits.device, dtype=torch.float32),
+        indexing="ij",
+    )
+    logits = torch.cat((left_logits, right_logits), dim=1).float()
+    centres_px = centres.clone()
+    centres_px[..., 0] *= max(width - 1, 1)
+    centres_px[..., 1] *= max(height - 1, 1)
+    distance_sq = (
+        (x_grid[None, None] - centres_px[..., 0, None, None]).square()
+        + (y_grid[None, None] - centres_px[..., 1, None, None]).square()
+    )
+    targets = torch.exp(-0.5 * distance_sq / (sigma_pixels * sigma_pixels))
+    per_eye_loss = F.mse_loss(torch.sigmoid(logits), targets, reduction="none").mean(
+        dim=(-1, -2)
+    )
+    return (per_eye_loss * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+def probabilistic_eye_keypoint_nll(
+    left_mean_xy: Tensor,
+    right_mean_xy: Tensor,
+    left_covariance: Tensor,
+    right_covariance: Tensor,
+    target_xy: Tensor,
+    valid_mask: Tensor,
+    eye_quality: Tensor,
+    *,
+    min_std_norm: float,
+) -> dict[str, Tensor]:
+    """Quality-weighted full-covariance NLL for binocular eye keypoints.
+
+    Coordinates are normalized to each legacy eye crop. The covariance comes
+    from the spatial probability maps' second moments. Invalid, low-quality,
+    or augmentation-occluded pseudo-labels therefore cannot dominate the
+    auxiliary objective.
+    """
+
+    if min_std_norm <= 0:
+        raise ValueError("min_std_norm must be positive.")
+    if left_mean_xy.ndim != 3 or left_mean_xy.shape[-1] != 2:
+        raise ValueError("Keypoint means must have shape [B, K, 2].")
+    if right_mean_xy.shape != left_mean_xy.shape:
+        raise ValueError("Left/right keypoint means must share shape [B, K, 2].")
+    batch_size, keypoint_count, _ = left_mean_xy.shape
+    expected_covariance_shape = (batch_size, keypoint_count, 2, 2)
+    if (
+        left_covariance.shape != expected_covariance_shape
+        or right_covariance.shape != expected_covariance_shape
+    ):
+        raise ValueError(
+            "Left/right keypoint covariance must have shape "
+            f"{expected_covariance_shape}."
+        )
+    if target_xy.shape != (batch_size, 2, keypoint_count, 2):
+        raise ValueError(
+            "target_xy must have shape "
+            f"[{batch_size}, 2, {keypoint_count}, 2]."
+        )
+    if valid_mask.shape != (batch_size, 2, keypoint_count):
+        raise ValueError(
+            "valid_mask must have shape "
+            f"[{batch_size}, 2, {keypoint_count}]."
+        )
+    if eye_quality.shape != (batch_size, 2):
+        raise ValueError(f"eye_quality must have shape [{batch_size}, 2].")
+
+    device = left_mean_xy.device
+    means = torch.stack((left_mean_xy, right_mean_xy), dim=1).float()
+    covariance = torch.stack(
+        (left_covariance, right_covariance), dim=1
+    ).float()
+    targets = target_xy.to(device=device, dtype=torch.float32)
+    valid = valid_mask.to(device=device, dtype=torch.float32)
+    quality = eye_quality.to(device=device, dtype=torch.float32)
+    if not all(
+        torch.isfinite(value).all()
+        for value in (means, covariance, targets, valid, quality)
+    ):
+        raise ValueError("Probabilistic keypoint inputs must be finite.")
+    if torch.any(valid < 0) or torch.any(valid > 1):
+        raise ValueError("Keypoint valid_mask must lie in [0, 1].")
+    if torch.any(quality < 0) or torch.any(quality > 1):
+        raise ValueError("Keypoint eye_quality must lie in [0, 1].")
+
+    covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
+    variance_floor = float(min_std_norm) ** 2
+    variance_x = covariance[..., 0, 0].clamp_min(0.0) + variance_floor
+    variance_y = covariance[..., 1, 1].clamp_min(0.0) + variance_floor
+    covariance_xy = covariance[..., 0, 1]
+    determinant_floor = variance_floor * variance_floor
+    determinant = (
+        variance_x * variance_y - covariance_xy.square()
+    ).clamp_min(determinant_floor)
+    delta = means - targets
+    mahalanobis = (
+        variance_y * delta[..., 0].square()
+        + variance_x * delta[..., 1].square()
+        - 2.0 * covariance_xy * delta[..., 0] * delta[..., 1]
+    ) / determinant
+    # Subtract the constant floor-density term. This keeps the auxiliary loss
+    # non-negative while preserving the Gaussian NLL gradients.
+    relative_log_determinant = torch.log(
+        determinant / determinant_floor
+    )
+    per_keypoint_nll = 0.5 * (
+        mahalanobis.clamp_min(0.0) + relative_log_determinant.clamp_min(0.0)
+    )
+
+    weights = valid * quality.unsqueeze(-1)
+    denominator = weights.sum().clamp_min(1.0)
+    loss = (per_keypoint_nll * weights).sum() / denominator
+    error_norm = torch.linalg.vector_norm(delta, dim=-1)
+    mean_error_norm = (error_norm * weights).sum() / denominator
+    predicted_std_norm = torch.sqrt(
+        0.5 * (variance_x + variance_y)
+    )
+    mean_std_norm = (predicted_std_norm * weights).sum() / denominator
+    return {
+        "loss": loss,
+        "mean_error_norm": mean_error_norm,
+        "mean_std_norm": mean_std_norm,
+        "effective_weight": weights.sum(),
+    }
 
 
 @dataclass(frozen=True)
@@ -364,7 +692,7 @@ def _required_batch_tensor(batch: Mapping[str, object], key: str) -> Tensor:
     try:
         value = batch[key]
     except KeyError as exc:
-        raise KeyError(f"Batch must contain {key!r} for V4 geometry loss.") from exc
+        raise KeyError(f"Batch must contain {key!r} for geometry supervision.") from exc
     if not torch.is_tensor(value):
         raise TypeError(f"batch[{key!r}] must be a tensor.")
     return value

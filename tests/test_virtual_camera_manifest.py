@@ -16,6 +16,7 @@ from modelv1.data.virtual_camera_manifest import (
     canonical_image_source,
     merge_virtual_camera_manifests,
 )
+from modelv1.depth_prior.pnp import PNP_GEOMETRY_VERSION
 
 
 class VirtualCameraManifestTests(unittest.TestCase):
@@ -42,6 +43,8 @@ class VirtualCameraManifestTests(unittest.TestCase):
             "normalization_reason": "",
             "eye_side_semantics": eye_semantics,
             "landmark_eye_side_conversion": LEGACY_EYE_SIDE_CONVERSION,
+            "pnp_geometry_version": PNP_GEOMETRY_VERSION,
+            "virtual_distance_scale": 0.75,
             "normalized_face_path": str(paths["face"]),
             "normalized_left_eye_path": str(paths["left_eye"]),
             "normalized_right_eye_path": str(paths["right_eye"]),
@@ -65,6 +68,10 @@ class VirtualCameraManifestTests(unittest.TestCase):
             self.assertTrue(record.face_path.is_file())
             torch.testing.assert_close(record.rotation_n_from_c, torch.eye(3))
             torch.testing.assert_close(record.rotation_c_from_n, torch.eye(3))
+            torch.testing.assert_close(
+                record.virtual_distance_scale,
+                torch.tensor([0.75]),
+            )
 
     def test_rejects_legacy_manifest_without_anatomical_eye_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

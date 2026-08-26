@@ -119,7 +119,7 @@ def append_completed_experiment(
 | DECA | representation=`{model.get("deca_feature_representation", "full236")}`，preprocess=`{data["deca_face_preprocess"]}`，crop_scale={data["deca_crop_scale"]}，cache=`{deca_artifact_description}` |
 | 深度先验 | `{depth_prior_description}` |
 | 人脸/双眼视觉融合 | use={model.get("use_face_image", False)}，face=`inception_resnet_v1(vggface2)`，eye=`{model.get("eye_backbone", "resnet18")}`，cross_attention={model.get("visual_attention_heads", 8)}x{model.get("visual_attention_dim", 128)}，face_frozen={model.get("freeze_face_image_backbone", False)} |
-| 眼部骨干 | `{model["eye_backbone"]}`，weights=`{model.get("eye_backbone_weights")}` |
+| 眼部骨干 | `{model["eye_backbone"]}`，input_size=`{data.get("eye_image_size", (60, 36))}` (W,H)，weights=`{model.get("eye_backbone_weights")}` |
 | Crop分支 | use={model.get("use_crop_cam", True)}，input_dim={model.get("crop_cam_dim", 36)} |
 | Scene分支 | representation=`{model.get("scene_representation", "full25")}`，input_dim={model.get("scene_dim", 25)} |
 | 几何分支 | use={model.get("use_eye_geometry", False)}，gate=`{model.get("eye_geometry_gate_mode", "none")}` |
