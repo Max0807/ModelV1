@@ -26,6 +26,8 @@ class FaceCropTransform:
     source_height_px: float
 
     def __post_init__(self) -> None:
+        """验证裁剪模式、目标输入尺寸和源图裁剪区域的有效性。"""
+
         if self.mode not in FACE_PREPROCESS_CHOICES:
             raise ValueError(f"Unsupported face preprocessing mode: {self.mode!r}")
         if self.input_size <= 0:
@@ -35,10 +37,14 @@ class FaceCropTransform:
 
     @property
     def source_right_px(self) -> float:
+        """返回源图裁剪矩形右边界的像素坐标。"""
+
         return self.source_left_px + self.source_width_px
 
     @property
     def source_bottom_px(self) -> float:
+        """返回源图裁剪矩形下边界的像素坐标。"""
+
         return self.source_top_px + self.source_height_px
 
     def input_pixels_to_source(self, points_xy: Any) -> Any:
@@ -72,6 +78,8 @@ class FaceCropTransform:
 
 
 def _validate_bbox(face_bbox_xywh: Sequence[float]) -> tuple[float, float, float, float]:
+    """把人脸 xywh 框转换为四个有限浮点数并保证宽高为正。"""
+
     import numpy as np
 
     bbox = np.asarray(face_bbox_xywh, dtype=np.float64).reshape(-1)
@@ -135,6 +143,8 @@ def build_face_crop_transform(
 
 
 def _as_rgb_uint8(image: Any) -> Any:
+    """验证输入为 H×W×3 RGB 图像，并安全转换为 uint8。"""
+
     import numpy as np
 
     array = np.asarray(image)

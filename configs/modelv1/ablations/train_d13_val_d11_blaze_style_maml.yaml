@@ -1,0 +1,61 @@
+experiment:
+  run_name: ablation_b3_blaze_style_maml_d13_to_d11_seed42_v2
+  project: ModelV1_virtual_camera_cross_camera
+  output_dir: outputs
+  seed: 42
+  deterministic: true
+
+initialization:
+  checkpoint: outputs/ModelV1_virtual_camera_cross_camera/ablation_b2_blaze_style_recon_consistency_d13_to_d11_seed42/checkpoints/best.pt
+  prefer_ema: true
+
+data:
+  identity_field: dataset
+  support_size: 9
+  query_size: 100
+  feature_cache_batch_size: 64
+  # B3 builds the frozen feature cache once. Single-process, non-pinned loading
+  # guarantees that cached scene/target tensors own stable CPU storage.
+  num_workers: 0
+  persistent_workers: false
+  pin_memory: false
+  # Dataset 13 is currently the only meta-training identity. This makes B3 a
+  # mechanism/limited-generalization experiment, not a strong multi-user MAML
+  # result. Set this to false as soon as multiple training identities exist.
+  allow_single_train_identity: true
+
+meta_learning:
+  algorithm: first_order_maml
+  adaptable_components:
+    - uv_head
+  device: auto
+  outer_steps: 500
+  inner_steps: 5
+  inner_lr: 0.00001
+  outer_lr: 0.0001
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  validate_every_steps: 5
+  validation_episodes_per_identity: 5
+  # Reuse exactly the same validation episodes at every checkpoint.
+  validation_seed: 100042
+
+logging:
+  wandb:
+    # Keep B3 local by default. Enable only with explicit authorization to
+    # upload experiment configuration and metrics to W&B.
+    enabled: false
+    project: ModelV1_virtual_camera_cross_camera
+    entity: null
+    mode: online
+    tags:
+      - ModelV1
+      - architecture_ablation
+      - blaze_style
+      - B3
+      - first_order_maml
+      - frozen_visual_encoder
+      - support9_query100
+      - train_dataset_13
+      - val_dataset_11
+      - seed42

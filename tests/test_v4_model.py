@@ -13,16 +13,12 @@ class V4ModelTests(unittest.TestCase):
     def _config(self, depth_mode: str, bins: int) -> ModelV1Config:
         return ModelV1Config(
             prediction_mode="gaze_geometry",
-            deca_feature_representation="geometry156",
-            deca_feature_dim=156,
             use_crop_cam=False,
             scene_representation="table_frame7",
             scene_dim=7,
             use_eye_geometry=False,
             eye_geometry_representation="raw_eye6d",
             eye_backbone="cnn",
-            face_embedding_dim=16,
-            face_hidden_dims=(16,),
             eye_embedding_dim=16,
             per_eye_embedding_dim=8,
             fusion_hidden_dims=(24, 12),
@@ -56,7 +52,6 @@ class V4ModelTests(unittest.TestCase):
     def test_forward_returns_unit_gaze_and_k17_geometry(self) -> None:
         model = ModelV1(self._config("fixed_prior", 17)).eval()
         batch = {
-            "deca_feat": torch.zeros((2, 156)),
             "left_eye": torch.zeros((2, 3, 36, 60)),
             "right_eye": torch.zeros((2, 3, 36, 60)),
             "table_frame7": torch.tensor(
@@ -87,7 +82,6 @@ class V4ModelTests(unittest.TestCase):
             )
         )
         batch = {
-            "deca_feat": torch.randn((2, 156)),
             "left_eye": torch.randn((2, 3, 36, 60)),
             "right_eye": torch.randn((2, 3, 36, 60)),
             "table_frame7": torch.tensor(
@@ -119,11 +113,7 @@ class V4ModelTests(unittest.TestCase):
             GazeGeometryLossConfig(
                 uv_huber_beta_mm=30.0,
                 uv_huber_weight=0.0,
-                mixture_nll_weight=0.0,
-                mixture_kernel_sigma_mm=30.0,
-                gaze_direction_weight=0.0,
                 gaze_angular_weight=0.0,
-                depth_prior_kl_weight=0.0,
                 ray_validity_weight=0.0,
                 ray_penalty_scale_mm=100.0,
                 uv_gaussian_nll_weight=1.0,
@@ -158,7 +148,6 @@ class V4ModelTests(unittest.TestCase):
             [[[0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]]
         )
         batch = {
-            "deca_feat": torch.zeros((1, 156)),
             "left_eye": torch.zeros((1, 3, 36, 60)),
             "right_eye": torch.zeros((1, 3, 36, 60)),
             "table_frame7": torch.tensor(
@@ -199,7 +188,6 @@ class V4ModelTests(unittest.TestCase):
             )
         )
         batch = {
-            "deca_feat": torch.zeros((1, 156)),
             "left_eye": torch.zeros((1, 3, 36, 60)),
             "right_eye": torch.zeros((1, 3, 36, 60)),
             "table_frame7": torch.tensor(
@@ -227,7 +215,6 @@ class V4ModelTests(unittest.TestCase):
     def test_learned_reweight_receives_uv_loss_gradient_without_table_mlp(self) -> None:
         model = ModelV1(self._config("learned_reweight", 17))
         batch = {
-            "deca_feat": torch.randn((2, 156)),
             "left_eye": torch.randn((2, 3, 36, 60)),
             "right_eye": torch.randn((2, 3, 36, 60)),
             "table_frame7": torch.tensor(
@@ -248,11 +235,7 @@ class V4ModelTests(unittest.TestCase):
             GazeGeometryLossConfig(
                 uv_huber_beta_mm=30.0,
                 uv_huber_weight=0.5,
-                mixture_nll_weight=0.1,
-                mixture_kernel_sigma_mm=30.0,
-                gaze_direction_weight=1.0,
                 gaze_angular_weight=0.0,
-                depth_prior_kl_weight=0.01,
                 ray_validity_weight=0.0,
                 ray_penalty_scale_mm=100.0,
             )
@@ -280,7 +263,6 @@ class V4ModelTests(unittest.TestCase):
             [[-30.0, -20.0, 600.0, 30.0, -20.0, 600.0]]
         )
         batch = {
-            "deca_feat": torch.zeros((1, 156)),
             "left_eye": torch.zeros((1, 3, 36, 60)),
             "right_eye": torch.zeros((1, 3, 36, 60)),
             "table_frame7": torch.tensor(
@@ -331,7 +313,6 @@ class V4ModelTests(unittest.TestCase):
         for parameter in model.depth_correction_head.parameters():
             parameter.requires_grad_(True)
         batch = {
-            "deca_feat": torch.randn((2, 156)),
             "left_eye": torch.randn((2, 3, 36, 60)),
             "right_eye": torch.randn((2, 3, 36, 60)),
             "table_frame7": torch.tensor(
@@ -353,14 +334,9 @@ class V4ModelTests(unittest.TestCase):
             GazeGeometryLossConfig(
                 uv_huber_beta_mm=30.0,
                 uv_huber_weight=1.0,
-                mixture_nll_weight=0.0,
-                mixture_kernel_sigma_mm=30.0,
-                gaze_direction_weight=0.0,
                 gaze_angular_weight=0.0,
-                depth_prior_kl_weight=0.0,
                 ray_validity_weight=0.1,
                 ray_penalty_scale_mm=100.0,
-                depth_correction_prior_weight=0.0,
             )
         )
         loss = criterion(output, batch)["loss"]

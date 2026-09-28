@@ -54,17 +54,15 @@ from modelv1.data.normalization import (
     EyeGeometryNormalizer,
     EyeGeometryQualityNormalizer,
     UVTargetNormalizer,
-    VirtualDistanceScaleNormalizer,
 )
-from modelv1.deca_cache import DECA_FEATURE_REPRESENTATION_NONE
 from modelv1.depth_distribution import (
     DEPTH_DISTRIBUTION_LEARNED_REWEIGHT,
     DEPTH_DISTRIBUTION_POINT,
 )
 from modelv1.geometry import virtual_camera_xy_to_table_uv
-from modelv1.inference import compose_table_uv_with_vertical_residual
 from modelv1.model import PREDICTION_MODE_GAZE_GEOMETRY
 from scripts.train_modelv1 import (
+    checkpoint_model_state,
     load_config,
     make_model_config,
     move_batch_to_device,
@@ -73,10 +71,10 @@ from scripts.train_modelv1 import (
     resolve_preprocessed_v2_artifacts,
     resolve_project_path,
     resolve_sample_id_filter_manifest_path,
+    resolve_table7_stage3_artifacts,
     resolve_virtual_camera_manifest_path,
     seed_everything,
     validate_config,
-    validate_deca_cache_preprocess,
 )
 
 
@@ -281,11 +279,6 @@ def _load_analysis_config(
                     "embedded config. Pass --config explicitly."
                 )
             config = copy.deepcopy(dict(embedded))
-            data_section = config.get("data")
-            if isinstance(data_section, dict):
-                data_section["deca_face_preprocess"] = str(
-                    data_section.get("deca_face_preprocess", "deca")
-                ).strip().lower()
             validate_config(config)
             source = "checkpoint:config"
 
@@ -318,39 +311,39 @@ def _resolve_data_inputs(
     config: Mapping[str, Any],
     model_config: Any,
     artifact_dir: Path,
-) -> tuple[Path, Path | None, Path | None, Path | None, frozenset[str] | None]:
+) -> tuple[Path, Path | None, Path | None, frozenset[str] | None]:
     data_config = config["data"]
     uses_gaze_geometry = (
         model_config.prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY
     )
-    uses_deca_features = (
-        model_config.deca_feature_representation
-        != DECA_FEATURE_REPRESENTATION_NONE
-    )
     require_depth_prior = model_config.use_eye_geometry or uses_gaze_geometry
+    uses_table7_stage3 = (
+        data_config.get("table7_stage3_csv_paths") is not None
+    )
     preprocessed_virtual_manifests: list[Path] = []
 
-    if data_config.get("preprocessed_v2_root") is not None:
+    if uses_table7_stage3:
+        dataset_csv = resolve_table7_stage3_artifacts(
+            data_config,
+            artifact_dir,
+        )
+        depth_prior = None
+    elif data_config.get("preprocessed_v2_root") is not None:
         (
             dataset_csv,
-            deca_cache,
             depth_prior,
             preprocessed_virtual_manifests,
         ) = resolve_preprocessed_v2_artifacts(
             data_config,
             artifact_dir,
-            require_deca_features=uses_deca_features,
             require_depth_prior=require_depth_prior,
         )
     else:
-        dataset_csv, deca_cache, depth_prior = resolve_numbered_dataset_artifacts(
+        dataset_csv, depth_prior = resolve_numbered_dataset_artifacts(
             data_config,
             artifact_dir,
-            require_deca_features=uses_deca_features,
             require_depth_prior=require_depth_prior,
         )
-    if deca_cache is not None:
-        validate_deca_cache_preprocess(deca_cache, data_config)
 
     image_source = canonical_image_source(
         data_config.get("image_source", IMAGE_SOURCE_LEGACY)
@@ -378,7 +371,7 @@ def _resolve_data_inputs(
         if filter_manifest is not None
         else None
     )
-    return dataset_csv, deca_cache, depth_prior, virtual_manifest, allowed_sample_ids
+    return dataset_csv, depth_prior, virtual_manifest, allowed_sample_ids
 
 
 def _build_analysis_loader(
@@ -387,7 +380,6 @@ def _build_analysis_loader(
     model_config: Any,
     checkpoint: Mapping[str, Any],
     dataset_csv: Path,
-    deca_cache: Path | None,
     depth_prior: Path | None,
     virtual_manifest: Path | None,
     allowed_sample_ids: frozenset[str] | None,
@@ -412,11 +404,6 @@ def _build_analysis_loader(
     uv_normalizer = _normalizer_from_checkpoint(
         checkpoint, "normalizer", UVTargetNormalizer
     )
-    scale_normalizer = _normalizer_from_checkpoint(
-        checkpoint,
-        "virtual_distance_scale_normalizer",
-        VirtualDistanceScaleNormalizer,
-    )
     eye_normalizer = _normalizer_from_checkpoint(
         checkpoint, "eye_geometry_normalizer", EyeGeometryNormalizer
     )
@@ -433,14 +420,6 @@ def _build_analysis_loader(
     if not uses_gaze_geometry and uv_normalizer is None:
         raise ValueError("Direct-UV checkpoint has no saved UV normalizer.")
 
-    iris_paths = None
-    if model_config.use_eye_iris_auxiliary and data_config.get(
-        "iris_supervision_csv_paths"
-    ):
-        iris_paths = [
-            resolve_project_path(path)
-            for path in data_config["iris_supervision_csv_paths"]
-        ]
     eye_geometry_pseudo_label_paths = [
         resolve_project_path(path)
         for path in data_config.get("eye_geometry_pseudo_label_paths", ())
@@ -461,22 +440,12 @@ def _build_analysis_loader(
         train_datasets=data_config.get("train_datasets", ("3", "4")),
         val_datasets=data_config.get("val_datasets", ("5",)),
         split_mode=data_config["split_mode"],
-        all_datasets=data_config.get("all_datasets", ("3", "4", "5")),
-        val_ratio=float(data_config["val_ratio"]),
-        split_seed=int(data_config["split_seed"]),
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=bool(data_config["pin_memory"]),
         normalize_images=bool(data_config["normalize_images"]),
-        load_face_image=bool(data_config["load_face_image"]),
-        eye_image_size=tuple(data_config.get("eye_image_size", (60, 36))),
         # Analysis must be deterministic, including when --split=train.
         train_paired_eye_transform=None,
-        deca_cache_path=deca_cache,
-        require_deca_features=(
-            model_config.deca_feature_representation
-            != DECA_FEATURE_REPRESENTATION_NONE
-        ),
         normalize_uv_targets=not uses_gaze_geometry,
         target_normalizer=uv_normalizer,
         use_eye_geometry=model_config.use_eye_geometry,
@@ -494,14 +463,7 @@ def _build_analysis_loader(
         depth_correction_geometry_normalizer=correction_normalizer,
         eye_geometry_representation=model_config.eye_geometry_representation,
         scene_representation=model_config.scene_representation,
-        deca_feature_representation=model_config.deca_feature_representation,
         image_source=str(data_config.get("image_source", IMAGE_SOURCE_LEGACY)),
-        eye_image_source=str(
-            data_config.get(
-                "eye_image_source",
-                data_config.get("image_source", IMAGE_SOURCE_LEGACY),
-            )
-        ),
         virtual_camera_manifest_path=virtual_manifest,
         filter_invalid_virtual_camera_samples=bool(
             data_config.get("skip_invalid_virtual_camera_samples", False)
@@ -513,10 +475,10 @@ def _build_analysis_loader(
                 DIRECT_UV_TARGET_FRAME_TABLE_LOCAL,
             )
         ),
-        use_virtual_distance_film=model_config.use_virtual_distance_film,
-        use_virtual_pose_film=model_config.use_virtual_pose_film,
-        virtual_distance_scale_normalizer=scale_normalizer,
-        iris_supervision_csv_paths=iris_paths,
+        use_table_frame_film=model_config.use_table_frame_film,
+        precomputed_table_frame7=(
+            data_config.get("table7_stage3_csv_paths") is not None
+        ),
         eye_geometry_pseudo_label_paths=eye_geometry_pseudo_label_paths,
         require_eye_geometry_pseudo_labels=bool(
             data_config.get("require_eye_geometry_pseudo_labels", False)
@@ -598,28 +560,18 @@ def _predict_table_uv(
         raise RuntimeError("Direct-UV inference requires the checkpoint normalizer.")
     point_xy_or_uv_mm = uv_normalizer.denormalize(normalized.float())
     if direct_uv_target_frame == DIRECT_UV_TARGET_FRAME_TABLE_LOCAL:
-        return (
-            compose_table_uv_with_vertical_residual(
-                point_xy_or_uv_mm, output_mapping
-            ),
-            output_mapping,
-        )
+        return point_xy_or_uv_mm, output_mapping
     if direct_uv_target_frame != DIRECT_UV_TARGET_FRAME_VIRTUAL_CAMERA:
         raise AssertionError(f"Unhandled direct UV target frame: {direct_uv_target_frame}")
     frame = batch.get("table_frame7_n")
     if not torch.is_tensor(frame):
         raise TypeError("Virtual-camera UV inference requires batch['table_frame7_n'].")
-    base_table_uv = virtual_camera_xy_to_table_uv(
+    table_uv = virtual_camera_xy_to_table_uv(
             point_xy_or_uv_mm,
             frame.float(),
             distance_scale_mm=model.config.table_distance_scale_mm,
         )
-    return (
-        compose_table_uv_with_vertical_residual(
-            base_table_uv, output_mapping
-        ),
-        output_mapping,
-    )
+    return table_uv, output_mapping
 
 
 def _rounded(value: float | int | None, digits: int = 6) -> float | int | None:
@@ -1123,7 +1075,7 @@ def main() -> int:
     device = resolve_device(args.device)
     print(f"Using device: {device}")
 
-    dataset_csv, deca_cache, depth_prior, virtual_manifest, allowed_ids = (
+    dataset_csv, depth_prior, virtual_manifest, allowed_ids = (
         _resolve_data_inputs(config, model_config, output_dir / "resolved_inputs")
     )
     loader, uv_normalizer = _build_analysis_loader(
@@ -1131,7 +1083,6 @@ def main() -> int:
         model_config=model_config,
         checkpoint=checkpoint,
         dataset_csv=dataset_csv,
-        deca_cache=deca_cache,
         depth_prior=depth_prior,
         virtual_manifest=virtual_manifest,
         allowed_sample_ids=allowed_ids,
@@ -1141,7 +1092,11 @@ def main() -> int:
     )
 
     model = ModelV1(model_config).to(device)
-    model.load_state_dict(checkpoint["model"], strict=True)
+    model_state, model_weight_source = checkpoint_model_state(
+        checkpoint,
+        prefer_ema=True,
+    )
+    model.load_state_dict(model_state, strict=True)
     model.eval()
     checkpoint_epoch = checkpoint.get("epoch")
     checkpoint_best_epe = checkpoint.get("best_val_epe_mm")
@@ -1154,7 +1109,10 @@ def main() -> int:
             "direct_uv_target_frame", DIRECT_UV_TARGET_FRAME_TABLE_LOCAL
         )
     )
-    print(f"Analyzing {len(loader.dataset)} samples from split={args.split!r} ...")
+    print(
+        f"Analyzing {len(loader.dataset)} samples from split={args.split!r} "
+        f"with {model_weight_source} weights ..."
+    )
     records = collect_sample_records(
         model=model,
         loader=loader,
@@ -1190,6 +1148,7 @@ def main() -> int:
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": checkpoint_epoch,
         "checkpoint_best_val_epe_mm": _rounded(checkpoint_best_epe),
+        "model_weight_source": model_weight_source,
         "config_source": config_source,
         "dataset_csv": str(dataset_csv.resolve()),
         "split": args.split,

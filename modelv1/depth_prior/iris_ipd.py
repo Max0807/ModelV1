@@ -21,10 +21,14 @@ class IrisIpdReconstruction:
 
     @property
     def midpoint_depth_z_mm(self) -> float:
+        """返回左右虹膜代理点中点在真实相机系中的毫米深度。"""
+
         return float(self.midpoint_camera_xyz_mm[2])
 
 
 def _require_numpy() -> Any:
+    """延迟导入 NumPy，并在 Iris/IPD 重建环境缺失时给出明确错误。"""
+
     try:
         import numpy as np
     except ImportError as error:  # pragma: no cover - environment dependent
@@ -38,10 +42,14 @@ def _dot3(left: Any, right: Any) -> float:
 
 
 def _norm3(vector: Any) -> float:
+    """通过三维点积计算向量欧氏长度，避免调用外部 BLAS。"""
+
     return math.sqrt(_dot3(vector, vector))
 
 
 def _normalize3(vector: Any, *, name: str, np: Any) -> Any:
+    """验证三维向量非零并返回 float64 单位向量。"""
+
     norm = _norm3(vector)
     if norm <= 1e-12:
         raise ValueError(f"{name} must be non-zero.")

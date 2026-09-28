@@ -81,7 +81,7 @@ class DirectTableUVLoss(nn.Module):
         uv_table_pred_normalized: Tensor | Mapping[str, Tensor],
         batch: Mapping[str, object],
     ) -> dict[str, Tensor]:
-        uv_table_pred_normalized, delta_v_mm = _direct_uv_and_vertical_residual(
+        uv_table_pred_normalized = _direct_uv_prediction(
             uv_table_pred_normalized
         )
         uv_table_pred_normalized = validate_uv_tensor(
@@ -90,12 +90,8 @@ class DirectTableUVLoss(nn.Module):
         )
         device_type = uv_table_pred_normalized.device.type
         with torch.autocast(device_type=device_type, enabled=False):
-            uv_base_table_mm = self.normalizer.denormalize(
+            uv_pred_table_mm = self.normalizer.denormalize(
                 uv_table_pred_normalized.float()
-            )
-            uv_pred_table_mm = _apply_table_v_residual(
-                uv_base_table_mm,
-                delta_v_mm,
             )
             uv_gt_table_mm = validate_uv_tensor(
                 _required_batch_tensor(batch, "uv_gt_table_mm"),
@@ -109,8 +105,6 @@ class DirectTableUVLoss(nn.Module):
         return {
             "loss": loss,
             "uv_pred_table_mm": uv_pred_table_mm,
-            "uv_base_table_mm": uv_base_table_mm,
-            "vertical_delta_v_mm": delta_v_mm,
         }
 
 
@@ -141,9 +135,7 @@ class DirectVirtualTableUVLoss(nn.Module):
         point_xy_n_pred: Tensor | Mapping[str, Tensor],
         batch: Mapping[str, object],
     ) -> dict[str, Tensor]:
-        point_xy_n_pred, delta_v_mm = _direct_uv_and_vertical_residual(
-            point_xy_n_pred
-        )
+        point_xy_n_pred = _direct_uv_prediction(point_xy_n_pred)
         point_xy_n_pred = validate_uv_tensor(
             point_xy_n_pred,
             "point_xy_n_pred",
@@ -163,14 +155,10 @@ class DirectVirtualTableUVLoss(nn.Module):
                 _required_batch_tensor(batch, "uv_gt_table_mm"),
                 "uv_gt_table_mm",
             ).to(device=point_xy_n_mm.device, dtype=torch.float32)
-            uv_base_table_mm = virtual_camera_xy_to_table_uv(
+            uv_pred_table_mm = virtual_camera_xy_to_table_uv(
                 point_xy_n_mm,
                 table_frame7_n,
                 distance_scale_mm=self.table_distance_scale_mm,
-            )
-            uv_pred_table_mm = _apply_table_v_residual(
-                uv_base_table_mm,
-                delta_v_mm,
             )
             loss = F.smooth_l1_loss(
                 uv_pred_table_mm,
@@ -180,50 +168,20 @@ class DirectVirtualTableUVLoss(nn.Module):
         return {
             "loss": loss,
             "uv_pred_table_mm": uv_pred_table_mm,
-            "uv_base_table_mm": uv_base_table_mm,
-            "vertical_delta_v_mm": delta_v_mm,
             "point_xy_n_mm": point_xy_n_mm,
         }
 
 
-def _direct_uv_and_vertical_residual(
+def _direct_uv_prediction(
     prediction: Tensor | Mapping[str, Tensor],
-) -> tuple[Tensor, Tensor]:
+) -> Tensor:
     if isinstance(prediction, Mapping):
         uv_prediction = prediction.get("uv")
         if not torch.is_tensor(uv_prediction):
             raise TypeError("Direct-UV model mapping must contain tensor 'uv'.")
-        delta_v_mm = prediction.get("vertical_delta_v_mm")
-        if delta_v_mm is None:
-            delta_v_mm = uv_prediction.new_zeros((uv_prediction.shape[0], 1))
-        elif not torch.is_tensor(delta_v_mm):
-            raise TypeError("vertical_delta_v_mm must be a tensor.")
     else:
         uv_prediction = prediction
-        delta_v_mm = prediction.new_zeros((prediction.shape[0], 1))
-    uv_prediction = validate_uv_tensor(uv_prediction, "direct_uv_prediction")
-    delta_v_mm = delta_v_mm.to(
-        device=uv_prediction.device,
-        dtype=torch.float32,
-    )
-    if delta_v_mm.shape != (uv_prediction.shape[0], 1):
-        raise ValueError("vertical_delta_v_mm must have shape [B, 1].")
-    return uv_prediction, delta_v_mm
-
-
-def _apply_table_v_residual(
-    uv_base_table_mm: Tensor,
-    delta_v_mm: Tensor,
-) -> Tensor:
-    """Apply a physical vertical correction while preserving u bit-for-bit."""
-
-    return torch.stack(
-        (
-            uv_base_table_mm[:, 0],
-            uv_base_table_mm[:, 1] + delta_v_mm[:, 0],
-        ),
-        dim=-1,
-    )
+    return validate_uv_tensor(uv_prediction, "direct_uv_prediction")
 
 
 @torch.no_grad()
@@ -261,59 +219,6 @@ def batch_uv_targets(batch: Mapping[str, object]) -> tuple[Tensor, Tensor]:
     if not torch.is_tensor(uv_target) or not torch.is_tensor(uv_gt):
         raise TypeError("uv_target and uv_gt must be torch tensors.")
     return validate_uv_tensor(uv_target, "uv_target"), validate_uv_tensor(uv_gt, "uv_gt")
-
-
-def iris_heatmap_mse_loss(
-    left_logits: Tensor,
-    right_logits: Tensor,
-    iris_center_xy: Tensor,
-    iris_center_valid_mask: Tensor,
-    *,
-    sigma_pixels: float,
-) -> Tensor:
-    """Supervise one Gaussian iris-centre heatmap per eye.
-
-    ``iris_center_xy`` is normalized to each eye crop and ordered left/right.
-    Invalid MediaPipe observations are masked out rather than treated as a
-    negative/background label.
-    """
-
-    if sigma_pixels <= 0:
-        raise ValueError("sigma_pixels must be positive.")
-    if left_logits.ndim != 4 or right_logits.ndim != 4:
-        raise ValueError("Iris heatmap logits must have shape [B, 1, H, W].")
-    if left_logits.shape != right_logits.shape or left_logits.shape[1] != 1:
-        raise ValueError("Left/right iris logits must share shape [B, 1, H, W].")
-    batch_size, _, height, width = left_logits.shape
-    if iris_center_xy.shape != (batch_size, 2, 2):
-        raise ValueError("iris_center_xy must have shape [B, 2, 2].")
-    if iris_center_valid_mask.shape != (batch_size, 2):
-        raise ValueError("iris_center_valid_mask must have shape [B, 2].")
-    centres = iris_center_xy.to(device=left_logits.device, dtype=torch.float32)
-    valid = iris_center_valid_mask.to(device=left_logits.device, dtype=torch.float32)
-    if not torch.isfinite(centres).all() or not torch.isfinite(valid).all():
-        raise ValueError("Iris auxiliary targets must be finite.")
-    if torch.any(valid < 0) or torch.any(valid > 1):
-        raise ValueError("iris_center_valid_mask must lie in [0, 1].")
-
-    y_grid, x_grid = torch.meshgrid(
-        torch.arange(height, device=left_logits.device, dtype=torch.float32),
-        torch.arange(width, device=left_logits.device, dtype=torch.float32),
-        indexing="ij",
-    )
-    logits = torch.cat((left_logits, right_logits), dim=1).float()
-    centres_px = centres.clone()
-    centres_px[..., 0] *= max(width - 1, 1)
-    centres_px[..., 1] *= max(height - 1, 1)
-    distance_sq = (
-        (x_grid[None, None] - centres_px[..., 0, None, None]).square()
-        + (y_grid[None, None] - centres_px[..., 1, None, None]).square()
-    )
-    targets = torch.exp(-0.5 * distance_sq / (sigma_pixels * sigma_pixels))
-    per_eye_loss = F.mse_loss(torch.sigmoid(logits), targets, reduction="none").mean(
-        dim=(-1, -2)
-    )
-    return (per_eye_loss * valid).sum() / valid.sum().clamp_min(1.0)
 
 
 def probabilistic_eye_keypoint_nll(
@@ -429,34 +334,23 @@ class GazeGeometryLossConfig:
 
     uv_huber_beta_mm: float
     uv_huber_weight: float
-    mixture_nll_weight: float
-    mixture_kernel_sigma_mm: float
-    gaze_direction_weight: float
     gaze_angular_weight: float
-    depth_prior_kl_weight: float
     ray_validity_weight: float
     ray_penalty_scale_mm: float
-    depth_correction_prior_weight: float = 0.0
     uv_gaussian_nll_weight: float = 0.0
     uv_covariance_floor_mm2: float = 400.0
 
     def __post_init__(self) -> None:
         if self.uv_huber_beta_mm <= 0:
             raise ValueError("uv_huber_beta_mm must be positive.")
-        if self.mixture_kernel_sigma_mm <= 0:
-            raise ValueError("mixture_kernel_sigma_mm must be positive.")
         if self.ray_penalty_scale_mm <= 0:
             raise ValueError("ray_penalty_scale_mm must be positive.")
         if self.uv_covariance_floor_mm2 <= 0:
             raise ValueError("uv_covariance_floor_mm2 must be positive.")
         weights = (
             self.uv_huber_weight,
-            self.mixture_nll_weight,
-            self.gaze_direction_weight,
             self.gaze_angular_weight,
-            self.depth_prior_kl_weight,
             self.ray_validity_weight,
-            self.depth_correction_prior_weight,
             self.uv_gaussian_nll_weight,
         )
         if any(weight < 0 for weight in weights) or sum(weights) <= 0:
@@ -524,28 +418,7 @@ class GazeGeometryLoss(nn.Module):
             beta=self.config.uv_huber_beta_mm,
         )
 
-        uv_hypotheses = output["uv_hypotheses_mm"]
         effective_weights = output["depth_effective_weights"]
-        if self.config.mixture_nll_weight > 0:
-            squared_error = (uv_hypotheses - uv_gt.unsqueeze(1)).square().sum(dim=-1)
-            sigma2 = self.config.mixture_kernel_sigma_mm**2
-            log_weights = torch.log(
-                effective_weights.clamp_min(
-                    torch.finfo(effective_weights.dtype).tiny
-                )
-            )
-            component_log_likelihood = (
-                log_weights
-                - 0.5 * squared_error / sigma2
-                - torch.log(uv_mean.new_tensor(2.0 * torch.pi * sigma2))
-            )
-            mixture_nll = -torch.logsumexp(
-                component_log_likelihood,
-                dim=-1,
-            ).mean()
-        else:
-            mixture_nll = uv_mean.new_zeros(())
-
         if self.config.uv_gaussian_nll_weight > 0:
             covariance = output.get("uv_covariance_mm2")
             if covariance is None:
@@ -561,10 +434,7 @@ class GazeGeometryLoss(nn.Module):
         else:
             uv_gaussian_nll = uv_mean.new_zeros(())
 
-        if (
-            self.config.gaze_direction_weight > 0
-            or self.config.gaze_angular_weight > 0
-        ):
+        if self.config.gaze_angular_weight > 0:
             raw_eyes = _required_batch_tensor(batch, "raw_eye_geometry_mm").to(
                 device=uv_mean.device,
                 dtype=uv_mean.dtype,
@@ -587,30 +457,12 @@ class GazeGeometryLoss(nn.Module):
             gaze_direction_cosine = (
                 gaze_direction * gaze_target_direction
             ).sum(dim=-1).clamp(-1.0, 1.0)
-            # Sign-only constraint: require the prediction to lie in the same
-            # hemisphere as eye->target GT, without forcing its noisy exact
-            # angle when the PnP eye depth is imperfect.
-            gaze_direction_loss = F.relu(-gaze_direction_cosine).mean()
             gaze_angular = (
                 1.0
                 - gaze_direction_cosine
             ).mean()
         else:
-            gaze_direction_loss = uv_mean.new_zeros(())
             gaze_angular = uv_mean.new_zeros(())
-
-        prior_log_weights = output["depth_prior_log_weights"]
-        posterior_log_weights = output.get(
-            "depth_posterior_log_weights",
-            prior_log_weights,
-        )
-        if self.config.depth_prior_kl_weight > 0:
-            posterior_weights = posterior_log_weights.exp()
-            depth_prior_kl = (
-                posterior_weights * (posterior_log_weights - prior_log_weights)
-            ).sum(dim=-1).mean()
-        else:
-            depth_prior_kl = uv_mean.new_zeros(())
 
         if self.config.ray_validity_weight > 0:
             lambdas = output["lambda_hypotheses_mm"]
@@ -648,39 +500,18 @@ class GazeGeometryLoss(nn.Module):
         else:
             ray_validity = uv_mean.new_zeros(())
 
-        if self.config.depth_correction_prior_weight > 0:
-            standardized_correction = output.get(
-                "depth_correction_standardized"
-            )
-            if standardized_correction is None:
-                raise KeyError(
-                    "depth_correction_prior_weight requires "
-                    "DepthCorrectionHead outputs."
-                )
-            depth_correction_prior = 0.5 * standardized_correction.square().mean()
-        else:
-            depth_correction_prior = uv_mean.new_zeros(())
-
         total = (
             self.config.uv_huber_weight * uv_huber
-            + self.config.mixture_nll_weight * mixture_nll
             + self.config.uv_gaussian_nll_weight * uv_gaussian_nll
-            + self.config.gaze_direction_weight * gaze_direction_loss
             + self.config.gaze_angular_weight * gaze_angular
-            + self.config.depth_prior_kl_weight * depth_prior_kl
             + self.config.ray_validity_weight * ray_validity
-            + self.config.depth_correction_prior_weight * depth_correction_prior
         )
         return {
             "loss": total,
             "uv_huber": uv_huber.detach(),
-            "mixture_nll": mixture_nll.detach(),
             "uv_gaussian_nll": uv_gaussian_nll.detach(),
-            "gaze_direction": gaze_direction_loss.detach(),
             "gaze_angular": gaze_angular.detach(),
-            "depth_prior_kl": depth_prior_kl.detach(),
             "ray_validity": ray_validity.detach(),
-            "depth_correction_prior": depth_correction_prior.detach(),
         }
 
     @torch.no_grad()

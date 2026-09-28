@@ -53,10 +53,6 @@ class ProcessedDatasetArtifacts:
         return self.processed_dir / f"modelv1_dataset{self.dataset_id}_report.json"
 
     @property
-    def deca_cache(self) -> Path:
-        return self.processed_dir / f"deca_features_deca_crop_v1{self.suffix}.npz"
-
-    @property
     def mediapipe_iris_centres(self) -> Path:
         return self.processed_dir / f"mediapipe_iris_centres{self.suffix}.csv"
 

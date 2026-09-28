@@ -12,6 +12,9 @@ from modelv1.processed_artifacts import canonical_dataset_id
 
 PREPROCESSING_PIPELINE_VERSION = "modelv1_metric_depth_virtual_camera_v2"
 PREPROCESSED_V2_DEPTH_METHODS = ("pnp1010", "iris65")
+# Training no longer treats the inferior depth route as a model hyperparameter.
+# Offline preprocessing still supports both methods for reproducibility.
+DEFAULT_TRAINING_DEPTH_METHOD = "iris65"
 
 
 def canonical_preprocessed_v2_depth_method(value: str) -> str:
@@ -70,7 +73,6 @@ class PreprocessedV2TrainingInput:
     virtual_camera_report: Path
     virtual_camera_pose_source: Path
     pnp_geometry_version: str
-    deca_cache: Path | None
     sample_count: int
 
     @classmethod
@@ -145,25 +147,6 @@ class PreprocessedV2TrainingInput:
         if sample_count <= 0:
             raise ValueError(f"sample_count must be positive: {manifest_path}")
 
-        deca_value = payload.get("deca_cache")
-        deca_cache: Path | None
-        if deca_value is None:
-            deca_cache = None
-        elif isinstance(deca_value, str) and deca_value.strip():
-            deca_path = Path(deca_value.strip())
-            if not deca_path.is_absolute():
-                deca_path = manifest_path.parent / deca_path
-            deca_cache = deca_path.resolve()
-            if not deca_cache.is_file():
-                raise FileNotFoundError(
-                    f"Preprocessed-v2 manifest references missing deca_cache: "
-                    f"{deca_cache}"
-                )
-        else:
-            raise ValueError(
-                f"deca_cache must be a path string or null: {manifest_path}"
-            )
-
         return cls(
             manifest_path=manifest_path,
             dataset_id=dataset_id,
@@ -185,7 +168,6 @@ class PreprocessedV2TrainingInput:
             pnp_geometry_version=_required_text(
                 payload, "pnp_geometry_version", manifest_path
             ),
-            deca_cache=deca_cache,
             sample_count=sample_count,
         )
 

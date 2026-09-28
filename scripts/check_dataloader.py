@@ -15,7 +15,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modelv1.data import (
-    DEFAULT_DECA_CACHE_PATH,
     DEFAULT_DEPTH_PRIOR_PATH,
     VirtualCameraManifest,
     build_modelv1_dataloaders,
@@ -26,10 +25,6 @@ from modelv1.data import (
 from modelv1.geometry_gate import EYE_GEOMETRY_GATE_MODES
 from modelv1.data.depth_prior import EYE_GEOMETRY_REPRESENTATIONS
 from modelv1.scene import SCENE_REPRESENTATIONS
-from modelv1.deca_cache import (
-    DECA_FEATURE_REPRESENTATIONS,
-    DECA_FEATURE_REPRESENTATION_NONE,
-)
 from modelv1.depth_distribution import (
     DEPTH_DISTRIBUTION_LEARNED_REWEIGHT,
     DEPTH_DISTRIBUTION_POINT,
@@ -43,6 +38,7 @@ from scripts.train_modelv1 import (
     resolve_preprocessed_v2_artifacts,
     resolve_project_path,
     resolve_sample_id_filter_manifest_path,
+    resolve_table7_stage3_artifacts,
     resolve_virtual_camera_manifest_path,
 )
 
@@ -59,18 +55,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--deca-feature-representation",
-        choices=DECA_FEATURE_REPRESENTATIONS,
-        default="full236",
-        help="full236=all coarse DECA parameters; geometry156=shape+exp+pose.",
-    )
-    parser.add_argument(
-        "--split-mode",
-        choices=["random_80_20", "dataset_5", "explicit_datasets"],
-        default="dataset_5",
-        help="Dataset split strategy to smoke-test.",
-    )
-    parser.add_argument(
         "--train-datasets",
         nargs="+",
         default=["3", "4"],
@@ -81,18 +65,6 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["5"],
         help="Validation dataset names/indices for explicit_datasets.",
-    )
-    parser.add_argument(
-        "--split-seed",
-        type=int,
-        default=42,
-        help="Random seed used by random_80_20.",
-    )
-    parser.add_argument(
-        "--deca-cache",
-        type=Path,
-        default=DEFAULT_DECA_CACHE_PATH,
-        help="DECA .npz cache produced by cache_deca_features.py.",
     )
     parser.add_argument(
         "--use-eye-geometry",
@@ -136,10 +108,6 @@ def main() -> int:
         config = load_config(args.config)
         data_config = config["data"]
         model_config = make_model_config(config["model"])
-        uses_deca_features = (
-            model_config.deca_feature_representation
-            != DECA_FEATURE_REPRESENTATION_NONE
-        )
         uses_gaze_geometry = (
             model_config.prediction_mode == PREDICTION_MODE_GAZE_GEOMETRY
         )
@@ -156,27 +124,33 @@ def main() -> int:
             prefix="modelv1_check_dataloader_"
         )
         run_dir = Path(temporary_run.name)
+        uses_table7_stage3 = (
+            data_config.get("table7_stage3_csv_paths") is not None
+        )
         preprocessed_virtual_manifests: list[Path] = []
-        if data_config.get("preprocessed_v2_root") is not None:
+        if uses_table7_stage3:
+            dataset_csv_path = resolve_table7_stage3_artifacts(
+                data_config,
+                run_dir,
+            )
+            depth_prior_csv_path = None
+        elif data_config.get("preprocessed_v2_root") is not None:
             (
                 dataset_csv_path,
-                deca_cache_path,
                 depth_prior_csv_path,
                 preprocessed_virtual_manifests,
             ) = resolve_preprocessed_v2_artifacts(
                 data_config,
                 run_dir,
-                require_deca_features=uses_deca_features,
                 require_depth_prior=(
                     model_config.use_eye_geometry or uses_gaze_geometry
                 ),
             )
         else:
-            dataset_csv_path, deca_cache_path, depth_prior_csv_path = (
+            dataset_csv_path, depth_prior_csv_path = (
                 resolve_numbered_dataset_artifacts(
                     data_config,
                     run_dir,
-                    require_deca_features=uses_deca_features,
                     require_depth_prior=(
                         model_config.use_eye_geometry or uses_gaze_geometry
                     ),
@@ -215,18 +189,11 @@ def main() -> int:
             train_datasets=data_config.get("train_datasets", ("3", "4")),
             val_datasets=data_config.get("val_datasets", ("5",)),
             split_mode=data_config["split_mode"],
-            all_datasets=data_config["all_datasets"],
-            val_ratio=float(data_config["val_ratio"]),
-            split_seed=int(data_config["split_seed"]),
             batch_size=min(4, int(data_config["batch_size"])),
             num_workers=0,
             pin_memory=False,
             normalize_images=bool(data_config["normalize_images"]),
-            load_face_image=bool(data_config["load_face_image"]),
-            eye_image_size=tuple(data_config.get("eye_image_size", (60, 36))),
             train_paired_eye_transform=make_eye_appearance_augmentation(data_config),
-            deca_cache_path=deca_cache_path,
-            require_deca_features=uses_deca_features,
             normalize_uv_targets=not uses_gaze_geometry,
             use_eye_geometry=model_config.use_eye_geometry,
             use_gaze_geometry=uses_gaze_geometry,
@@ -240,11 +207,7 @@ def main() -> int:
             eye_geometry_gate_mode=model_config.eye_geometry_gate_mode,
             eye_geometry_representation=model_config.eye_geometry_representation,
             scene_representation=model_config.scene_representation,
-            deca_feature_representation=model_config.deca_feature_representation,
             image_source=image_source,
-            eye_image_source=str(
-                data_config.get("eye_image_source", image_source)
-            ),
             virtual_camera_manifest_path=virtual_camera_manifest_path,
             filter_invalid_virtual_camera_samples=bool(
                 data_config.get("skip_invalid_virtual_camera_samples", False)
@@ -253,8 +216,8 @@ def main() -> int:
             direct_uv_target_frame=str(
                 data_config.get("direct_uv_target_frame", "table_local")
             ),
-            use_virtual_distance_film=model_config.use_virtual_distance_film,
-            use_virtual_pose_film=model_config.use_virtual_pose_film,
+            use_table_frame_film=model_config.use_table_frame_film,
+            precomputed_table_frame7=uses_table7_stage3,
             eye_geometry_pseudo_label_paths=(
                 eye_geometry_pseudo_label_paths
             ),
@@ -264,7 +227,6 @@ def main() -> int:
         )
         split_mode = str(data_config["split_mode"])
         scene_representation = model_config.scene_representation
-        deca_representation = model_config.deca_feature_representation
         eye_representation = model_config.eye_geometry_representation
     else:
         use_eye_geometry = (
@@ -274,28 +236,15 @@ def main() -> int:
             batch_size=4,
             train_datasets=args.train_datasets,
             val_datasets=args.val_datasets,
-            split_mode=args.split_mode,
-            split_seed=args.split_seed,
-            deca_cache_path=(
-                None
-                if args.deca_feature_representation
-                == DECA_FEATURE_REPRESENTATION_NONE
-                else args.deca_cache
-            ),
-            require_deca_features=(
-                args.deca_feature_representation
-                != DECA_FEATURE_REPRESENTATION_NONE
-            ),
+            split_mode="explicit_datasets",
             use_eye_geometry=use_eye_geometry,
             depth_prior_csv_path=args.depth_prior,
             eye_geometry_gate_mode=args.eye_geometry_gate_mode,
             eye_geometry_representation=args.eye_geometry_representation,
             scene_representation=args.scene_representation,
-            deca_feature_representation=args.deca_feature_representation,
         )
-        split_mode = args.split_mode
+        split_mode = "explicit_datasets"
         scene_representation = args.scene_representation
-        deca_representation = args.deca_feature_representation
         eye_representation = args.eye_geometry_representation
     batch = next(iter(train_loader))
     val_batch = next(iter(val_loader))
@@ -311,12 +260,9 @@ def main() -> int:
     print("crop_cam_vec:", tuple(batch["crop_cam_vec"].shape))
     print("scene_vec:", tuple(batch["scene_vec"].shape))
     print("scene representation:", scene_representation)
-    print("DECA feature representation:", deca_representation)
     print("eye geometry representation:", eye_representation)
     print("uv_gt:", tuple(batch["uv_gt"].shape))
     print("uv_target:", tuple(batch["uv_target"].shape))
-    if "deca_feat" in batch:
-        print("deca_feat:", tuple(batch["deca_feat"].shape))
     if "eye_geometry_vec" in batch:
         print("eye_geometry_vec:", tuple(batch["eye_geometry_vec"].shape))
         geometry_normalizer = get_eye_geometry_normalizer(train_loader.dataset)

@@ -1,0 +1,63 @@
+experiment:
+  run_name: native_blazegaze_supervised_d13_to_d11_seed42
+  output_root: outputs/blazegaze_native
+  seed: 42
+  deterministic: true
+
+data:
+  # Required for publication runs. Supply the fixed physical/protocol rectangle
+  # here or through --pog-bounds-mm; never estimate it from validation/test rows.
+  pog_bounds_mm: null
+  eye_patch_manifest_paths:
+    - data/preprocessed_blazegaze/table7/blazegaze_eye_patches.csv
+  train:
+    stage3_csv_paths:
+      - data/preprocessed_table7/dataset13/stage3_virtual_table7/training_table7_dataset13.csv
+    metric_pose_csv_paths:
+      - data/preprocessed_table7/dataset13/stage2_metric_head_pose/iris65_metric_head_pose_dataset13.csv
+  val:
+    stage3_csv_paths:
+      - data/preprocessed_table7/dataset11/stage3_virtual_table7/training_table7_dataset11.csv
+    metric_pose_csv_paths:
+      - data/preprocessed_table7/dataset11/stage2_metric_head_pose/iris65_metric_head_pose_dataset11.csv
+  batch_size: 8
+  num_workers: 0
+  pin_memory: true
+  # The released MPIIFaceGaze config uses uniform weights. Set the alternative
+  # below to reproduce WebEyeTrack's optional 30x30 inverse-frequency grid.
+  sample_weighting: uniform
+  weight_bins: 30
+
+model:
+  architecture: native_blazegaze
+  image_shape_chw: [3, 128, 512]
+  embedding_size: 512
+  gaze_mlp_dims: [518, 16, 16, 2]
+  use_decoder: true
+
+loss:
+  gaze_weight: 1.0
+  reconstruction_weight: 1.0
+  consistency_weight: 0.2
+
+training:
+  epochs: 80
+  device: auto
+  learning_rate: 0.001
+  decay_rate: 0.95
+  grad_clip_norm: null
+
+logging:
+  wandb:
+    enabled: true
+    project: ModelV1_virtual_camera_cross_camera
+    entity: null
+    mode: online
+    group: native_blazegaze_supervised
+    tags:
+      - NativeBlazeGaze
+      - supervised_stage1
+      - exact_mediapipe478_homography
+      - train_dataset_13
+      - val_dataset_11
+      - seed42

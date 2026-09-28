@@ -44,24 +44,24 @@ class ProbabilisticEyeLandmarkHead(nn.Module):
         shape_embedding_dim: int = 32,
     ) -> None:
         super().__init__()
-        if min(
-            layer2_channels,
-            layer3_channels,
-            hidden_channels,
-            keypoint_count,
-            shape_embedding_dim,
-        ) <= 0:
-            raise ValueError("Eye-landmark head dimensions must be positive.")
-        if keypoint_count != EYE_PSEUDO_POINT_COUNT:
-            raise ValueError(
-                "keypoint_count must match the 15-point pseudo-label schema."
-            )
-        if len(output_size) != 2 or min(output_size) <= 1:
-            raise ValueError("output_size must be a two-item spatial size > 1.")
-        if temperature <= 0:
-            raise ValueError("temperature must be positive.")
-        if max_abs_log_std_correction <= 0:
-            raise ValueError("max_abs_log_std_correction must be positive.")
+        # if min(
+        #     layer2_channels,
+        #     layer3_channels,
+        #     hidden_channels,
+        #     keypoint_count,
+        #     shape_embedding_dim,
+        # ) <= 0:
+        #     raise ValueError("Eye-landmark head dimensions must be positive.")
+        # if keypoint_count != EYE_PSEUDO_POINT_COUNT:
+        #     raise ValueError(
+        #         "keypoint_count must match the 15-point pseudo-label schema."
+        #     )
+        # if len(output_size) != 2 or min(output_size) <= 1:
+        #     raise ValueError("output_size must be a two-item spatial size > 1.")
+        # if temperature <= 0:
+        #     raise ValueError("temperature must be positive.")
+        # if max_abs_log_std_correction <= 0:
+        #     raise ValueError("max_abs_log_std_correction must be positive.")
         self.keypoint_count = int(keypoint_count)
         self.output_size = tuple(int(value) for value in output_size)
         self.temperature = float(temperature)
@@ -95,30 +95,31 @@ class ProbabilisticEyeLandmarkHead(nn.Module):
         )
 
     def forward(self, layer2: Tensor, layer3: Tensor) -> dict[str, Tensor]:
-        _validate_feature_map(layer2, "layer2")
-        _validate_feature_map(layer3, "layer3")
-        if layer2.shape[0] != layer3.shape[0]:
-            raise ValueError("layer2 and layer3 must share the batch dimension.")
-        layer2_features = self.layer2_projection(layer2)
+        """
+        输入一只眼睛的 ResNet 中层特征 layer2/layer3，预测 15 个眼部伪关键点的概率热力图，
+        然后从热力图里解析出每个关键点的坐标均值、协方差、不确定性、可见性，以及一个整体眼形 embedding。
+        heatmap 本身给出一个基础不确定性；variance_predictor 再根据整只眼睛的状态，对这个不确定性做放大或缩小
+        """
+        layer2_features = self.layer2_projection(layer2)  # 投影到同一个通道数128；  -->[B,128,14,23]
+        layer3_projected = self.layer3_projection(layer3)
         layer3_features = F.interpolate(
-            self.layer3_projection(layer3),
+            layer3_projected.float(),
             size=layer2.shape[-2:],
             mode="bilinear",
             align_corners=False,
-        )
-        fused = self.fusion(torch.cat((layer2_features, layer3_features), dim=1))
+        ).to(dtype=layer3_projected.dtype)  # 投影到同一个通道数128，并上采样；-->[B,128,14,23]
+        fused = self.fusion(torch.cat((layer2_features, layer3_features), dim=1))  # -->[B,256,14,23] -->[B,128,14,23]
         decoded = F.interpolate(
-            fused,
+            fused.float(),
             size=self.output_size,
             mode="bilinear",
-            align_corners=False,
-        )
-        logits = self.heatmap_predictor(decoded)
-        pooled = F.adaptive_avg_pool2d(fused, output_size=1).flatten(start_dim=1)
-        visibility_logits = self.visibility_predictor(pooled)
-        moments = spatial_probability_moments(logits, self.temperature)
-
-        covariance_heatmap = moments["covariance"]
+            align_corners=False,  # 控制插值输入和输出网格的角点是否对齐
+        ).to(dtype=fused.dtype)  # 插值到高宽为28x45的尺寸；-->[B,128,28,45]
+        logits = self.heatmap_predictor(decoded)  # 预测每个关键点的 heatmap logits； -->[B,15,28,45]
+        pooled = F.adaptive_avg_pool2d(fused, output_size=1).flatten(start_dim=1)  # 池化到特征维度为128的向量； -->[B,128]
+        visibility_logits = self.visibility_predictor(pooled)  # 预测每个关键点的可见性 logits； -->[B,15]
+        moments = spatial_probability_moments(logits, self.temperature)  # 计算概率分布的均值、协方差、不确定性
+        covariance_heatmap = moments["covariance"]  # 获取概率分布的协方差  
         if self.variance_predictor is None:
             log_std_correction = logits.new_zeros(
                 (logits.shape[0], self.keypoint_count, 2), dtype=torch.float32
@@ -127,33 +128,33 @@ class ProbabilisticEyeLandmarkHead(nn.Module):
         else:
             raw_correction = self.variance_predictor(pooled).reshape(
                 logits.shape[0], self.keypoint_count, 2
-            )
+            )  # 预测每个关键点的协方差； -->[B,15,2]
             log_std_correction = self.max_abs_log_std_correction * torch.tanh(
                 raw_correction.float()
-            )
-            std_scale = torch.exp(log_std_correction)
+            )  # 限制范围
+            std_scale = torch.exp(log_std_correction)  # 变成尺度
             covariance = (
                 covariance_heatmap
                 * std_scale.unsqueeze(-1)
                 * std_scale.unsqueeze(-2)
-            )
-        canonical_shape = canonicalize_eye_landmark_shape(moments["mean_xy"])
+            )  # 修正协方差
+        canonical_shape = canonicalize_eye_landmark_shape(moments["mean_xy"])  # 用关键点的平均坐标 mean_xy 构造一个“标准眼睛坐标系”。
         shape_embedding = F.normalize(
             self.shape_encoder(canonical_shape.flatten(start_dim=1)),
             dim=-1,
             eps=1e-8,
-        )
+        )  # 用一个向量表示一个“标准眼睛坐标系”，并归一化
         return {
-            "logits": logits,
-            **moments,
-            "covariance_heatmap": covariance_heatmap,
-            "covariance": covariance,
-            "variance_xy": torch.diagonal(covariance, dim1=-2, dim2=-1),
-            "log_std_correction": log_std_correction,
-            "visibility_logits": visibility_logits,
-            "visibility_probability": torch.sigmoid(visibility_logits.float()),
-            "canonical_shape": canonical_shape,
-            "shape_embedding": shape_embedding,
+            "logits": logits,  #关键点heatmap; -->[B,15,28,45]
+            **moments,  # 关键点概率分布的均值、协方差、不确定性；
+            "covariance_heatmap": covariance_heatmap,  # 关键点概率分布的协方差（热力图自己算出来的原始不确定性）；-->[64, 15, 2, 2]
+            "covariance": covariance,  # 获取概率分布的协方差（经过全局特征预测的方差修正之后的不确定性）；-->[64, 15, 2, 2]
+            "variance_xy": torch.diagonal(covariance, dim1=-2, dim2=-1),  # 提取协方差矩阵的对角线元素（方差）；-->[64, 15, 2]
+            "log_std_correction": log_std_correction,  # 获取概率分布的协方差修正参数；-->[64, 15, 2]
+            "visibility_logits": visibility_logits,  # 关键点可见性 logits；-->[B,15]
+            "visibility_probability": torch.sigmoid(visibility_logits.float()),  # 获取关键点可见性（转换为概率）；-->[B,15]
+            "canonical_shape": canonical_shape,  # 用关键点的平均坐标 mean_xy 构造一个“标准眼睛坐标系”；存储了标准眼睛局部坐标系下的坐标；-->[B,15,2]
+            "shape_embedding": shape_embedding,  # 用一个向量表示一个“标准眼睛坐标系”，并归一化；-->[64, 32]
         }
 
 
@@ -233,14 +234,14 @@ class ProbabilisticLandmarkTokenizer(nn.Module):
                 size=spatial_size,
                 mode="bilinear",
                 align_corners=False,
-            ),
+            ),  # 插值缩放到spatial_size，后面要和 projected 特征图逐位置相乘、加权求和
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
-        ).clamp_min(0.0)
+        ).clamp_min(0.0)  # 插值后可能出现 NaN 或 Inf，或者负数，全部置为 0
         probabilities = probabilities / probabilities.sum(
             dim=(-1, -2), keepdim=True
-        ).clamp_min(1e-8)
+        ).clamp_min(1e-8)  # 经过 F.interpolate 缩放后，总和不一定还等于 1；这里重新做加权平均
         if detach:
             probabilities = probabilities.detach()
         return probabilities.to(dtype=dtype)
@@ -251,14 +252,17 @@ class ProbabilisticLandmarkTokenizer(nn.Module):
         feature_map: Tensor,
         projection: nn.Module,
     ) -> Tensor:
-        projected = projection(feature_map)
+        '''
+        先从ResNet 特征空间 -> 1x1 Conv -> 关键点采样用的 token 特征空间；再用关键点 heatmap 当作空间权重，在 layer2 特征图上做加权采样
+        '''
+        projected = projection(feature_map)  # 经过 1x1 Conv，进行投影;1x1 Conv 可以学习重新加权和组合这些通道,让模型学习“哪些通道适合关键点采样”
         probabilities = self._normalized_probability_at_size(
-            probability_maps,
-            tuple(projected.shape[-2:]),
-            detach=self.detach_probability_for_sampling,
-            dtype=projected.dtype,
-        )
-        return torch.einsum("bkhw,bchw->bkc", probabilities, projected)
+            probability_maps,  # 原始关键点概率图，--> [B,15,28,45]
+            tuple(projected.shape[-2:]),  # 当前特征图的空间尺寸
+            detach=self.detach_probability_for_sampling,  # 是否切断 probability_maps 到采样过程的梯度
+            dtype=projected.dtype,  # 输出 dtype 和 projected 保持一致，比如 float16/bfloat16/float32
+        )  # 把关键点 heatmap 概率图缩放到当前特征图的空间大小，并重新整理成一个合法的概率分布，然后用它去做关键点位置的特征采样。
+        return torch.einsum("bkhw,bchw->bkc", probabilities, projected)  # 对每个关键点 k，用它的概率热力图，在 feature_map 上做加权平均。
 
     def _tokenize_eye(
         self,
@@ -272,82 +276,64 @@ class ProbabilisticLandmarkTokenizer(nn.Module):
         entropy: Tensor,
         eye_index: int,
     ) -> tuple[Tensor, Tensor]:
-        batch_size = layer2.shape[0]
-        expected_points = (batch_size, self.keypoint_count)
-        if probability_maps.ndim != 4 or probability_maps.shape[:2] != expected_points:
-            raise ValueError("probability_maps must have shape [B, 15, H, W].")
-        if mean_xy.shape != (*expected_points, 2):
-            raise ValueError("mean_xy must have shape [B, 15, 2].")
-        if covariance.shape != (*expected_points, 2, 2):
-            raise ValueError("covariance must have shape [B, 15, 2, 2].")
-        if visibility_probability.shape != expected_points:
-            raise ValueError(
-                "visibility_probability must have shape [B, 15]."
-            )
-        if entropy.shape != expected_points:
-            raise ValueError("entropy must have shape [B, 15].")
-        if eye_index not in {0, 1}:
-            raise ValueError("eye_index must be zero (left) or one (right).")
-
         layer2_appearance = self._appearance_tokens(
             probability_maps, layer2, self.layer2_projection
-        )
+        )  # 从 layer2 提取关键点外观; [64, 128, 14, 23]-->[64, 15, 128]
         layer3_appearance = self._appearance_tokens(
             probability_maps, layer3, self.layer3_projection
-        )
+        )  # 从 layer3 提取关键点外观; [64, 256, 14, 23]-->[64, 15, 128]
         covariance = 0.5 * (
             covariance.float() + covariance.float().transpose(-1, -2)
-        )
+        )  # 将协方差矩阵转换为对称矩阵
         statistics = torch.cat(
             (
-                mean_xy.float(),
-                covariance[..., 0, 0:1],
-                covariance[..., 0, 1:2],
-                covariance[..., 1, 1:2],
-                visibility_probability.float().unsqueeze(-1),
-                entropy.float().unsqueeze(-1),
+                mean_xy.float(),  # [64, 15, 2]     ← 期望坐标 (x, y)
+                covariance[..., 0, 0:1],  # [64, 15, 2, 2]  方差 σx²  ← 协方差矩阵
+                covariance[..., 0, 1:2],  # [64, 15, 1]  协方差 σxy
+                covariance[..., 1, 1:2],  # [64, 15, 1]  方差 σy²
+                visibility_probability.float().unsqueeze(-1),  # [64, 15]   ← 可见性概率
+                entropy.float().unsqueeze(-1),   # [64, 15]    ← 归一化熵
             ),
             dim=-1,
-        )
+        )  # 将位置、不确定性和置信度拼接成一个统一的一维特征向量，作为每个关键点的完整统计描述; -->[64, 15, 7]
         statistics = torch.nan_to_num(
             statistics, nan=0.0, posinf=1.0, neginf=-1.0
-        )
+        )  # [64, 15, 7]
         if self.detach_landmark_statistics:
             statistics = statistics.detach()
         statistics_features = self.statistics_projection(statistics).to(
             dtype=layer2_appearance.dtype
-        )
+        )  # [64, 15, 7] --一个小MLP--> [64, 15, 128]
         tokens = self.token_fusion(
             torch.cat(
                 (layer2_appearance, layer3_appearance, statistics_features),
                 dim=-1,
             )
-        )
+        )  # [B,15,128] + [B,15,128] + [B,15,128] --> [B,15,384] --> [64, 15, 128]
         tokens = self.output_norm(
             tokens
-            + self.point_embedding.to(dtype=tokens.dtype)
+            + self.point_embedding.to(dtype=tokens.dtype)  # 表示第几个关键点；[1,15,128]
             + self.eye_type_embedding[eye_index : eye_index + 1].to(
                 dtype=tokens.dtype
-            )
-        )
-
+            )  # 表示左眼还是右眼;[2,1,128] --> [1,1,128]
+        )  # 向特征向量中添加位置编码和类型编码；[B,15,128] + [1,15,128] + [1,1,128] -->[64, 15, 128]
         posterior_std = torch.diagonal(
             covariance, dim1=-2, dim2=-1
-        ).clamp_min(0.0).sum(dim=-1).sqrt()
-        visibility = visibility_probability.float().clamp(0.0, 1.0)
-        normalized_entropy = entropy.float().clamp(0.0, 1.0)
+        ).clamp_min(0.0).sum(dim=-1).sqrt()  # 将对角线（cov_xx, cov_yy）方差求和后开平方根,计算后验标准差；[64, 15]
+        visibility = visibility_probability.float().clamp(0.0, 1.0)  # 关键点可见性概率（0~1），来自可见性分类头;[64, 15]
+        normalized_entropy = entropy.float().clamp(0.0, 1.0)  # 归一化熵（0~1）;[64, 15]
         raw_quality = (
             visibility
             * (1.0 - 0.5 * normalized_entropy)
             * torch.exp(-posterior_std / self.uncertainty_scale_norm)
-        ).clamp(0.0, 1.0)
+        ).clamp(0.0, 1.0)  # 计算原始质量分数;[64, 15]
         quality = self.min_quality + (1.0 - self.min_quality) * raw_quality
         quality = torch.nan_to_num(
             quality,
             nan=self.min_quality,
             posinf=1.0,
             neginf=self.min_quality,
-        )
+        )  # 映射到最终质量分数;[64, 15]
         return tokens, quality
 
     def forward(
@@ -359,6 +345,9 @@ class ProbabilisticLandmarkTokenizer(nn.Module):
         right_layer3: Tensor,
         predictions: Mapping[str, Tensor],
     ) -> dict[str, Tensor]:
+        '''
+        它把左右眼关键点预测结果和 ResNet 的 layer2/layer3 眼部特征，转换成可以给交叉注意力使用的 landmark tokens。
+        '''
         left_tokens, left_quality = self._tokenize_eye(
             layer2=left_layer2,
             layer3=left_layer3,
@@ -470,8 +459,7 @@ class LandmarkGuidedEyeFusion(nn.Module):
         predictions: Mapping[str, Tensor],
         return_attention: bool = False,
     ) -> dict[str, Tensor]:
-        if eye_tokens.ndim != 3 or eye_tokens.shape[-1] != self.token_dim:
-            raise ValueError("eye_tokens must have shape [B, N, token_dim].")
+        # if eye_tokens.ndim != 3 or eye_tokens.shape[-1] != self.token_dim:
         tokenized = self.tokenizer(
             left_layer2=left_layer2,
             left_layer3=left_layer3,
@@ -479,46 +467,47 @@ class LandmarkGuidedEyeFusion(nn.Module):
             right_layer3=right_layer3,
             predictions=predictions,
         )
-        landmark_tokens = tokenized["tokens"]
-        quality = tokenized["quality"]
-        quality_for_fusion = quality.detach() if self.detach_quality else quality
-        query = self.query_norm(eye_tokens)
-        landmark_key = self.landmark_norm(
+        landmark_tokens = tokenized["tokens"]  # 关键点 Token;[64, 30, 128]
+        quality = tokenized["quality"]  # [64, 30]
+        quality_for_fusion = quality.detach() if self.detach_quality else quality  # 切断沿着 quality 的反向传播路径;[64, 30]
+        # 质量是一个控制信号，用来告诉融合模块该信任哪些关键点；避免主任务为了获得更好的融合结果，反过来任意操纵质量分数
+        query = self.query_norm(eye_tokens)  # Query：眼图 Token;[64, 168, 128]
+        landmark_key = self.landmark_norm(  
             landmark_tokens
             + self.quality_embedding(
-                quality_for_fusion.to(dtype=landmark_tokens.dtype).unsqueeze(-1)
-            )
-        )
+                quality_for_fusion.to(dtype=landmark_tokens.dtype).unsqueeze(-1) 
+            )  # 关键点质量嵌入;[64, 30] --> [64, 30, 1]
+        )  # Key：关键点身份和质量
         landmark_value = landmark_tokens * quality_for_fusion.to(
             dtype=landmark_tokens.dtype
-        ).unsqueeze(-1)
+        ).unsqueeze(-1)  # Value：被取出的关键点内容;[64, 30, 128]
 
         attention_bias = self.quality_logit_scale * torch.log(
             quality_for_fusion.clamp_min(1e-4)
-        )
+        )  # 关键点质量对权重的缩放;[64, 30]
         attention_bias = (
-            attention_bias[:, None, None, :]
-            .expand(-1, self.num_heads, eye_tokens.shape[1], -1)
+            attention_bias[:, None, None, :]  # [64, 1, 1, 30]
+            .expand(-1, self.num_heads, eye_tokens.shape[1], -1)  # expand[-1, 4, 168, -1] --> [64, 4, 168, 30]
             .reshape(
-                eye_tokens.shape[0] * self.num_heads,
-                eye_tokens.shape[1],
-                landmark_tokens.shape[1],
+                eye_tokens.shape[0] * self.num_heads,  # 64*4=256
+                eye_tokens.shape[1],  # 168
+                landmark_tokens.shape[1],  # 30
             )
             .to(dtype=query.dtype)
-        )
+        )  # [256, 168, 30]
         attended, attention_weights = self.cross_attention(
-            query=query,
-            key=landmark_key,
-            value=landmark_value,
-            attn_mask=attention_bias,
-            need_weights=return_attention,
+            query=query,  # [64, 168, 128]  眼图空间 Token
+            key=landmark_key,  # [64, 30,128]  关键点匹配信息
+            value=landmark_value,  # [64, 30, 128]  关键点内容
+            attn_mask=attention_bias,  # 不希望查询（168个空间位置）关注的位置（30个关键点中的某些）,掩码值会设为 -inf 或一个极大的负数，使得 Softmax 后这些位置的权重变为 0
+            need_weights=return_attention,  # False；对 scores 的最后一个维度（S=30）做 Softmax，得到注意力权重 attn_weights
             average_attn_weights=False,
-        )
-        delta = self.delta_dropout(self.delta_norm(attended))
-        global_gate = self.gate_max * torch.tanh(self.raw_gate)
-        sample_quality = quality_for_fusion.mean(dim=-1, keepdim=True)
-        applied_gate = global_gate * sample_quality
-        applied_delta = applied_gate.unsqueeze(-1) * delta
+        )  # [64, 168, 128], None
+        delta = self.delta_dropout(self.delta_norm(attended))  # 修正量 delta；不直接加到眼图 Token 上，需要经过门控；[64, 168, 128]
+        global_gate = self.gate_max * torch.tanh(self.raw_gate)  # 可训练参数，关键点修正眼图特征
+        sample_quality = quality_for_fusion.mean(dim=-1, keepdim=True)  # 将 30 个关键点的质量取平均;[64, 1]
+        applied_gate = global_gate * sample_quality  # [64, 1];关键点修正眼图特征最终门控同时取决于：模型全局是否愿意使用关键点信息;当前样本的关键点是否可靠
+        applied_delta = applied_gate.unsqueeze(-1) * delta  # [64, 168, 128]
         refined_eye_tokens = eye_tokens + applied_delta
 
         output = {
@@ -529,9 +518,10 @@ class LandmarkGuidedEyeFusion(nn.Module):
             "global_gate": global_gate.expand(eye_tokens.shape[0], 1),
             "applied_gate": applied_gate,
             "delta_norm": torch.linalg.vector_norm(
-                applied_delta.float(), dim=-1
-            ).mean(dim=-1, keepdim=True),
-        }
+                applied_delta.float(), dim=-1  # 沿着最后一维计算 L2范数； [64, 168, 128] --> [64, 168]
+            ).mean(dim=-1, keepdim=True),  # 沿着关键点维度求平均值，保留维度；[64, 168] --> [64, 1]
+            # 代表该批次中所有关键点位移/特征向量的平均长度
+        }  
         if return_attention and attention_weights is not None:
             output["attention_weights"] = attention_weights
         return output
@@ -555,41 +545,36 @@ def _conv_norm_activation(
         nn.SiLU(inplace=True),
     )
 
-
-def _validate_feature_map(value: Tensor, name: str) -> None:
-    if value.ndim != 4 or min(value.shape[-2:]) <= 0:
-        raise ValueError(f"{name} must have shape [B, C, H, W].")
-
-
 def spatial_probability_moments(
     logits: Tensor,
     temperature: float,
 ) -> dict[str, Tensor]:
     """Return spatial probabilities, normalized means, and full covariance."""
 
-    if logits.ndim != 4:
-        raise ValueError("Landmark logits must have shape [B, K, H, W].")
-    if temperature <= 0:
-        raise ValueError("temperature must be positive.")
+
+    # if logits.ndim != 4:
+    #     raise ValueError("Landmark logits must have shape [B, K, H, W].")
+    # if temperature <= 0:
+    #     raise ValueError("temperature must be positive.")
     batch_size, keypoint_count, height, width = logits.shape
     probabilities = torch.softmax(
         logits.float().flatten(start_dim=2) / float(temperature), dim=-1
-    )
+    )  # 对每个关键点的 28x45 热力图做 softmax，得到概率分布; --> [B,15,28,45]
     y_coordinates, x_coordinates = torch.meshgrid(
         torch.linspace(0.0, 1.0, height, device=logits.device),
         torch.linspace(0.0, 1.0, width, device=logits.device),
         indexing="ij",
-    )
+    )  # 创建一个坐标网格
     coordinate_grid = torch.stack((x_coordinates, y_coordinates), dim=-1).reshape(
         height * width, 2
-    )
-    mean_xy = torch.einsum("bkn,nc->bkc", probabilities, coordinate_grid)
+    )  # 堆叠成坐标表； --> [28*45,2]
+    mean_xy = torch.einsum("bkn,nc->bkc", probabilities, coordinate_grid)  # 用概率作权重，对所有像素坐标做加权求和；归一化坐标； -->[B,15,2]
     centered = coordinate_grid[None, None] - mean_xy[:, :, None]
     covariance = torch.einsum(
         "bkn,bknc,bknd->bkcd", probabilities, centered, centered
-    )
-    log_probabilities = torch.log(probabilities.clamp_min(1e-12))
-    entropy = -(probabilities * log_probabilities).sum(dim=-1)
+    )  # 计算协方差矩阵
+    log_probabilities = torch.log(probabilities.clamp_min(1e-12))  # 计算对数概率
+    entropy = -(probabilities * log_probabilities).sum(dim=-1)  # 计算熵
     if height * width > 1:
         entropy = entropy / math.log(height * width)
     return {
@@ -600,17 +585,17 @@ def spatial_probability_moments(
         "covariance": covariance,
         "variance_xy": torch.diagonal(covariance, dim1=-2, dim2=-1),
         "entropy": entropy,
-        "confidence": (1.0 - entropy).clamp(0.0, 1.0),
+        "confidence": (1.0 - entropy).clamp(0.0, 1.0),  # 获取关键点置信度
     }
 
 
 def canonicalize_eye_landmark_shape(points_xy: Tensor) -> Tensor:
-    """Map either anatomical eye to an outer-to-inner canonical eye frame."""
-
+    """用外眼角到内眼角的方向作为局部 x 轴，用两眼角中点作为原点，用眼角距离作为尺度。
+       去掉一部分平移、尺度、左右眼方向差异，让模型更关注“眼形结构本身”"""
     if points_xy.ndim != 3 or points_xy.shape[1:] != (EYE_PSEUDO_POINT_COUNT, 2):
         raise ValueError("points_xy must have shape [B, 15, 2].")
-    outer = points_xy[:, OUTER_CANTHUS_INDEX]
-    inner = points_xy[:, INNER_CANTHUS_INDEX]
+    outer = points_xy[:, OUTER_CANTHUS_INDEX]  # 第 0 个点：outer canthus，外眼角
+    inner = points_xy[:, INNER_CANTHUS_INDEX]  # 第 5 个点：inner canthus，内眼角
     origin = 0.5 * (outer + inner)
     x_vector = inner - outer
     scale = torch.linalg.vector_norm(x_vector, dim=-1, keepdim=True).clamp_min(1e-4)
@@ -986,1289 +971,6 @@ def eye_landmark_validation_metrics(
         "eye_landmark_ellipse_reprojection_error": ellipse_reprojection_error,
         "eye_landmark_teacher_quality_error_corr": correlation,
     }
-
-
-class LowDOFDifferentiableEyeballTemplate(nn.Module):
-    """Fit a weak-perspective spherical eyeball with only yaw and pitch free.
-
-    The ten canthus/eyelid landmarks define an isotropic pixel-space eye frame.
-    The iris centre and four unordered rim points score a bounded yaw/pitch
-    candidate grid. A spatial posterior, rather than an argmin, keeps the fit
-    differentiable and exposes angular covariance for later uncertainty gates.
-    """
-
-    def __init__(
-        self,
-        *,
-        eye_image_size: tuple[int, int] = (90, 56),
-        pitch_range_deg: tuple[float, float] = (-35.0, 35.0),
-        yaw_range_deg: tuple[float, float] = (-45.0, 45.0),
-        pitch_bins: int = 29,
-        yaw_bins: int = 31,
-        posterior_temperature: float = 0.25,
-        covariance_floor_px: float = 0.75,
-        min_canthus_distance_px: float = 4.0,
-        min_geometry_confidence: float = 0.1,
-        center_energy_weight: float = 1.0,
-        rim_energy_weight: float = 1.0,
-        angle_prior_weight: float = 0.05,
-        learnable_template: bool = True,
-        use_reference_uncertainty: bool = True,
-        use_aperture_visibility: bool = True,
-    ) -> None:
-        super().__init__()
-        if len(eye_image_size) != 2 or min(eye_image_size) <= 1:
-            raise ValueError("eye_image_size must be (width, height), both > 1.")
-        if len(pitch_range_deg) != 2 or pitch_range_deg[0] >= pitch_range_deg[1]:
-            raise ValueError("pitch_range_deg must be an increasing pair.")
-        if len(yaw_range_deg) != 2 or yaw_range_deg[0] >= yaw_range_deg[1]:
-            raise ValueError("yaw_range_deg must be an increasing pair.")
-        if pitch_bins < 3 or yaw_bins < 3:
-            raise ValueError("pitch_bins and yaw_bins must be at least three.")
-        if posterior_temperature <= 0 or covariance_floor_px <= 0:
-            raise ValueError("Posterior temperature and covariance floor must be positive.")
-        if min_canthus_distance_px <= 0:
-            raise ValueError("min_canthus_distance_px must be positive.")
-        if not 0 <= min_geometry_confidence <= 1:
-            raise ValueError("min_geometry_confidence must lie in [0, 1].")
-        if min(center_energy_weight, rim_energy_weight, angle_prior_weight) < 0:
-            raise ValueError("Eyeball-template energy weights must be non-negative.")
-
-        self.eye_image_size = tuple(int(value) for value in eye_image_size)
-        self.posterior_temperature = float(posterior_temperature)
-        self.covariance_floor_px = float(covariance_floor_px)
-        self.min_canthus_distance_px = float(min_canthus_distance_px)
-        self.min_geometry_confidence = float(min_geometry_confidence)
-        self.center_energy_weight = float(center_energy_weight)
-        self.rim_energy_weight = float(rim_energy_weight)
-        self.angle_prior_weight = float(angle_prior_weight)
-        self.use_reference_uncertainty = bool(use_reference_uncertainty)
-        self.use_aperture_visibility = bool(use_aperture_visibility)
-        self.pitch_bins = int(pitch_bins)
-        self.yaw_bins = int(yaw_bins)
-
-        pitch_values = torch.linspace(*pitch_range_deg, pitch_bins)
-        yaw_values = torch.linspace(*yaw_range_deg, yaw_bins)
-        pitch_grid_deg, yaw_grid_deg = torch.meshgrid(
-            pitch_values,
-            yaw_values,
-            indexing="ij",
-        )
-        pitch_grid = torch.deg2rad(pitch_grid_deg.reshape(-1))
-        yaw_grid = torch.deg2rad(yaw_grid_deg.reshape(-1))
-        candidate_angles = torch.stack((yaw_grid, pitch_grid), dim=-1)
-        candidate_gaze = torch.stack(
-            (
-                torch.sin(yaw_grid) * torch.cos(pitch_grid),
-                torch.sin(pitch_grid),
-                torch.cos(yaw_grid) * torch.cos(pitch_grid),
-            ),
-            dim=-1,
-        )
-        self.register_buffer("candidate_angles_rad", candidate_angles)
-        self.register_buffer("candidate_gaze", candidate_gaze)
-        self.register_buffer("pitch_values_rad", torch.deg2rad(pitch_values))
-        self.register_buffer("yaw_values_rad", torch.deg2rad(yaw_values))
-        yaw_prior_std = math.radians(30.0)
-        pitch_prior_std = math.radians(25.0)
-        candidate_prior = 0.5 * (
-            (yaw_grid / yaw_prior_std).square()
-            + (pitch_grid / pitch_prior_std).square()
-        )
-        self.register_buffer("candidate_angle_prior", candidate_prior)
-
-        self.raw_eyeball_radius = nn.Parameter(
-            _inverse_bounded_value(0.55, 0.40, 0.70),
-            requires_grad=learnable_template,
-        )
-        self.raw_iris_radius = nn.Parameter(
-            _inverse_bounded_value(0.105, 0.06, 0.18),
-            requires_grad=learnable_template,
-        )
-        self.raw_center_x_offset = nn.Parameter(
-            torch.zeros(()), requires_grad=learnable_template
-        )
-        self.raw_center_y_offset = nn.Parameter(
-            torch.zeros(()), requires_grad=learnable_template
-        )
-
-    def template_parameters(self) -> dict[str, Tensor]:
-        return {
-            "eyeball_radius_canthus_ratio": _bounded_value(
-                self.raw_eyeball_radius, 0.40, 0.70
-            ),
-            "iris_radius_canthus_ratio": _bounded_value(
-                self.raw_iris_radius, 0.06, 0.18
-            ),
-            "center_x_offset_canthus_ratio": 0.05
-            * torch.tanh(self.raw_center_x_offset),
-            "center_y_offset_canthus_ratio": 0.12
-            * torch.tanh(self.raw_center_y_offset),
-        }
-
-    def forward(
-        self,
-        landmark_mean_xy: Tensor,
-        landmark_covariance: Tensor,
-        visibility_probability: Tensor,
-    ) -> dict[str, Tensor]:
-        if landmark_mean_xy.ndim != 4 or landmark_mean_xy.shape[1:] != (
-            2,
-            EYE_PSEUDO_POINT_COUNT,
-            2,
-        ):
-            raise ValueError("landmark_mean_xy must have shape [B, 2, 15, 2].")
-        if landmark_covariance.shape != (*landmark_mean_xy.shape, 2):
-            raise ValueError(
-                "landmark_covariance must have shape [B, 2, 15, 2, 2]."
-            )
-        if visibility_probability.shape != landmark_mean_xy.shape[:-1]:
-            raise ValueError(
-                "visibility_probability must have shape [B, 2, 15]."
-            )
-
-        batch_size = landmark_mean_xy.shape[0]
-        eye_count = batch_size * 2
-        means = landmark_mean_xy.float().reshape(
-            eye_count, EYE_PSEUDO_POINT_COUNT, 2
-        )
-        covariance = landmark_covariance.float().reshape(
-            eye_count, EYE_PSEUDO_POINT_COUNT, 2, 2
-        )
-        visibility = visibility_probability.float().reshape(
-            eye_count, EYE_PSEUDO_POINT_COUNT
-        ).clamp(0.0, 1.0)
-        width, height = self.eye_image_size
-        pixel_scale = means.new_tensor((width - 1.0, height - 1.0))
-        points_px = means * pixel_scale
-        covariance_px = (
-            covariance
-            * pixel_scale.reshape(1, 1, 2, 1)
-            * pixel_scale.reshape(1, 1, 1, 2)
-        )
-
-        reference = _estimate_probabilistic_eye_reference_frame(
-            points_px,
-            covariance_px,
-            visibility,
-            covariance_floor_px=self.covariance_floor_px,
-            use_uncertainty=self.use_reference_uncertainty,
-        )
-        origin_px = reference["origin_px"]
-        basis = reference["basis"]
-        canthus_distance_px = reference["canthus_distance_px"]
-        relative_px = points_px - origin_px.unsqueeze(1)
-        local_points = (
-            torch.einsum("nij,nqj->nqi", basis.transpose(1, 2), relative_px)
-            / canthus_distance_px[:, None, None]
-        )
-
-        upper_local = _weighted_point_mean(
-            local_points[:, 1:5], reference["point_weight"][:, 1:5]
-        )
-        lower_local = _weighted_point_mean(
-            local_points[:, 6:10], reference["point_weight"][:, 6:10]
-        )
-        aperture_center_local = 0.5 * (upper_local + lower_local)
-        parameters = self.template_parameters()
-        eyeball_center_local = aperture_center_local + torch.stack(
-            (
-                parameters["center_x_offset_canthus_ratio"].expand(eye_count),
-                parameters["center_y_offset_canthus_ratio"].expand(eye_count),
-            ),
-            dim=-1,
-        )
-        eyeball_radius_ratio = parameters[
-            "eyeball_radius_canthus_ratio"
-        ]
-        iris_radius_ratio = parameters["iris_radius_canthus_ratio"]
-
-        if self.use_aperture_visibility:
-            iris_aperture_visibility = _soft_iris_aperture_visibility(
-                local_points[:, 1:5],
-                local_points[:, 6:10],
-                local_points[:, EYE_PSEUDO_IRIS_CENTER_INDEX:],
-            )
-        else:
-            iris_aperture_visibility = visibility.new_ones((eye_count, 5))
-        iris_center_visibility = (
-            visibility[:, EYE_PSEUDO_IRIS_CENTER_INDEX]
-            * iris_aperture_visibility[:, 0]
-        )
-        rim_visibility = (
-            visibility[:, IRIS_RIM_SLICE]
-            * iris_aperture_visibility[:, 1:]
-        )
-        (
-            iris_center_px,
-            iris_center_variance_px2,
-            iris_center_effective_visibility,
-        ) = _observed_iris_center(
-            points_px,
-            covariance_px,
-            iris_center_visibility,
-            rim_visibility,
-            covariance_floor_px=self.covariance_floor_px,
-        )
-        rim_px = points_px[:, IRIS_RIM_SLICE]
-        rim_variance_px2 = 0.5 * torch.diagonal(
-            covariance_px[:, IRIS_RIM_SLICE], dim1=-2, dim2=-1
-        ).sum(dim=-1)
-
-        candidate_gxy = self.candidate_gaze[:, :2]
-        candidate_center_local = (
-            eyeball_center_local[:, None]
-            + eyeball_radius_ratio * candidate_gxy[None]
-        )
-        candidate_center_px = origin_px[:, None] + canthus_distance_px[
-            :, None, None
-        ] * torch.einsum("nij,ncj->nci", basis, candidate_center_local)
-        center_delta_px = candidate_center_px - iris_center_px[:, None]
-        center_scale_px2 = iris_center_variance_px2 + (
-            0.02 * canthus_distance_px
-        ).square()
-        center_normalized_sq = center_delta_px.square().sum(dim=-1) / (
-            center_scale_px2[:, None].clamp_min(1e-4)
-        )
-        center_energy = torch.sqrt(1.0 + center_normalized_sq) - 1.0
-
-        candidate_covariance_local = _projected_iris_covariance(
-            candidate_gxy,
-            iris_radius_ratio,
-        )
-        candidate_covariance_px = canthus_distance_px[:, None, None, None].square() * (
-            basis[:, None]
-            @ candidate_covariance_local[None]
-            @ basis.transpose(1, 2)[:, None]
-        )
-        identity = torch.eye(2, device=means.device, dtype=torch.float32)
-        candidate_covariance_inverse = torch.linalg.inv(
-            candidate_covariance_px
-            + self.covariance_floor_px**2 * identity.reshape(1, 1, 2, 2)
-        )
-        rim_delta_px = rim_px[:, None] - candidate_center_px[:, :, None]
-        rim_radius = torch.sqrt(
-            0.5
-            * torch.einsum(
-                "ncqi,ncij,ncqj->ncq",
-                rim_delta_px,
-                candidate_covariance_inverse,
-                rim_delta_px,
-            ).clamp_min(1e-10)
-        )
-        rim_uncertainty_scale = (
-            0.02 * canthus_distance_px[:, None]
-        ).square().clamp_min(1e-4)
-        rim_weight = rim_visibility / (
-            1.0 + rim_variance_px2 / rim_uncertainty_scale
-        )
-        rim_residual = torch.sqrt(
-            1.0 + ((rim_radius - 1.0) / 0.15).square()
-        ) - 1.0
-        rim_energy = (
-            rim_residual * rim_weight[:, None]
-        ).sum(dim=-1) / rim_weight.sum(dim=-1, keepdim=True).clamp_min(0.1)
-        data_energy = (
-            self.center_energy_weight * center_energy
-            + self.rim_energy_weight * rim_energy
-        )
-        total_energy = data_energy + (
-            self.angle_prior_weight * self.candidate_angle_prior[None]
-        )
-        posterior = torch.softmax(
-            -total_energy / self.posterior_temperature,
-            dim=-1,
-        )
-
-        gaze_direction = F.normalize(
-            posterior @ self.candidate_gaze,
-            dim=-1,
-            eps=1e-8,
-        )
-        yaw_rad = torch.atan2(gaze_direction[:, 0], gaze_direction[:, 2])
-        pitch_rad = torch.asin(gaze_direction[:, 1].clamp(-1.0, 1.0))
-        fitted_angles = torch.stack((yaw_rad, pitch_rad), dim=-1)
-        angle_delta = self.candidate_angles_rad[None] - fitted_angles[:, None]
-        angle_covariance = torch.einsum(
-            "nc,nci,ncj->nij", posterior, angle_delta, angle_delta
-        )
-
-        fitted_gxy = gaze_direction[:, :2]
-        fitted_center_local = (
-            eyeball_center_local + eyeball_radius_ratio * fitted_gxy
-        )
-        fitted_center_px = origin_px + canthus_distance_px[:, None] * torch.einsum(
-            "nij,nj->ni", basis, fitted_center_local
-        )
-        fitted_covariance_local = _projected_iris_covariance(
-            fitted_gxy,
-            iris_radius_ratio,
-        )
-        fitted_covariance_px = canthus_distance_px[:, None, None].square() * (
-            basis @ fitted_covariance_local @ basis.transpose(1, 2)
-        )
-        fitted_inverse = torch.linalg.inv(
-            fitted_covariance_px
-            + self.covariance_floor_px**2 * identity.reshape(1, 2, 2)
-        )
-        fitted_rim_delta = rim_px - fitted_center_px[:, None]
-        fitted_rim_radius = torch.sqrt(
-            0.5
-            * torch.einsum(
-                "nqi,nij,nqj->nq",
-                fitted_rim_delta,
-                fitted_inverse,
-                fitted_rim_delta,
-            ).clamp_min(1e-10)
-        )
-        fitted_rim_error = (
-            (fitted_rim_radius - 1.0).abs() * rim_weight
-        ).sum(dim=-1) / rim_weight.sum(dim=-1).clamp_min(0.1)
-        fitted_center_error = torch.linalg.vector_norm(
-            fitted_center_px - iris_center_px, dim=-1
-        ) / canthus_distance_px
-        reprojection_error = (
-            fitted_center_error + iris_radius_ratio * fitted_rim_error
-        ).clamp(max=10.0)
-
-        posterior_entropy = -(
-            posterior * torch.log(posterior.clamp_min(1e-12))
-        ).sum(dim=-1) / math.log(posterior.shape[-1])
-        iris_confidence_product = (
-            iris_center_effective_visibility * rim_visibility.mean(dim=-1)
-        )
-        iris_confidence = (
-            torch.sqrt(iris_confidence_product.clamp_min(1e-12))
-            * (iris_confidence_product > 0).to(iris_confidence_product.dtype)
-        )
-        input_confidence_product = reference["confidence"] * iris_confidence
-        input_confidence = (
-            torch.sqrt(input_confidence_product.clamp_min(1e-12))
-            * (input_confidence_product > 0).to(input_confidence_product.dtype)
-        ).clamp(0.0, 1.0)
-        fit_confidence = torch.exp(-reprojection_error / 0.08)
-        posterior_confidence = (1.0 - posterior_entropy).clamp(0.0, 1.0)
-        scale_confidence = torch.sigmoid(
-            (canthus_distance_px - self.min_canthus_distance_px) / 2.0
-        )
-        geometry_confidence = (
-            input_confidence
-            * fit_confidence
-            * (0.25 + 0.75 * posterior_confidence)
-            * scale_confidence
-        ).clamp(0.0, 1.0)
-        valid_mask = (
-            (geometry_confidence >= self.min_geometry_confidence)
-            & (canthus_distance_px >= self.min_canthus_distance_px)
-        ).float()
-
-        fitted_center_xy = fitted_center_px / pixel_scale
-        eyeball_center_px = origin_px + canthus_distance_px[:, None] * torch.einsum(
-            "nij,nj->ni", basis, eyeball_center_local
-        )
-        eyeball_center_xy = eyeball_center_px / pixel_scale
-        observed_iris_center_xy = iris_center_px / pixel_scale
-        fitted_covariance_xy = (
-            fitted_covariance_px
-            / pixel_scale.reshape(1, 2, 1)
-            / pixel_scale.reshape(1, 1, 2)
-        )
-        expected_fit_energy = (posterior * data_energy).sum(dim=-1)
-        observed_iris_center_local = (
-            torch.einsum(
-                "nij,nj->ni",
-                basis.transpose(1, 2),
-                iris_center_px - origin_px,
-            )
-            / canthus_distance_px[:, None]
-        )
-
-        def binocular(value: Tensor) -> Tensor:
-            return value.reshape(batch_size, 2, *value.shape[1:])
-
-        return {
-            "gaze_direction_eye": binocular(gaze_direction),
-            "yaw_rad": binocular(yaw_rad),
-            "pitch_rad": binocular(pitch_rad),
-            "safe_yaw_rad": binocular(yaw_rad * valid_mask),
-            "safe_pitch_rad": binocular(pitch_rad * valid_mask),
-            "angle_covariance": binocular(angle_covariance),
-            "pitch_variance": binocular(angle_covariance[:, 1, 1]),
-            "angle_posterior": posterior.reshape(
-                batch_size, 2, self.pitch_bins, self.yaw_bins
-            ),
-            "pitch_probability": posterior.reshape(
-                eye_count, self.pitch_bins, self.yaw_bins
-            ).sum(dim=-1).reshape(batch_size, 2, self.pitch_bins),
-            "eyeball_center_xy": binocular(eyeball_center_xy),
-            "eyeball_radius_px": binocular(
-                canthus_distance_px * eyeball_radius_ratio
-            ),
-            "iris_radius_px": binocular(
-                canthus_distance_px * iris_radius_ratio
-            ),
-            "observed_iris_center_xy": binocular(observed_iris_center_xy),
-            "observed_iris_center_local": binocular(
-                observed_iris_center_local
-            ),
-            "reference_origin_xy": binocular(origin_px / pixel_scale),
-            "reference_basis_image": binocular(basis),
-            "reference_confidence": binocular(reference["confidence"]),
-            "iris_center_effective_visibility": binocular(
-                iris_center_effective_visibility
-            ),
-            "iris_rim_effective_visibility": binocular(rim_visibility),
-            "fitted_iris_center_xy": binocular(fitted_center_xy),
-            "fitted_iris_covariance": binocular(fitted_covariance_xy),
-            "reprojection_error_norm": binocular(reprojection_error),
-            "expected_fit_energy": binocular(expected_fit_energy),
-            "posterior_entropy": binocular(posterior_entropy),
-            "geometry_confidence": binocular(geometry_confidence),
-            "valid_mask": binocular(valid_mask),
-            "canthus_distance_px": binocular(canthus_distance_px),
-            "eyeball_radius_canthus_ratio": binocular(
-                eyeball_radius_ratio.expand(eye_count)
-            ),
-            "iris_radius_canthus_ratio": binocular(
-                iris_radius_ratio.expand(eye_count)
-            ),
-        }
-
-
-def low_dof_eye_template_losses(
-    template_outputs: Mapping[str, Tensor],
-    eye_weight: Tensor,
-    *,
-    huber_delta_rad: float = math.radians(2.0),
-) -> dict[str, Tensor]:
-    """Self-supervise template reprojection and binocular pitch agreement."""
-
-    if huber_delta_rad <= 0:
-        raise ValueError("huber_delta_rad must be positive.")
-    reprojection = template_outputs["reprojection_error_norm"]
-    pitch = template_outputs["pitch_rad"]
-    confidence = template_outputs["geometry_confidence"]
-    if reprojection.ndim != 2 or reprojection.shape[1] != 2:
-        raise ValueError("Template outputs must use binocular shape [B, 2].")
-    if eye_weight.shape != reprojection.shape:
-        raise ValueError("eye_weight must have shape [B, 2].")
-    teacher_weight = eye_weight.to(
-        device=reprojection.device, dtype=torch.float32
-    )
-    # Detaching the gate prevents the network from lowering confidence to hide
-    # a bad fit. It also keeps an untrained, collapsed canthus prediction from
-    # injecting unstable geometry gradients before the landmark head separates.
-    weight = teacher_weight * confidence.detach()
-    reprojection_loss = (
-        reprojection.float() * weight
-    ).sum() / weight.sum().clamp_min(1.0)
-    pair_weight = weight.prod(dim=-1)
-    pitch_difference = pitch[:, 0] - pitch[:, 1]
-    pitch_consistency = F.smooth_l1_loss(
-        pitch_difference,
-        torch.zeros_like(pitch_difference),
-        beta=huber_delta_rad,
-        reduction="none",
-    )
-    pitch_consistency_loss = (
-        pitch_consistency * pair_weight
-    ).sum() / pair_weight.sum().clamp_min(1.0)
-    return {
-        "reprojection_loss": reprojection_loss,
-        "binocular_pitch_consistency_loss": pitch_consistency_loss,
-        "effective_eye_weight": weight.sum(),
-    }
-
-
-def low_dof_eye_template_metrics(
-    template_outputs: Mapping[str, Tensor],
-    eye_weight: Tensor,
-) -> dict[str, Tensor]:
-    """Summarize fit quality without using gaze or desktop-UV labels."""
-
-    reprojection = template_outputs["reprojection_error_norm"].float()
-    pitch = template_outputs["pitch_rad"].float()
-    pitch_variance = template_outputs["pitch_variance"].float()
-    confidence = template_outputs["geometry_confidence"].float()
-    valid = template_outputs["valid_mask"].float()
-    reference_confidence = template_outputs["reference_confidence"].float()
-    iris_center_visibility = template_outputs[
-        "iris_center_effective_visibility"
-    ].float()
-    iris_rim_visibility = template_outputs[
-        "iris_rim_effective_visibility"
-    ].float().mean(dim=-1)
-    weight = eye_weight.to(device=reprojection.device, dtype=torch.float32)
-    denominator = weight.sum().clamp_min(1.0)
-    pair_weight = weight.prod(dim=-1)
-    pair_denominator = pair_weight.sum().clamp_min(1.0)
-    return {
-        "eye_template_reprojection_error_norm": (
-            reprojection * weight
-        ).sum()
-        / denominator,
-        "eye_template_pitch_std_deg": (
-            torch.rad2deg(pitch_variance.clamp_min(0.0).sqrt()) * weight
-        ).sum()
-        / denominator,
-        "eye_template_binocular_pitch_disagreement_deg": (
-            torch.rad2deg((pitch[:, 0] - pitch[:, 1]).abs()) * pair_weight
-        ).sum()
-        / pair_denominator,
-        "eye_template_geometry_confidence": (
-            confidence * weight
-        ).sum()
-        / denominator,
-        "eye_template_reference_confidence": (
-            reference_confidence * weight
-        ).sum()
-        / denominator,
-        "eye_template_iris_effective_visibility": (
-            0.5 * (iris_center_visibility + iris_rim_visibility) * weight
-        ).sum()
-        / denominator,
-        "eye_template_valid_rate": (valid * weight).sum() / denominator,
-    }
-
-
-
-VERTICAL_EYE_GEOMETRY_FEATURE_DIM = 22
-
-
-class VerticalEyeGeometryFeatureExtractor(nn.Module):
-    """Convert 15 probabilistic landmarks into a compact vertical descriptor.
-
-    This deliberately does not infer a 3D pitch.  It exposes the crop-local
-    vertical iris displacement, aperture, ellipse shape, uncertainty, and
-    visibility that a residual head can combine with global face/scene context.
-    """
-
-    def __init__(self, *, eye_image_size: tuple[int, int] = (90, 56)) -> None:
-        super().__init__()
-        if len(eye_image_size) != 2 or min(eye_image_size) <= 1:
-            raise ValueError("eye_image_size must be (width, height) > 1.")
-        width, height = (int(value) for value in eye_image_size)
-        self.register_buffer(
-            "pixel_scale",
-            torch.tensor((float(width - 1), float(height - 1))),
-            persistent=False,
-        )
-
-    def forward(
-        self,
-        mean_xy: Tensor,
-        covariance_xy: Tensor,
-        visibility: Tensor,
-        entropy: Tensor,
-    ) -> dict[str, Tensor]:
-        expected_points = (EYE_PSEUDO_POINT_COUNT, 2)
-        if mean_xy.ndim != 4 or mean_xy.shape[1:] != (2, *expected_points):
-            raise ValueError("mean_xy must have shape [B, 2, 15, 2].")
-        if covariance_xy.shape != (*mean_xy.shape[:-1], 2, 2):
-            raise ValueError("covariance_xy must have shape [B, 2, 15, 2, 2].")
-        if visibility.shape != mean_xy.shape[:-1]:
-            raise ValueError("visibility must have shape [B, 2, 15].")
-        if entropy.shape != visibility.shape:
-            raise ValueError("entropy must have shape [B, 2, 15].")
-
-        pixel_scale = self.pixel_scale.to(device=mean_xy.device, dtype=torch.float32)
-        points = mean_xy.float() * pixel_scale.reshape(1, 1, 1, 2)
-        covariance = (
-            covariance_xy.float()
-            * pixel_scale.reshape(1, 1, 1, 2, 1)
-            * pixel_scale.reshape(1, 1, 1, 1, 2)
-        )
-        visibility = visibility.float().clamp(0.0, 1.0)
-        entropy = entropy.float().clamp(0.0, 1.0)
-
-        outer = points[:, :, OUTER_CANTHUS_INDEX]
-        inner = points[:, :, INNER_CANTHUS_INDEX]
-        origin = 0.5 * (outer + inner)
-        horizontal = inner - outer
-        canthus_distance = torch.linalg.vector_norm(horizontal, dim=-1).clamp_min(1e-4)
-        x_axis = horizontal / canthus_distance.unsqueeze(-1)
-        y_axis = torch.stack((-x_axis[..., 1], x_axis[..., 0]), dim=-1)
-        upper = points[:, :, 1:5].mean(dim=-2)
-        lower = points[:, :, 6:10].mean(dim=-2)
-        orientation = torch.where(
-            ((lower - upper) * y_axis).sum(dim=-1, keepdim=True) >= 0,
-            torch.ones_like(canthus_distance).unsqueeze(-1),
-            -torch.ones_like(canthus_distance).unsqueeze(-1),
-        )
-        y_axis = y_axis * orientation
-        centered = points - origin.unsqueeze(-2)
-        local_x = (centered * x_axis.unsqueeze(-2)).sum(dim=-1) / canthus_distance.unsqueeze(-1)
-        local_y = (centered * y_axis.unsqueeze(-2)).sum(dim=-1) / canthus_distance.unsqueeze(-1)
-
-        iris_center_y = local_y[:, :, EYE_PSEUDO_IRIS_CENTER_INDEX]
-        upper_y = local_y[:, :, 1:5].mean(dim=-1)
-        lower_y = local_y[:, :, 6:10].mean(dim=-1)
-        aperture_height = (lower_y - upper_y).clamp_min(0.0)
-        rim_x = local_x[:, :, IRIS_RIM_SLICE]
-        rim_y = local_y[:, :, IRIS_RIM_SLICE]
-        iris_radius_x = 0.5 * (rim_x[:, :, 0].abs() + rim_x[:, :, 2].abs())
-        iris_radius_y = 0.5 * (rim_y[:, :, 1].abs() + rim_y[:, :, 3].abs())
-        iris_log_aspect = torch.log(
-            (iris_radius_y + 1e-4) / (iris_radius_x + 1e-4)
-        ).clamp(-3.0, 3.0)
-
-        covariance_trace = torch.diagonal(covariance, dim1=-2, dim2=-1).sum(dim=-1)
-        point_std = torch.sqrt(covariance_trace.clamp_min(1e-8)) / canthus_distance.unsqueeze(-1)
-        iris_std = point_std[:, :, EYE_PSEUDO_IRIS_CENTER_INDEX]
-        iris_visibility = visibility[:, :, EYE_PSEUDO_IRIS_CENTER_INDEX]
-        rim_visibility = visibility[:, :, IRIS_RIM_SLICE].mean(dim=-1)
-        iris_entropy = entropy[:, :, EYE_PSEUDO_IRIS_CENTER_INDEX]
-        anchor_visibility = visibility[:, :, (OUTER_CANTHUS_INDEX, INNER_CANTHUS_INDEX)].mean(dim=-1)
-        lid_visibility = 0.5 * (
-            visibility[:, :, 1:5].mean(dim=-1)
-            + visibility[:, :, 6:10].mean(dim=-1)
-        )
-        reference_visibility = anchor_visibility * lid_visibility
-
-        per_eye = torch.stack(
-            (
-                iris_center_y.clamp(-1.5, 1.5),
-                aperture_height.clamp(0.0, 1.5),
-                iris_radius_y.clamp(0.0, 1.0),
-                iris_radius_x.clamp(0.0, 1.0),
-                iris_log_aspect,
-                iris_visibility,
-                rim_visibility,
-                iris_std.clamp(0.0, 2.0),
-                iris_entropy,
-                reference_visibility,
-            ),
-            dim=-1,
-        )
-        binocular_mean = per_eye.mean(dim=1)
-        binocular_difference = per_eye[:, 0] - per_eye[:, 1]
-        iris_disagreement = iris_center_y[:, :1] - iris_center_y[:, 1:2]
-        entropy_confidence = (1.0 - iris_entropy).clamp(0.0, 1.0)
-        uncertainty_confidence = torch.exp(-iris_std.clamp_min(0.0) / 0.12)
-        per_eye_confidence = (
-            iris_visibility
-            * rim_visibility
-            * reference_visibility
-            * entropy_confidence
-            * uncertainty_confidence
-        ).clamp(0.0, 1.0)
-        geometry_confidence = per_eye_confidence.mean(dim=-1, keepdim=True)
-        features = torch.cat(
-            (
-                binocular_mean,
-                binocular_difference,
-                geometry_confidence,
-                iris_disagreement.abs(),
-            ),
-            dim=-1,
-        )
-        if features.shape[-1] != VERTICAL_EYE_GEOMETRY_FEATURE_DIM:
-            raise RuntimeError("Unexpected vertical geometry feature dimension.")
-        if not torch.isfinite(features).all():
-            raise ValueError("Vertical eye geometry features must be finite.")
-        return {
-            "features": features,
-            "per_eye_features": per_eye,
-            "geometry_confidence": geometry_confidence,
-            "iris_vertical_disagreement": iris_disagreement.abs(),
-            "per_eye_confidence": per_eye_confidence,
-        }
-
-
-class VerticalGeometryVResidual(nn.Module):
-    """Low-capacity, confidence-gated residual that can modify only table ``v``.
-
-    During training the gate has a small continuous floor so the branch can
-    bootstrap from uncertain early heatmaps.  Evaluation restores a confidence
-    threshold and falls back exactly to the base UV estimate when geometry is
-    unreliable.
-    """
-
-    def __init__(
-        self,
-        *,
-        geometry_dim: int,
-        fused_feature_dim: int,
-        scene_dim: int,
-        pose_dim: int = 0,
-        hidden_dims: tuple[int, ...] = (64, 32),
-        max_abs_delta_v_mm: float = 250.0,
-        min_training_gate: float = 0.10,
-        min_inference_confidence: float = 0.10,
-    ) -> None:
-        super().__init__()
-        if min(geometry_dim, fused_feature_dim, scene_dim, max_abs_delta_v_mm) <= 0:
-            raise ValueError("Vertical geometry residual dimensions/scales must be positive.")
-        if pose_dim < 0 or not hidden_dims or min(hidden_dims) <= 0:
-            raise ValueError("Vertical geometry residual hidden dimensions are invalid.")
-        if not 0 <= min_training_gate <= 1 or not 0 <= min_inference_confidence <= 1:
-            raise ValueError("Vertical geometry gates must lie in [0, 1].")
-        self.geometry_dim = int(geometry_dim)
-        self.fused_feature_dim = int(fused_feature_dim)
-        self.scene_dim = int(scene_dim)
-        self.pose_dim = int(pose_dim)
-        self.max_abs_delta_v_mm = float(max_abs_delta_v_mm)
-        self.min_training_gate = float(min_training_gate)
-        self.min_inference_confidence = float(min_inference_confidence)
-        input_dim = geometry_dim + fused_feature_dim + scene_dim + pose_dim + 1
-        layers: list[nn.Module] = [nn.LayerNorm(input_dim)]
-        for hidden_dim in hidden_dims:
-            layers.extend((nn.Linear(input_dim, hidden_dim), nn.SiLU(inplace=True)))
-            input_dim = hidden_dim
-        layers.append(nn.Linear(input_dim, 2))
-        self.network = nn.Sequential(*layers)
-        self.reset_output_to_zero()
-
-    def reset_output_to_zero(self) -> None:
-        output = self.network[-1]
-        assert isinstance(output, nn.Linear)
-        nn.init.zeros_(output.weight)
-        nn.init.zeros_(output.bias)
-
-    def forward(
-        self,
-        *,
-        geometry_features: Tensor,
-        geometry_confidence: Tensor,
-        fused_features: Tensor,
-        scene_vec: Tensor,
-        base_v_normalized: Tensor,
-        virtual_camera_pose_table: Tensor | None = None,
-    ) -> dict[str, Tensor]:
-        batch_size = geometry_features.shape[0]
-        expected = (batch_size, self.geometry_dim)
-        if geometry_features.shape != expected:
-            raise ValueError(f"geometry_features must have shape {expected}.")
-        if geometry_confidence.shape != (batch_size, 1):
-            raise ValueError("geometry_confidence must have shape [B, 1].")
-        if fused_features.shape != (batch_size, self.fused_feature_dim):
-            raise ValueError("fused_features has an unexpected shape.")
-        if scene_vec.shape != (batch_size, self.scene_dim):
-            raise ValueError("scene_vec has an unexpected shape.")
-        if base_v_normalized.shape != (batch_size, 1):
-            raise ValueError("base_v_normalized must have shape [B, 1].")
-        parts = (
-            geometry_features.float(),
-            fused_features.float(),
-            scene_vec.float(),
-            base_v_normalized.detach().float(),
-        )
-        if self.pose_dim > 0:
-            if virtual_camera_pose_table is None or virtual_camera_pose_table.shape != (
-                batch_size,
-                self.pose_dim,
-            ):
-                raise ValueError("virtual_camera_pose_table has an unexpected shape.")
-            parts = (*parts[:-1], virtual_camera_pose_table.float(), parts[-1])
-        output = self.network(torch.cat(parts, dim=-1))
-        raw_delta_v_mm = self.max_abs_delta_v_mm * torch.tanh(output[:, :1])
-        learned_gate = torch.sigmoid(output[:, 1:2])
-        confidence = geometry_confidence.float().clamp(0.0, 1.0)
-        training_gate = self.min_training_gate + (1.0 - self.min_training_gate) * confidence
-        if self.training:
-            confidence_gate = training_gate
-            fallback_mask = torch.zeros_like(confidence)
-        else:
-            fallback_mask = (confidence < self.min_inference_confidence).float()
-            confidence_gate = confidence * (1.0 - fallback_mask)
-        applied_geometry_gate = confidence_gate * learned_gate
-        delta_v_mm = applied_geometry_gate * raw_delta_v_mm
-        return {
-            "delta_v_mm": delta_v_mm,
-            "raw_delta_v_mm": raw_delta_v_mm,
-            "geometry_gate": confidence_gate,
-            "applied_geometry_gate": applied_geometry_gate,
-            "training_gate": training_gate,
-            "learned_gate": learned_gate,
-            "fallback_mask": fallback_mask,
-            "camera_table_vertical_sensitivity_mm_per_rad": torch.zeros_like(delta_v_mm),
-            "camera_table_geometry_valid_mask": torch.zeros_like(delta_v_mm),
-            "geometric_pitch_delta_v_mm": torch.zeros_like(delta_v_mm),
-        }
-
-
-class PitchToTableVResidual(nn.Module):
-    """Map uncertain binocular pitch to a confidence-gated table-v residual.
-
-    The mapper is deliberately low capacity. Scene/virtual-pose context predicts
-    only three coefficients for ``p``, ``p^3``, and a bias. It cannot modify
-    table ``u`` and starts as an exact zero residual, preserving the baseline.
-    """
-
-    def __init__(
-        self,
-        *,
-        scene_dim: int,
-        pose_dim: int = 0,
-        hidden_dims: tuple[int, ...] = (32, 16),
-        max_abs_delta_v_mm: float = 250.0,
-        pitch_scale_deg: float = 20.0,
-        uncertainty_scale_deg: float = 8.0,
-        disagreement_scale_deg: float = 6.0,
-        min_pitch_std_deg: float = 0.5,
-        min_active_gate: float = 0.05,
-        detach_uncertainty_gate: bool = True,
-        table_distance_scale_mm: float = 1000.0,
-        use_camera_table_sensitivity: bool = True,
-        min_abs_table_normal_z: float = 0.1,
-    ) -> None:
-        super().__init__()
-        if scene_dim <= 0 or pose_dim < 0:
-            raise ValueError("scene_dim must be positive and pose_dim non-negative.")
-        if not hidden_dims or min(hidden_dims) <= 0:
-            raise ValueError("hidden_dims must contain positive widths.")
-        if min(
-            max_abs_delta_v_mm,
-            pitch_scale_deg,
-            uncertainty_scale_deg,
-            disagreement_scale_deg,
-            min_pitch_std_deg,
-            table_distance_scale_mm,
-            min_abs_table_normal_z,
-        ) <= 0:
-            raise ValueError("Pitch-to-v scales must be positive.")
-        if not 0 <= min_active_gate <= 1:
-            raise ValueError("min_active_gate must lie in [0, 1].")
-        self.scene_dim = int(scene_dim)
-        self.pose_dim = int(pose_dim)
-        self.max_abs_delta_v_mm = float(max_abs_delta_v_mm)
-        self.pitch_scale_rad = math.radians(pitch_scale_deg)
-        self.uncertainty_scale_rad = math.radians(uncertainty_scale_deg)
-        self.disagreement_scale_rad = math.radians(disagreement_scale_deg)
-        self.min_pitch_variance = math.radians(min_pitch_std_deg) ** 2
-        self.min_active_gate = float(min_active_gate)
-        self.detach_uncertainty_gate = bool(detach_uncertainty_gate)
-        self.table_distance_scale_mm = float(table_distance_scale_mm)
-        self.use_camera_table_sensitivity = bool(use_camera_table_sensitivity)
-        self.min_abs_table_normal_z = float(min_abs_table_normal_z)
-
-        layers: list[nn.Module] = [nn.LayerNorm(scene_dim + pose_dim)]
-        input_dim = scene_dim + pose_dim
-        for hidden_dim in hidden_dims:
-            layers.extend(
-                (
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.SiLU(inplace=True),
-                )
-            )
-            input_dim = hidden_dim
-        layers.append(nn.Linear(input_dim, 3))
-        self.coefficient_network = nn.Sequential(*layers)
-        self.reset_output_to_zero()
-
-    def reset_output_to_zero(self) -> None:
-        output = self.coefficient_network[-1]
-        assert isinstance(output, nn.Linear)
-        nn.init.zeros_(output.weight)
-        nn.init.zeros_(output.bias)
-
-    def forward(
-        self,
-        *,
-        pitch_rad: Tensor,
-        pitch_variance: Tensor,
-        geometry_confidence: Tensor,
-        geometry_valid_mask: Tensor,
-        scene_vec: Tensor,
-        virtual_camera_pose_table: Tensor | None = None,
-    ) -> dict[str, Tensor]:
-        expected_shape = pitch_rad.shape
-        if pitch_rad.ndim != 2 or pitch_rad.shape[1] != 2:
-            raise ValueError("pitch_rad must have shape [B, 2].")
-        for name, value in (
-            ("pitch_variance", pitch_variance),
-            ("geometry_confidence", geometry_confidence),
-            ("geometry_valid_mask", geometry_valid_mask),
-        ):
-            if value.shape != expected_shape:
-                raise ValueError(f"{name} must have shape [B, 2].")
-        if scene_vec.ndim != 2 or scene_vec.shape != (
-            pitch_rad.shape[0],
-            self.scene_dim,
-        ):
-            raise ValueError(
-                f"scene_vec must have shape [B, {self.scene_dim}]."
-            )
-        if self.pose_dim > 0:
-            if virtual_camera_pose_table is None or virtual_camera_pose_table.shape != (
-                pitch_rad.shape[0],
-                self.pose_dim,
-            ):
-                raise ValueError(
-                    "virtual_camera_pose_table must match configured pose_dim."
-                )
-            context = torch.cat(
-                (scene_vec.float(), virtual_camera_pose_table.float()), dim=-1
-            )
-        else:
-            context = scene_vec.float()
-
-        pitch = pitch_rad.float()
-        variance = pitch_variance.float().clamp_min(self.min_pitch_variance)
-        confidence = geometry_confidence.float().clamp(0.0, 1.0)
-        valid = geometry_valid_mask.float().clamp(0.0, 1.0)
-        eye_quality = confidence * valid
-        precision = eye_quality / variance
-        precision_sum = precision.sum(dim=-1, keepdim=True)
-        fused_pitch = (precision * pitch).sum(dim=-1, keepdim=True) / (
-            precision_sum.clamp_min(1e-8)
-        )
-        has_geometry = (precision_sum > 1e-8).float()
-        fused_pitch = fused_pitch * has_geometry
-        fused_variance = torch.where(
-            precision_sum > 1e-8,
-            precision_sum.clamp_min(1e-8).reciprocal(),
-            torch.full_like(
-                precision_sum,
-                4.0 * self.uncertainty_scale_rad**2,
-            ),
-        )
-        pitch_disagreement = (pitch[:, :1] - pitch[:, 1:2]).abs()
-        pair_support = (eye_quality[:, :1] * eye_quality[:, 1:2] > 0).float()
-        confidence_union = 1.0 - (
-            (1.0 - eye_quality[:, :1]) * (1.0 - eye_quality[:, 1:2])
-        )
-        uncertainty_gate = torch.exp(
-            -0.5 * fused_variance / self.uncertainty_scale_rad**2
-        )
-        disagreement_gate = torch.where(
-            pair_support > 0,
-            torch.exp(
-                -0.5
-                * (pitch_disagreement / self.disagreement_scale_rad).square()
-            ),
-            torch.ones_like(pitch_disagreement),
-        )
-        geometry_gate = (
-            has_geometry
-            * confidence_union
-            * uncertainty_gate
-            * disagreement_gate
-        ).clamp(0.0, 1.0)
-
-        normalized_pitch = (fused_pitch / self.pitch_scale_rad).clamp(-2.0, 2.0)
-        if self.use_camera_table_sensitivity:
-            (
-                camera_table_vertical_sensitivity,
-                camera_table_geometry_valid,
-            ) = _camera_table_vertical_sensitivity(
-                scene_vec,
-                distance_scale_mm=self.table_distance_scale_mm,
-                min_abs_normal_z=self.min_abs_table_normal_z,
-                max_abs_sensitivity_mm_per_rad=(
-                    4.0 * self.max_abs_delta_v_mm / self.pitch_scale_rad
-                ),
-            )
-            geometry_gate = geometry_gate * camera_table_geometry_valid
-            geometric_pitch_delta_v_mm = (
-                camera_table_vertical_sensitivity * fused_pitch
-            )
-            normalized_geometric_pitch = (
-                geometric_pitch_delta_v_mm / self.max_abs_delta_v_mm
-            ).clamp(-2.0, 2.0)
-        else:
-            camera_table_vertical_sensitivity = torch.zeros_like(fused_pitch)
-            camera_table_geometry_valid = torch.ones_like(fused_pitch)
-            geometric_pitch_delta_v_mm = torch.zeros_like(fused_pitch)
-            normalized_geometric_pitch = normalized_pitch
-        coefficients = self.coefficient_network(context)
-        mapping_value = (
-            coefficients[:, :1] * normalized_geometric_pitch
-            + coefficients[:, 1:2] * normalized_pitch.pow(3)
-            + coefficients[:, 2:3]
-        )
-        raw_delta_v_mm = self.max_abs_delta_v_mm * torch.tanh(mapping_value)
-        fallback_mask = (geometry_gate < self.min_active_gate).float()
-        active_geometry_gate = torch.where(
-            fallback_mask > 0,
-            torch.zeros_like(geometry_gate),
-            geometry_gate,
-        )
-        applied_gate = (
-            active_geometry_gate.detach()
-            if self.detach_uncertainty_gate
-            else active_geometry_gate
-        )
-        delta_v_mm = applied_gate * raw_delta_v_mm
-        return {
-            "delta_v_mm": delta_v_mm,
-            "raw_delta_v_mm": raw_delta_v_mm,
-            "geometry_gate": geometry_gate,
-            "applied_geometry_gate": active_geometry_gate,
-            "fallback_mask": fallback_mask,
-            "fused_pitch_rad": fused_pitch,
-            "fused_pitch_variance": fused_variance,
-            "pitch_disagreement_rad": pitch_disagreement,
-            "binocular_precision": precision_sum,
-            "camera_table_vertical_sensitivity_mm_per_rad": (
-                camera_table_vertical_sensitivity
-            ),
-            "camera_table_geometry_valid_mask": camera_table_geometry_valid,
-            "geometric_pitch_delta_v_mm": geometric_pitch_delta_v_mm,
-            "mapping_coefficients": coefficients,
-        }
-
-
-def _camera_table_vertical_sensitivity(
-    table_frame7: Tensor,
-    *,
-    distance_scale_mm: float,
-    min_abs_normal_z: float,
-    max_abs_sensitivity_mm_per_rad: float,
-) -> tuple[Tensor, Tensor]:
-    """Return local table-v displacement per camera vertical ray radian.
-
-    The derivative is evaluated around the virtual-camera optical axis.  The
-    learned mapper still calibrates eye-local pitch, but its linear basis now
-    carries the correct per-sample camera/table scale and orientation in mm.
-    """
-
-    table = unpack_table_frame7(
-        table_frame7,
-        distance_scale_mm=distance_scale_mm,
-    )
-    normal_z = table["n_c"][:, 2:3]
-    normal_y = table["n_c"][:, 1:2]
-    distance = table["d_c_mm"]
-    valid = (
-        (normal_z.abs() >= min_abs_normal_z)
-        & (distance.abs() >= 1e-3)
-    ).float()
-    safe_sign = torch.where(normal_z >= 0, 1.0, -1.0)
-    safe_normal_z = torch.where(
-        normal_z.abs() >= min_abs_normal_z,
-        normal_z,
-        safe_sign * min_abs_normal_z,
-    )
-    forward_sign = torch.sign(distance / safe_normal_z)
-    forward_sign = torch.where(
-        forward_sign == 0,
-        torch.ones_like(forward_sign),
-        forward_sign,
-    )
-    denominator = safe_normal_z * forward_sign
-    ray_distance = distance / denominator
-    ray_distance_derivative = -distance * normal_y / denominator.square()
-    e2 = table["e2_c"]
-    sensitivity = (
-        ray_distance * e2[:, 1:2]
-        + ray_distance_derivative * forward_sign * e2[:, 2:3]
-    )
-    sensitivity = sensitivity.clamp(
-        -max_abs_sensitivity_mm_per_rad,
-        max_abs_sensitivity_mm_per_rad,
-    )
-    return sensitivity * valid, valid
-
-
-def pitch_to_v_residual_regularization(
-    delta_v_mm: Tensor,
-    *,
-    max_abs_delta_v_mm: float,
-) -> Tensor:
-    """Penalize large corrections without supplying additional labels."""
-
-    if max_abs_delta_v_mm <= 0:
-        raise ValueError("max_abs_delta_v_mm must be positive.")
-    if delta_v_mm.ndim != 2 or delta_v_mm.shape[1] != 1:
-        raise ValueError("delta_v_mm must have shape [B, 1].")
-    return (delta_v_mm.float() / max_abs_delta_v_mm).square().mean()
-
-
-def _bounded_value(raw: Tensor, minimum: float, maximum: float) -> Tensor:
-    return minimum + (maximum - minimum) * torch.sigmoid(raw)
-
-
-def _inverse_bounded_value(value: float, minimum: float, maximum: float) -> Tensor:
-    ratio = (value - minimum) / (maximum - minimum)
-    return torch.tensor(math.log(ratio / (1.0 - ratio)), dtype=torch.float32)
-
-
-def _weighted_point_mean(points: Tensor, weight: Tensor) -> Tensor:
-    denominator = weight.sum(dim=-1, keepdim=True)
-    weighted = (points * weight.unsqueeze(-1)).sum(dim=-2) / denominator.clamp_min(
-        1e-6
-    )
-    fallback = points.mean(dim=-2)
-    return torch.where(denominator > 1e-6, weighted, fallback)
-
-
-def _estimate_probabilistic_eye_reference_frame(
-    points_px: Tensor,
-    covariance_px: Tensor,
-    visibility: Tensor,
-    *,
-    covariance_floor_px: float,
-    use_uncertainty: bool,
-) -> dict[str, Tensor]:
-    """Estimate the canthus/lid frame while downweighting uncertain anchors."""
-
-    point_variance = 0.5 * torch.diagonal(
-        covariance_px, dim1=-2, dim2=-1
-    ).sum(dim=-1)
-    if use_uncertainty:
-        point_weight = visibility / (
-            point_variance + covariance_floor_px**2
-        ).clamp_min(1e-6)
-    else:
-        point_weight = visibility
-
-    outer = points_px[:, OUTER_CANTHUS_INDEX]
-    inner = points_px[:, INNER_CANTHUS_INDEX]
-    origin_px = 0.5 * (outer + inner)
-    horizontal = inner - outer
-    canthus_distance_px = torch.linalg.vector_norm(
-        horizontal, dim=-1
-    ).clamp_min(1e-4)
-    x_axis = horizontal / canthus_distance_px.unsqueeze(-1)
-    perpendicular = torch.stack((-x_axis[:, 1], x_axis[:, 0]), dim=-1)
-    upper_px = _weighted_point_mean(
-        points_px[:, 1:5], point_weight[:, 1:5]
-    )
-    lower_px = _weighted_point_mean(
-        points_px[:, 6:10], point_weight[:, 6:10]
-    )
-    vertical_sign = torch.where(
-        ((lower_px - upper_px) * perpendicular).sum(dim=-1) >= 0,
-        torch.ones_like(canthus_distance_px),
-        -torch.ones_like(canthus_distance_px),
-    )
-    y_axis = perpendicular * vertical_sign.unsqueeze(-1)
-    basis = torch.stack((x_axis, y_axis), dim=-1)
-
-    anchor_visibility_product = (
-        visibility[:, OUTER_CANTHUS_INDEX]
-        * visibility[:, INNER_CANTHUS_INDEX]
-    )
-    anchor_visibility = (
-        torch.sqrt(anchor_visibility_product.clamp_min(1e-12))
-        * (anchor_visibility_product > 0).to(anchor_visibility_product.dtype)
-    )
-    lid_visibility_product = (
-        visibility[:, 1:5].mean(dim=-1)
-        * visibility[:, 6:10].mean(dim=-1)
-    )
-    lid_visibility = (
-        torch.sqrt(lid_visibility_product.clamp_min(1e-12))
-        * (lid_visibility_product > 0).to(lid_visibility_product.dtype)
-    )
-    if use_uncertainty:
-        anchor_variance = 0.5 * (
-            point_variance[:, OUTER_CANTHUS_INDEX]
-            + point_variance[:, INNER_CANTHUS_INDEX]
-        )
-        upper_variance = point_weight[:, 1:5].sum(dim=-1).clamp_min(1e-6).reciprocal()
-        lower_variance = point_weight[:, 6:10].sum(dim=-1).clamp_min(1e-6).reciprocal()
-        reference_std_norm = torch.sqrt(
-            anchor_variance + upper_variance + lower_variance
-        ) / canthus_distance_px
-        uncertainty_confidence = torch.exp(
-            -0.5 * (reference_std_norm / 0.08).square()
-        )
-    else:
-        reference_std_norm = torch.zeros_like(canthus_distance_px)
-        uncertainty_confidence = torch.ones_like(canthus_distance_px)
-    confidence_product = (
-        anchor_visibility * lid_visibility * uncertainty_confidence
-    )
-    confidence = (
-        confidence_product.clamp_min(1e-12).pow(1.0 / 3.0)
-        * (confidence_product > 0).to(confidence_product.dtype)
-    ).clamp(0.0, 1.0)
-    return {
-        "origin_px": origin_px,
-        "basis": basis,
-        "canthus_distance_px": canthus_distance_px,
-        "point_weight": point_weight,
-        "reference_std_norm": reference_std_norm,
-        "confidence": confidence,
-    }
-
-
-def _soft_iris_aperture_visibility(
-    upper_lid_local: Tensor,
-    lower_lid_local: Tensor,
-    iris_points_local: Tensor,
-    *,
-    horizontal_bandwidth: float = 0.12,
-    vertical_softness: float = 0.025,
-) -> Tensor:
-    """Softly reduce support for iris points predicted behind an eyelid."""
-
-    query_x = iris_points_local[..., 0]
-
-    def interpolate_lid_y(lid: Tensor) -> Tensor:
-        distance = (
-            query_x.unsqueeze(-1) - lid[:, None, :, 0]
-        ) / horizontal_bandwidth
-        weight = torch.softmax(-distance.square(), dim=-1)
-        return (weight * lid[:, None, :, 1]).sum(dim=-1)
-
-    upper_y = interpolate_lid_y(upper_lid_local)
-    lower_y = interpolate_lid_y(lower_lid_local)
-    top = torch.minimum(upper_y, lower_y)
-    bottom = torch.maximum(upper_y, lower_y)
-    visible_from_top = torch.sigmoid(
-        (iris_points_local[..., 1] - top) / vertical_softness
-    )
-    visible_from_bottom = torch.sigmoid(
-        (bottom - iris_points_local[..., 1]) / vertical_softness
-    )
-    return (visible_from_top * visible_from_bottom).clamp(0.0, 1.0)
-
-
-def _observed_iris_center(
-    points_px: Tensor,
-    covariance_px: Tensor,
-    center_visibility: Tensor,
-    rim_visibility: Tensor,
-    *,
-    covariance_floor_px: float,
-) -> tuple[Tensor, Tensor, Tensor]:
-    direct = points_px[:, EYE_PSEUDO_IRIS_CENTER_INDEX]
-    direct_variance = 0.5 * torch.diagonal(
-        covariance_px[:, EYE_PSEUDO_IRIS_CENTER_INDEX], dim1=-2, dim2=-1
-    ).sum(dim=-1)
-    rim = points_px[:, IRIS_RIM_SLICE]
-    rim_weight_sum = rim_visibility.sum(dim=-1, keepdim=True)
-    rim_alpha = rim_visibility / rim_weight_sum.clamp_min(1e-6)
-    rim_center = (rim * rim_alpha.unsqueeze(-1)).sum(dim=-2)
-    rim_covariance = torch.einsum(
-        "nq,nqij->nij",
-        rim_alpha.square(),
-        covariance_px[:, IRIS_RIM_SLICE],
-    )
-    rim_center_variance = 0.5 * torch.diagonal(
-        rim_covariance, dim1=-2, dim2=-1
-    ).sum(dim=-1)
-    floor_variance = covariance_floor_px**2
-    direct_precision = center_visibility / (
-        direct_variance + floor_variance
-    ).clamp_min(1e-6)
-    rim_precision = rim_visibility.mean(dim=-1) / (
-        rim_center_variance + floor_variance
-    ).clamp_min(1e-6)
-    total_precision = direct_precision + rim_precision
-    center = (
-        direct * direct_precision.unsqueeze(-1)
-        + rim_center * rim_precision.unsqueeze(-1)
-    ) / total_precision.unsqueeze(-1).clamp_min(1e-6)
-    fallback = 0.5 * (direct + rim_center)
-    center = torch.where(total_precision[:, None] > 1e-6, center, fallback)
-    variance = total_precision.clamp_min(1e-6).reciprocal()
-    effective_visibility = 1.0 - (
-        (1.0 - center_visibility) * (1.0 - rim_visibility.mean(dim=-1))
-    )
-    return center, variance, effective_visibility.clamp(0.0, 1.0)
-
-
-def _projected_iris_covariance(
-    gaze_xy: Tensor,
-    iris_radius: Tensor,
-) -> Tensor:
-    identity = torch.eye(2, device=gaze_xy.device, dtype=torch.float32)
-    projection = identity - gaze_xy.unsqueeze(-1) * gaze_xy.unsqueeze(-2)
-    return 0.5 * iris_radius.square() * projection
 
 
 def stack_binocular_outputs(

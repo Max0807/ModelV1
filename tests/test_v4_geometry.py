@@ -117,11 +117,7 @@ class RayTableGeometryTests(unittest.TestCase):
             GazeGeometryLossConfig(
                 uv_huber_beta_mm=30.0,
                 uv_huber_weight=0.0,
-                mixture_nll_weight=0.0,
-                mixture_kernel_sigma_mm=30.0,
-                gaze_direction_weight=0.0,
                 gaze_angular_weight=0.0,
-                depth_prior_kl_weight=0.0,
                 ray_validity_weight=0.0,
                 ray_penalty_scale_mm=100.0,
                 uv_gaussian_nll_weight=1.0,
@@ -145,54 +141,12 @@ class RayTableGeometryTests(unittest.TestCase):
         )
         self.assertGreater(float(narrow["uv_gaussian_nll"]), float(wide["uv_gaussian_nll"]))
 
-    def test_direction_constraint_penalizes_only_opposite_hemisphere(self) -> None:
-        criterion = GazeGeometryLoss(
-            GazeGeometryLossConfig(
-                uv_huber_beta_mm=30.0,
-                uv_huber_weight=0.0,
-                mixture_nll_weight=0.0,
-                mixture_kernel_sigma_mm=30.0,
-                gaze_direction_weight=1.0,
-                gaze_angular_weight=0.0,
-                depth_prior_kl_weight=0.0,
-                ray_validity_weight=0.0,
-                ray_penalty_scale_mm=100.0,
-            )
-        )
-        batch = {
-            "uv_gt": torch.zeros((1, 2)),
-            "raw_eye_geometry_mm": torch.tensor(
-                [[-30.0, 0.0, 600.0, 30.0, 0.0, 600.0]]
-            ),
-            "gaze_target_camera_mm": torch.tensor([[0.0, 0.0, 1000.0]]),
-        }
-        common = {
-            "uv_mean_mm": torch.zeros((1, 2)),
-            "uv_hypotheses_mm": torch.zeros((1, 1, 2)),
-            "depth_effective_weights": torch.ones((1, 1)),
-            "depth_prior_log_weights": torch.zeros((1, 1)),
-        }
-        forward = criterion(
-            {**common, "gaze_direction_c": torch.tensor([[0.0, 0.0, 1.0]])},
-            batch,
-        )
-        backward = criterion(
-            {**common, "gaze_direction_c": torch.tensor([[0.0, 0.0, -1.0]])},
-            batch,
-        )
-        self.assertEqual(float(forward["gaze_direction"]), 0.0)
-        self.assertEqual(float(backward["gaze_direction"]), 1.0)
-
     def test_pseudo_gaze_cosine_loss_has_configured_weak_weight(self) -> None:
         criterion = GazeGeometryLoss(
             GazeGeometryLossConfig(
                 uv_huber_beta_mm=30.0,
                 uv_huber_weight=0.0,
-                mixture_nll_weight=0.0,
-                mixture_kernel_sigma_mm=30.0,
-                gaze_direction_weight=0.0,
                 gaze_angular_weight=100.0,
-                depth_prior_kl_weight=0.0,
                 ray_validity_weight=0.0,
                 ray_penalty_scale_mm=100.0,
             )

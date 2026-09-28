@@ -6,10 +6,19 @@ import torch
 
 from modelv1.data.augmentation import (
     EYE_AUGMENTATION_COORDINATE_POLICY,
+    FACE_AUGMENTATION_COORDINATE_POLICY,
     EyeAppearanceAugmentationConfig,
+    FaceAppearanceAugmentation,
+    FaceAppearanceAugmentationConfig,
     PairedEyeAppearanceAugmentation,
+    face_augmentation_config_for_policy,
 )
-from modelv1.model import ResNetEyeImageEncoder
+from modelv1.model import (
+    EYE_FEATURE_MODE_MULTISCALE_FPN24,
+    EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL,
+    ResNetEyeImageEncoder,
+)
+from modelv1.vertical_eye_geometry import ProbabilisticEyeLandmarkHead
 
 
 def augmentation_config(**overrides: float | int) -> EyeAppearanceAugmentationConfig:
@@ -35,6 +44,66 @@ def augmentation_config(**overrides: float | int) -> EyeAppearanceAugmentationCo
     }
     values.update(overrides)
     return EyeAppearanceAugmentationConfig(**values)  # type: ignore[arg-type]
+
+
+def face_augmentation_config(
+    **overrides: float | int | str,
+) -> FaceAppearanceAugmentationConfig:
+    values: dict[str, float | int | str] = {
+        "photometric_probability": 1.0,
+        "brightness_min": 0.9,
+        "brightness_max": 0.9,
+        "contrast_min": 1.1,
+        "contrast_max": 1.1,
+        "gamma_min": 1.0,
+        "gamma_max": 1.0,
+        "blur_probability": 0.0,
+        "blur_kernel_size": 3,
+        "blur_sigma_min": 0.1,
+        "blur_sigma_max": 0.6,
+        "noise_probability": 0.0,
+        "noise_std_max": 0.0,
+    }
+    values.update(overrides)
+    return FaceAppearanceAugmentationConfig(**values)  # type: ignore[arg-type]
+
+
+class FaceAppearanceAugmentationTests(unittest.TestCase):
+    def test_appearance_changes_preserve_face_shape_and_input(self) -> None:
+        transform = FaceAppearanceAugmentation(face_augmentation_config())
+        face = torch.linspace(0.0, 1.0, 3 * 160 * 160).reshape(3, 160, 160)
+        original = face.clone()
+
+        augmented = transform(face)
+
+        self.assertEqual(tuple(augmented.shape), (3, 160, 160))
+        torch.testing.assert_close(face, original)
+        self.assertFalse(torch.equal(augmented, face))
+        self.assertTrue(torch.isfinite(augmented).all())
+        self.assertTrue(torch.all((augmented >= 0) & (augmented <= 1)))
+
+    def test_named_policy_is_mild_and_contains_no_spatial_parameters(self) -> None:
+        config = face_augmentation_config_for_policy("appearance_mild_v1")
+
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(
+            config.coordinate_policy,
+            FACE_AUGMENTATION_COORDINATE_POLICY,
+        )
+        self.assertFalse(
+            any(
+                token in config.__dataclass_fields__
+                for token in ("rotation", "flip", "crop", "translation", "scale")
+            )
+        )
+
+    def test_spatial_coordinate_policy_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "appearance-only"):
+            face_augmentation_config(coordinate_policy="rotate_or_flip")
+        self.assertTrue(
+            FaceAppearanceAugmentation.preserves_spatial_coordinates
+        )
 
 
 class PairedEyeAugmentationTests(unittest.TestCase):
@@ -142,6 +211,40 @@ class EyeBackboneFreezeTests(unittest.TestCase):
         self.assertTrue(all(p.requires_grad for p in encoder.backbone.layer4.parameters()))
         self.assertFalse(encoder.backbone.layer3[0].bn1.training)
         self.assertTrue(encoder.backbone.layer4[0].bn1.training)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+    "CUDA BF16 is required",
+)
+class BFloat16InterpolationTests(unittest.TestCase):
+    def test_fpn_and_landmark_decoder_support_bf16_autocast(self) -> None:
+        encoder = ResNetEyeImageEncoder(
+            backbone="resnet18",
+            embedding_dim=None,
+            dropout=0.0,
+            weights=None,
+            spatial_pool_size=(7, 12),
+            feature_map_stage="layer4",
+            feature_map_mode=EYE_FEATURE_MODE_MULTISCALE_FPN24,
+            stem_mode=EYE_STEM_MODE_SMALL_3X3_S2_NO_MAXPOOL,
+        ).cuda().eval()
+        landmark_head = ProbabilisticEyeLandmarkHead(
+            output_size=(14, 23),
+        ).cuda().eval()
+        image = torch.zeros((1, 3, 56, 90), device="cuda")
+
+        with torch.no_grad(), torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16,
+        ):
+            maps = encoder.forward_feature_maps(image)
+            landmarks = landmark_head(maps["layer2"], maps["layer3"])
+
+        self.assertEqual(maps["feature_map"].dtype, torch.bfloat16)
+        self.assertEqual(landmarks["logits"].dtype, torch.bfloat16)
+        self.assertEqual(tuple(maps["feature_map"].shape[-2:]), (7, 12))
+        self.assertEqual(tuple(landmarks["logits"].shape[-2:]), (14, 23))
 
 
 if __name__ == "__main__":

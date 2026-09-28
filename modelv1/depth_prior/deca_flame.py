@@ -34,6 +34,8 @@ class DecaFlameConfig:
     image_size: int = 224
 
     def __post_init__(self) -> None:
+        """规范化 DECA/checkpoint 路径，并验证输入图像尺寸为正。"""
+
         object.__setattr__(self, "deca_root", Path(self.deca_root).resolve())
         if self.pretrained_model_path is not None:
             object.__setattr__(
@@ -64,10 +66,14 @@ class DecaFlameOutput:
 
     @property
     def batch_size(self) -> int:
+        """返回本次 DECA/FLAME 输出中的样本数量。"""
+
         return int(self.head_local_landmarks3d.shape[0])
 
 
 def _require_torch() -> Any:
+    """延迟导入 PyTorch，并将缺失依赖转换为明确的 DECA 错误。"""
+
     try:
         import torch
     except ImportError as error:  # pragma: no cover - depends on environment
@@ -114,6 +120,8 @@ def _enable_chumpy_compatibility() -> None:
         arg_spec = namedtuple("ArgSpec", ("args", "varargs", "keywords", "defaults"))
 
         def getargspec(function: Any) -> Any:
+            """用 getfullargspec 模拟旧 chumpy 依赖需要的 inspect.getargspec。"""
+
             full_spec = inspect.getfullargspec(function)
             return arg_spec(
                 full_spec.args,
@@ -222,6 +230,8 @@ class DecaFlameExtractor:
     """
 
     def __init__(self, config: DecaFlameConfig | None = None) -> None:
+        """加载官方 DECA encoder、FLAME decoder、checkpoint，并选择推理设备。"""
+
         self.config = config or DecaFlameConfig()
         torch = _require_torch()
         ResnetEncoder, FLAME, get_cfg_defaults = _import_official_deca(

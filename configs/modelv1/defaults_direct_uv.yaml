@@ -1,0 +1,7 @@
+# Stable direct-UV training contract. Experiment YAML files inherit these
+# values through their top-level `defaults` entry and only keep tunable choices.
+data:
+  require_eye_geometry_pseudo_labels: true
+  direct_uv_target_frame: table_local
+  skip_invalid_virtual_camera_samples: true
+  split_mode: explicit_datasets

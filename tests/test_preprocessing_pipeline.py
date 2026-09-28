@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 
 from modelv1.depth_prior.pnp import PNP_GEOMETRY_VERSION
-from scripts.prepare_modelv1_preprocessing import PipelineArtifacts, depth_method
+from scripts.prepare_modelv1_preprocessing import (
+    DEFAULT_CONFIG_PATH,
+    PipelineArtifacts,
+    depth_method,
+    load_preprocessing_config,
+)
 from scripts.validate_pnp_geometry import audit
 
 
@@ -22,6 +27,20 @@ class PreprocessingControllerTests(unittest.TestCase):
         self.assertIn("iris65", str(artifacts.iris_prior))
         self.assertNotEqual(artifacts.pnp_dataset, artifacts.iris_dataset)
         self.assertIn("common_pnp1010_iris65", str(artifacts.virtual_root("both")))
+
+    def test_default_yaml_owns_preprocessing_parameters(self) -> None:
+        config = load_preprocessing_config(DEFAULT_CONFIG_PATH)
+
+        self.assertEqual(config.dataset_id, "13")
+        self.assertEqual(config.depth_method, "both")
+        self.assertEqual(config.output_root.name, "dataset13")
+        self.assertEqual((config.virtual_face_width, config.virtual_face_height), (160, 160))
+        self.assertFalse(hasattr(config, "device"))
+        self.assertFalse(hasattr(config, "deca_batch_size"))
+        self.assertFalse(hasattr(config, "deca_crop_scale"))
+
+        artifacts = PipelineArtifacts(config.dataset_id, config.output_root)
+        self.assertFalse(hasattr(artifacts, "deca_cache"))
 
     def test_geometry_audit_can_exclude_failed_reconstructions(self) -> None:
         identity = {

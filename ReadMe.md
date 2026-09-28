@@ -9,6 +9,12 @@ Basic project skeleton for model experiments.
 3. Copy `.env.example` to `.env` if local environment variables are needed.
 4. Open a Python file and run `Python: Current File` from the Run and Debug panel.
 
+To debug how raw collection data becomes the virtual face image and
+`table_frame7_n[7]`, use the `Table7 00`–`Table7 05` entries in
+`.vscode/launch.json` and follow
+[`docs/table_frame7_stage1_3_debug_guide.md`](docs/table_frame7_stage1_3_debug_guide.md).
+The separate `modelv1_pre_model_debug_guide.md` covers the later DataLoader-to-model boundary.
+
 ## Data Preparation
 
 Build the unified ModelV1 CSV from the CrossGaze collection:
@@ -47,21 +53,14 @@ Install the runtime dependencies first:
 pip install -r requirements.txt
 ```
 
-Then check one training batch, including frozen DECA features and normalized UV targets:
+Then check one training batch and normalized UV targets:
 
 ```powershell
 python scripts\check_dataloader.py
 ```
 
-The default loader requires and reads
-`data/processed/deca_features_deca_crop_v1.npz`.
-Use `deca_cache_path` only when intentionally selecting a different cache.
-
-The split strategy is selected with `split_mode`:
-
-- `dataset_5` (default): train on `dataset_dual_rigid_body_3` + `dataset_dual_rigid_body_4`; use `dataset_dual_rigid_body_5` as validation/test.
-- `explicit_datasets`: use the requested `train_datasets` and `val_datasets` as a disjoint session/camera holdout.
-- `random_80_20`: merge datasets 3, 4, and 5, then split them into train/validation with a deterministic 4:1 ratio.
+Training uses an explicit, disjoint session/camera holdout selected by
+`train_datasets` and `val_datasets`.
 
 Examples:
 
@@ -78,8 +77,6 @@ train_loader, val_loader = build_modelv1_dataloaders(
 The smoke-test script supports the same selection:
 
 ```powershell
-python scripts\check_dataloader.py --split-mode random_80_20
-python scripts\check_dataloader.py --split-mode dataset_5
 python scripts\check_dataloader.py --split-mode explicit_datasets --train-datasets 3 --val-datasets 4
 ```
 
@@ -91,7 +88,6 @@ Open [validate_modelv1_dataset.ipynb](notebooks/validate_modelv1_dataset.ipynb) 
 
 The V1 model is a multi-branch PyTorch regressor:
 
-- `face_branch`: consumes frozen/offline DECA features from `deca_feat`.
 - `visual_encoder` (V3 optional): extracts a 3x3 face feature map with a
   VGGFace2-pretrained Inception-ResNet V1 and two 2x2 eye feature maps with a
   shared ResNet-18, then fuses them with eye-to-face cross-attention.
@@ -99,20 +95,6 @@ The V1 model is a multi-branch PyTorch regressor:
 - `crop_cam_branch`: embeds the 36D crop/camera vector.
 - `scene_branch`: embeds the 25D scene/table vector.
 - `fusion_mlp` + `uv_head`: predicts normalized table-local `(u, v)`.
-
-For a no-DECA ablation, set:
-
-```yaml
-model:
-  deca_feature_representation: none
-  deca_feature_dim: 0
-  deca_branch_mode: flat
-```
-
-This removes the DECA branch and its 128D output from the fusion input. The
-DataLoader and training entry point will not load, merge, or validate a DECA
-cache in this mode. RGB face/eye cross-attention remains enabled independently
-through `use_face_image`.
 
 The eye backbone is selected in the training YAML:
 
@@ -141,7 +123,7 @@ Minimal use:
 from modelv1 import ModelV1
 
 model = ModelV1()
-uv_pred = model(batch)  # deca_feat is optional when deca_feature_representation="none"
+uv_pred = model(batch)
 ```
 
 ### Optional V2.1/V2.2 binocular geometry
@@ -206,8 +188,7 @@ python scripts\check_dataloader.py --split-mode random_80_20 --scene-representat
 
 ### V3 RGB face encoder and cross-attention fusion
 
-V3 retains the V2.2 DECA, TableFrame, binocular geometry, and quality-gate
-branches. It additionally computes:
+The RGB face/eye path computes:
 
 ```text
 face [B,3,160,160] -> Inception-ResNet V1 -> [B,1792,3,3] -> 9x128 K/V tokens
@@ -215,14 +196,11 @@ each eye [B,3,36,60] -> shared ResNet18   -> [B,512,2,2]  -> 4x128 Q tokens
 CrossAttention(Q=8 eye tokens, K/V=9 face tokens) -> mean pool -> f_visual [B,128]
 ```
 
-The final fusion consumes `DECA feature + f_visual + scene + gated eye
-geometry`; it does not append the RGB face and eye embeddings independently.
+The final fusion consumes `f_visual + scene` plus any enabled geometry
+branches; it does not append separate global RGB face and eye embeddings.
 Enable it with:
 
 ```yaml
-data:
-  load_face_image: true
-
 model:
   use_face_image: true
   freeze_face_image_backbone: false
@@ -275,17 +253,15 @@ python scripts\check_loss.py
 
 ## Training
 
-The default training configuration uses datasets 3, 4, and 5 in a fixed 80/20
-random split, trains for 300 epochs, and selects the best checkpoint by
-validation EPE in millimeters. Training reads only cached DECA features and eye
-crops; it does not load the unused face image tensor.
+The finalized training configuration uses explicit training/validation datasets
+and selects the best checkpoint by validation EPE in millimeters. Training uses
+the RGB face and eye inputs directly and has no DECA feature-cache dependency.
 
 All W&B naming and routing settings live in the selected config file:
 
 ```yaml
 experiment:
   run_name: null  # null generates a timestamp; set a string to name the run
-  description: "Describe the hypothesis or model change for this run."
   diary_enabled: true
   diary_path: experiments/experiment_diary.md
 
@@ -318,48 +294,17 @@ per-axis MAE in millimeters, learning rate, throughput, and elapsed time. The te
 every tenth, and final epoch. `checkpoints/best.pt` tracks lowest validation
 EPE, while `checkpoints/last.pt` supports resuming:
 
+When `training.ema.enabled=true`, EMA averaging starts after warmup. Validation and best-checkpoint
+selection then use EMA weights. Checkpoints keep both the raw model (for exact
+optimizer resume) and EMA state; analysis prefers EMA weights when available.
+
 ```powershell
 python scripts\train_modelv1.py --resume outputs\<project>\<run>\checkpoints\last.pt
 ```
 
 ## DECA Offline Features
 
-The face branch uses DECA's frozen 236-D coarse `E_flame` output. By default,
-DECA reads `source_image_path`, forms the official-style square bbox crop with
-a downward 0.12 bbox-size center offset and a 1.25 scale, pads outside pixels
-with black, and resizes to `224x224`. Create the default cache before training:
-
-```powershell
-python scripts\cache_deca_features.py --device cuda
-```
-
-This writes `data/processed/deca_features_deca_crop_v1.npz`. It stores one
-float32 `deca_feat` vector per `sample_id`, plus face-image and checkpoint
-SHA-256 digests and JSON metadata. Re-running the command reuses entries whose
-sample id and image digest have not changed.
-
-```powershell
-python scripts\cache_deca_features.py --verify-cache
-python scripts\train_modelv1.py --config configs\modelv1\train_random_80_20_100_deca_crop.yaml
-```
-
-`data.deca_face_preprocess` and `data.deca_crop_scale` are recorded in the
-experiment configuration and checked against cache metadata before training.
-The ModelV1 network reads the resulting cached DECA feature, so this crop is
-performed once during cache generation rather than repeatedly in every epoch.
-
-The checked-in `DECA-master` directory must be a complete DECA checkout and
-contain `data/deca_model.tar`; see the official DECA README for its model/data
-download instructions. The cache script only loads the `E_flame` encoder, so
-it does not run DECA rendering or mesh decoding.
-
-The default loader uses this result automatically. To override its location:
-
-```python
-from modelv1.data import build_modelv1_dataloaders
-
-train_loader, val_loader = build_modelv1_dataloaders(
-    deca_cache_path="data/processed/deca_features_deca_crop_v1.npz",
-    require_deca_features=True,
-)
-```
+The former offline 236-D DECA `E_flame` cache and its train-time MLP branch
+have been removed. Current preprocessing and training do not generate or load
+`deca_features_*.npz`. DECA/FLAME utilities that support separate offline
+geometry or depth-prior research are independent of this removed model branch.

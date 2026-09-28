@@ -74,13 +74,10 @@ def append_completed_experiment(
     optimizer = training["optimizer"]
     scheduler = training["scheduler"]
     wandb = config["logging"]["wandb"]
-    deca_artifact_description, depth_prior_description = _describe_data_artifacts(
-        data
-    )
-    if str(model.get("deca_feature_representation", "full236")) == "none":
-        deca_artifact_description = "disabled (deca_feature_representation=none)"
+    depth_prior_description = _describe_depth_prior_artifact(data)
     run_name = str(experiment["run_name"])
-    description = str(experiment.get("description", "")).strip() or "未填写"
+    model_change = _describe_model_change(model)
+    description = model_change
 
     record = {
         "run_dir": run_key,
@@ -100,7 +97,6 @@ def append_completed_experiment(
         f"{_format_delta(delta)} | {int(best['epoch'])} |"
     )
 
-    model_change = _describe_model_change(model)
     loss_description = _describe_loss(loss)
     details = f"""## {completed_at} · {run_name}
 
@@ -115,11 +111,10 @@ def append_completed_experiment(
 
 | 类别 | 设置 |
 |---|---|
-| 数据划分 | `{data["split_mode"]}`；train={train_sample_count}，val={val_sample_count}，seed={data["split_seed"]} |
-| DECA | representation=`{model.get("deca_feature_representation", "full236")}`，preprocess=`{data["deca_face_preprocess"]}`，crop_scale={data["deca_crop_scale"]}，cache=`{deca_artifact_description}` |
+| 数据划分 | `{data["split_mode"]}`；datasets={data.get("train_datasets")} → {data.get("val_datasets")}；train={train_sample_count}，val={val_sample_count} |
 | 深度先验 | `{depth_prior_description}` |
 | 人脸/双眼视觉融合 | use={model.get("use_face_image", False)}，face=`inception_resnet_v1(vggface2)`，eye=`{model.get("eye_backbone", "resnet18")}`，cross_attention={model.get("visual_attention_heads", 8)}x{model.get("visual_attention_dim", 128)}，face_frozen={model.get("freeze_face_image_backbone", False)} |
-| 眼部骨干 | `{model["eye_backbone"]}`，input_size=`{data.get("eye_image_size", (60, 36))}` (W,H)，weights=`{model.get("eye_backbone_weights")}` |
+| 眼部骨干 | `{model["eye_backbone"]}`，input_size=`(90, 56)` (W,H)，weights=`{model.get("eye_backbone_weights")}` |
 | Crop分支 | use={model.get("use_crop_cam", True)}，input_dim={model.get("crop_cam_dim", 36)} |
 | Scene分支 | representation=`{model.get("scene_representation", "full25")}`，input_dim={model.get("scene_dim", 25)} |
 | 几何分支 | use={model.get("use_eye_geometry", False)}，gate=`{model.get("eye_geometry_gate_mode", "none")}` |
@@ -155,18 +150,14 @@ def append_completed_experiment(
     return True
 
 
-def _describe_data_artifacts(data: Mapping[str, Any]) -> tuple[str, str]:
-    """Return diary-safe artifact descriptions for legacy and numbered configs."""
+def _describe_depth_prior_artifact(data: Mapping[str, Any]) -> str:
+    """Return a diary-safe depth-prior description."""
 
     dataset_ids = data.get("dataset_ids")
     if isinstance(dataset_ids, (list, tuple)) and dataset_ids:
         ids = ", ".join(str(value) for value in dataset_ids)
         processed_dir = str(data.get("processed_data_dir", "data/processed"))
         prior_kind = str(data.get("depth_prior_kind", "iris_ipd_65mm"))
-        deca = (
-            f"numbered datasets [{ids}]; "
-            f"{processed_dir}/deca_features_deca_crop_v1_<id>.npz"
-        )
         if prior_kind == "iris_ipd_65mm":
             prior_pattern = "depth_priors_iris_ipd_65mm_v1_<id>.csv"
         elif prior_kind == "pnp1010":
@@ -174,12 +165,9 @@ def _describe_data_artifacts(data: Mapping[str, Any]) -> tuple[str, str]:
         else:
             prior_pattern = f"<unknown prior kind: {prior_kind}>"
         depth_prior = f"numbered datasets [{ids}]; {processed_dir}/{prior_pattern}"
-        return deca, depth_prior
+        return depth_prior
 
-    return (
-        str(data.get("deca_cache_path", "<not configured>")),
-        str(data.get("depth_prior_csv_path", "<not configured>")),
-    )
+    return str(data.get("depth_prior_csv_path", "<not configured>"))
 
 
 def _read_metric_rows(path: Path) -> list[dict[str, str]]:
@@ -245,15 +233,6 @@ def _escape_table(value: object) -> str:
 
 def _describe_model_change(model: Mapping[str, Any]) -> str:
     changes = []
-    deca_representation = str(
-        model.get("deca_feature_representation", "full236")
-    )
-    if deca_representation == "none":
-        changes.append("完全移除离线 DECA 特征及其 MLP 分支")
-    elif deca_representation == "geometry156":
-        changes.append("DECA 特征从完整 236D 切换为 shape+exp+pose 的 Geometry 156D")
-    if str(model.get("deca_branch_mode", "flat")) == "factorized_geometry":
-        changes.append("DECA 的 shape、exp、pose 分别经小型 MLP 编码后再融合为 128D")
     if bool(model.get("use_face_image", False)):
         changes.append(
             "增加 RGB 人脸编码器及 face-eye 视觉融合"
@@ -289,10 +268,7 @@ def _describe_loss(loss: Mapping[str, Any]) -> str:
         fields = (
             "uv_huber_beta_mm",
             "uv_huber_weight",
-            "mixture_nll_weight",
-            "gaze_direction_weight",
             "gaze_angular_weight",
-            "depth_prior_kl_weight",
             "ray_validity_weight",
         )
         return "，".join(

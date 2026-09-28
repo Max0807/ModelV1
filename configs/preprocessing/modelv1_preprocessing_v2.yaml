@@ -1,0 +1,75 @@
+# ModelV1 preprocessing defaults.
+#
+# Normal use:
+#   python scripts/prepare_modelv1_preprocessing.py
+# Alternative config:
+#   python scripts/prepare_modelv1_preprocessing.py --config <path-to-yaml>
+#
+# To adapt this project to another machine, start by changing paths.source_root.
+# Relative paths are resolved from the repository root. {dataset_id} is replaced
+# with dataset.id, and environment variables in paths are expanded.
+
+dataset:
+  # Accepts 13 or dataset_dual_rigid_body_13.
+  id: "13"
+  # pnp1010 | iris65 | both
+  depth_method: both
+
+paths:
+  # Directory that contains dataset_dual_rigid_body_<ID>/.
+  source_root: D:/GithubCode/CrossGaze-main/CrossGaze-main/data_collection
+  output_root: data/preprocessed_v2_160/dataset{dataset_id}
+
+input:
+  # Face crop used in the unified model dataset.
+  face_image_dir: insightface_face
+  # Detection table stored inside dataset_dual_rigid_body_<ID>/.
+  insightface_coordinates_file: insightface_coordinates.csv
+
+dataset_build:
+  handeye_translation_scale: 1000.0
+  table_z_source: per-sample-target
+
+pnp1010:
+  fixed_scale_mm_per_flame_unit: 1010.0
+
+iris65:
+  ipd_mm: 65.0
+  max_ipd_residual_mm: 4.0
+  max_ray_condition: 250.0
+
+  # Inclusive fixed-shape calibration range. Update it for each dataset.
+  calibration_start: 1
+  calibration_stop: 83
+  calibration_index_mode: frame_idx
+
+  # Enable only when training consumes an Iris65 depth uncertainty estimate.
+  estimate_depth_uncertainty: false
+  uncertainty_bootstrap_samples: 64
+  uncertainty_iris_std_px: 0.5
+  uncertainty_ipd_std_mm: 0.0
+  uncertainty_min_success_count: 32
+  uncertainty_seed: 42
+
+virtual_camera:
+  face_width: 160
+  face_height: 160
+  eye_width: 60
+  eye_height: 36
+  eye_span_scale: 1.8
+  focal_length_px: 480.0
+  distance_mm: 600.0
+
+  # null means process every valid sample. Positive integers are for debugging.
+  limit_per_dataset: null
+
+execution:
+  # true skips rebuilding shared/modelv1_dataset<ID>.csv; use only when the raw
+  # collection files are intentionally unchanged.
+  reuse_base_dataset: false
+
+  # true permits derived outputs at the configured output root to be replaced.
+  overwrite: false
+
+  # true prints all subprocess commands without creating preprocessing outputs.
+  dry_run: false

@@ -9,7 +9,6 @@ __all__ = [
     "ProbabilisticEyeLandmarkHead",
     "ProbabilisticLandmarkTokenizer",
     "LandmarkGuidedEyeFusion",
-    "LowDOFDifferentiableEyeballTemplate",
     "PitchToTableVResidual",
     "DirectTableUVLoss",
     "DirectVirtualTableUVLoss",
@@ -75,11 +74,6 @@ def __getattr__(name: str):
         }
         globals().update(exports)
         return exports[name]
-    if name == "LowDOFDifferentiableEyeballTemplate":
-        from .vertical_eye_geometry import LowDOFDifferentiableEyeballTemplate
-
-        globals()[name] = LowDOFDifferentiableEyeballTemplate
-        return LowDOFDifferentiableEyeballTemplate
     if name == "PitchToTableVResidual":
         from .vertical_eye_geometry import PitchToTableVResidual
 

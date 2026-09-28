@@ -104,6 +104,23 @@
 | 2026-08-25T13:24:05+08:00 | 20260825_130035 | Preprocessed-v2 direct table-UV H5+F0 experiment: train Dataset 13 and validate Dataset 11 with virtual-camera face images and legacy 90x56 eye images; Eye uses H5 small stem + multiscale FPN 4x6 tokens, Face uses the native Inception-ResNet V1 3x3 spatial tokens, then direct table-local (u,v) is predicted with virtual-distance and virtual-pose FiLM. | 32.578 mm | +0.449 mm | 42 |
 | 2026-08-25T14:40:16+08:00 | 20260825_140932 | Preprocessed-v2 direct table-UV H5+F0 experiment: train Dataset 13 and validate Dataset 11 with virtual-camera face images and legacy 90x56 eye images; Eye uses H5 small stem + multiscale FPN 4x6 tokens, Face uses the native Inception-ResNet V1 3x3 spatial tokens, then direct table-local (u,v) is predicted with virtual-distance and virtual-pose FiLM. | 31.116 mm | -1.462 mm | 43 |
 | 2026-08-25T22:39:18+08:00 | 20260825_211030 | Preprocessed-v2 direct table-UV H5+F0 experiment: train Dataset 13 and validate Dataset 11 with virtual-camera face images and legacy 90x56 eye images; Eye uses H5 small stem + multiscale FPN 4x6 tokens, Face uses the native Inception-ResNet V1 3x3 spatial tokens, then direct table-local (u,v) is predicted with virtual-distance and virtual-pose FiLM. | 32.030 mm | +0.914 mm | 39 |
+| 2026-08-28T21:41:30+08:00 | 20260828_205505 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 31.879 mm | -0.151 mm | 46 |
+| 2026-08-30T01:50:34+08:00 | 20260830_012612 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 32.392 mm | +0.513 mm | 44 |
+| 2026-08-31T18:24:14+08:00 | 20260831_180320 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 32.386 mm | -0.006 mm | 44 |
+| 2026-09-01T16:16:44+08:00 | 20260901_155527 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 32.290 mm | -0.096 mm | 36 |
+| 2026-09-02T10:23:02+08:00 | 20260902_095621 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 32.286 mm | -0.004 mm | 37 |
+| 2026-09-02T15:35:13+08:00 | 20260902_150149 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 31.834 mm | -0.452 mm | 45 |
+| 2026-09-02T16:39:16+08:00 | 20260902_161042 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 31.747 mm | -0.087 mm | 45 |
+| 2026-09-02T22:50:23+08:00 | 20260902_222551 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 45.942 mm | +14.195 mm | 44 |
+| 2026-09-02T23:58:40+08:00 | 20260902_233231 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 31.162 mm | -14.780 mm | 40 |
+| 2026-09-03T10:48:05+08:00 | 20260903_101954 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 30.248 mm | -0.915 mm | 50 |
+| 2026-09-03T16:46:11+08:00 | 20260903_163247 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 31.928 mm | +1.681 mm | 45 |
+| 2026-09-03T20:39:59+08:00 | 20260903_202624 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 33.145 mm | +1.217 mm | 44 |
+| 2026-09-03T22:58:41+08:00 | 20260903_224229 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 33.669 mm | +0.524 mm | 50 |
+| 2026-09-03T23:43:58+08:00 | 20260903_233046 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 33.767 mm | +0.098 mm | 50 |
+| 2026-09-04T09:50:21+08:00 | 20260904_092948 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 32.210 mm | -1.557 mm | 73 |
+| 2026-09-23T15:44:56+08:00 | ablation_a2_blaze_style_d13_to_d11_seed42 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 31.371 mm | -0.839 mm | 76 |
+| 2026-09-23T16:10:22+08:00 | ablation_b2_blaze_style_recon_consistency_d13_to_d11_seed42 | 增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。 | 37.357 mm | +5.986 mm | 80 |
 <!-- AUTO-INDEX-END -->
 
 ## 实验详情
@@ -3618,5 +3635,600 @@
 | 最终验证（epoch 50） | 13.038 | 32.621 mm | 30.029 mm | 19.262 mm | 21.886 mm |
 
 相比上一实验：最佳 Val EPE 上升 0.914 mm，性能下降。
+
+## 2026-08-28T21:41:30+08:00 · 20260828_205505
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260828_205505","completed_at":"2026-08-28T21:41:30+08:00","run_name":"20260828_205505","best_val_epe_mm":31.87899398803711,"best_epoch":46} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_v2', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260828_205505`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=798，val=505 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,559,561 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 46） | 9.982 | 31.879 mm | 28.899 mm | 19.370 mm | 21.379 mm |
+| 最终训练（epoch 50） | 4.687 | 20.634 mm | 18.535 mm | 12.353 mm | 13.954 mm |
+| 最终验证（epoch 50） | 10.136 | 32.177 mm | 29.279 mm | 19.622 mm | 21.473 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.151 mm，性能提升。
+
+## 2026-08-30T01:50:34+08:00 · 20260830_012612
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260830_012612","completed_at":"2026-08-30T01:50:34+08:00","run_name":"20260830_012612","best_val_epe_mm":32.39226531982422,"best_epoch":44} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_v2', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260830_012612`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=798，val=505 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,559,561 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 44） | 10.206 | 32.392 mm | 28.334 mm | 19.688 mm | 21.534 mm |
+| 最终训练（epoch 50） | 4.776 | 20.857 mm | 18.962 mm | 12.501 mm | 13.974 mm |
+| 最终验证（epoch 50） | 10.362 | 32.677 mm | 29.482 mm | 19.612 mm | 22.021 mm |
+
+相比上一实验：最佳 Val EPE 上升 0.513 mm，性能下降。
+
+## 2026-08-31T18:24:14+08:00 · 20260831_180320
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260831_180320","completed_at":"2026-08-31T18:24:14+08:00","run_name":"20260831_180320","best_val_epe_mm":32.38603210449219,"best_epoch":44} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_v2', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260831_180320`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=798，val=505 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,559,561 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 44） | 10.212 | 32.386 mm | 28.926 mm | 19.704 mm | 21.503 mm |
+| 最终训练（epoch 50） | 4.772 | 20.838 mm | 19.055 mm | 12.453 mm | 13.964 mm |
+| 最终验证（epoch 50） | 10.377 | 32.671 mm | 29.497 mm | 19.616 mm | 21.998 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.006 mm，性能提升。
+
+## 2026-09-01T16:16:44+08:00 · 20260901_155527
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260901_155527","completed_at":"2026-09-01T16:16:44+08:00","run_name":"20260901_155527","best_val_epe_mm":32.29025650024414,"best_epoch":36} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_v2', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260901_155527`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=798，val=505 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,559,561 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 36） | 10.237 | 32.290 mm | 28.819 mm | 19.102 mm | 22.182 mm |
+| 最终训练（epoch 50） | 5.413 | 22.174 mm | 20.014 mm | 12.966 mm | 15.245 mm |
+| 最终验证（epoch 50） | 10.722 | 33.169 mm | 30.260 mm | 19.389 mm | 22.857 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.096 mm，性能提升。
+
+## 2026-09-02T10:23:02+08:00 · 20260902_095621
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260902_095621","completed_at":"2026-09-02T10:23:02+08:00","run_name":"20260902_095621","best_val_epe_mm":32.285945892333984,"best_epoch":37} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_v2', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260902_095621`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=798，val=505 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 37） | 10.186 | 32.286 mm | 28.829 mm | 20.148 mm | 20.821 mm |
+| 最终训练（epoch 50） | 5.634 | 22.976 mm | 20.826 mm | 15.138 mm | 14.326 mm |
+| 最终验证（epoch 50） | 11.028 | 33.605 mm | 30.231 mm | 21.057 mm | 21.878 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.004 mm，性能提升。
+
+## 2026-09-02T15:35:13+08:00 · 20260902_150149
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260902_150149","completed_at":"2026-09-02T15:35:13+08:00","run_name":"20260902_150149","best_val_epe_mm":31.834369659423828,"best_epoch":45} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260902_150149`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 45） | 9.970 | 31.834 mm | 28.551 mm | 20.295 mm | 20.364 mm |
+| 最终训练（epoch 50） | 5.817 | 23.156 mm | 21.692 mm | 13.604 mm | 15.884 mm |
+| 最终验证（epoch 50） | 10.200 | 32.314 mm | 28.546 mm | 20.756 mm | 20.409 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.452 mm，性能提升。
+
+## 2026-09-02T16:39:16+08:00 · 20260902_161042
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260902_161042","completed_at":"2026-09-02T16:39:16+08:00","run_name":"20260902_161042","best_val_epe_mm":31.747499465942383,"best_epoch":45} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260902_161042`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 45） | 9.947 | 31.747 mm | 27.823 mm | 20.112 mm | 20.431 mm |
+| 最终训练（epoch 50） | 5.816 | 23.137 mm | 21.530 mm | 13.635 mm | 15.825 mm |
+| 最终验证（epoch 50） | 10.193 | 32.280 mm | 28.699 mm | 20.661 mm | 20.475 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.087 mm，性能提升。
+
+## 2026-09-02T22:50:23+08:00 · 20260902_222551
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260902_222551","completed_at":"2026-09-02T22:50:23+08:00","run_name":"20260902_222551","best_val_epe_mm":45.942081451416016,"best_epoch":44} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260902_222551`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 44） | 17.810 | 45.942 mm | 42.661 mm | 31.606 mm | 27.437 mm |
+| 最终训练（epoch 50） | 6.595 | 25.076 mm | 23.410 mm | 15.541 mm | 16.373 mm |
+| 最终验证（epoch 50） | 18.212 | 46.697 mm | 44.835 mm | 31.806 mm | 28.041 mm |
+
+相比上一实验：最佳 Val EPE 上升 14.195 mm，性能下降。
+
+## 2026-09-02T23:58:40+08:00 · 20260902_233231
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260902_233231","completed_at":"2026-09-02T23:58:40+08:00","run_name":"20260902_233231","best_val_epe_mm":31.162109375,"best_epoch":40} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260902_233231`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 40） | 9.616 | 31.162 mm | 28.293 mm | 19.679 mm | 20.161 mm |
+| 最终训练（epoch 50） | 5.293 | 22.063 mm | 20.478 mm | 12.753 mm | 15.446 mm |
+| 最终验证（epoch 50） | 9.801 | 31.488 mm | 29.073 mm | 20.070 mm | 20.264 mm |
+
+相比上一实验：最佳 Val EPE 下降 14.780 mm，性能提升。
+
+## 2026-09-03T10:48:05+08:00 · 20260903_101954
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260903_101954","completed_at":"2026-09-03T10:48:05+08:00","run_name":"20260903_101954","best_val_epe_mm":30.247570037841797,"best_epoch":50} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260903_101954`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 50） | 9.196 | 30.248 mm | 27.027 mm | 19.055 mm | 19.299 mm |
+| 最终训练（epoch 50） | 4.830 | 20.937 mm | 19.085 mm | 12.781 mm | 13.921 mm |
+| 最终验证（epoch 50） | 9.196 | 30.248 mm | 27.027 mm | 19.055 mm | 19.299 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.915 mm，性能提升。
+
+## 2026-09-03T16:46:11+08:00 · 20260903_163247
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260903_163247","completed_at":"2026-09-03T16:46:11+08:00","run_name":"20260903_163247","best_val_epe_mm":31.928220748901367,"best_epoch":45} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260903_163247`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 45） | 10.035 | 31.928 mm | 28.107 mm | 20.854 mm | 19.721 mm |
+| 最终训练（epoch 50） | 5.744 | 23.091 mm | 21.219 mm | 14.251 mm | 15.176 mm |
+| 最终验证（epoch 50） | 10.808 | 33.408 mm | 29.788 mm | 21.771 mm | 20.742 mm |
+
+相比上一实验：最佳 Val EPE 上升 1.681 mm，性能下降。
+
+## 2026-09-03T20:39:59+08:00 · 20260903_202624
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260903_202624","completed_at":"2026-09-03T20:39:59+08:00","run_name":"20260903_202624","best_val_epe_mm":33.14524459838867,"best_epoch":44} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260903_202624`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 44） | 10.788 | 33.145 mm | 29.495 mm | 21.221 mm | 20.944 mm |
+| 最终训练（epoch 50） | 6.292 | 24.084 mm | 22.224 mm | 15.203 mm | 15.554 mm |
+| 最终验证（epoch 50） | 11.318 | 33.951 mm | 30.157 mm | 22.095 mm | 21.118 mm |
+
+相比上一实验：最佳 Val EPE 上升 1.217 mm，性能下降。
+
+## 2026-09-03T22:58:41+08:00 · 20260903_224229
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260903_224229","completed_at":"2026-09-03T22:58:41+08:00","run_name":"20260903_224229","best_val_epe_mm":33.66901779174805,"best_epoch":50} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260903_224229`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 50） | 11.065 | 33.669 mm | 30.522 mm | 22.064 mm | 20.850 mm |
+| 最终训练（epoch 50） | 6.114 | 23.819 mm | 22.015 mm | 15.100 mm | 15.302 mm |
+| 最终验证（epoch 50） | 11.065 | 33.669 mm | 30.522 mm | 22.064 mm | 20.850 mm |
+
+相比上一实验：最佳 Val EPE 上升 0.524 mm，性能下降。
+
+## 2026-09-03T23:43:58+08:00 · 20260903_233046
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260903_233046","completed_at":"2026-09-03T23:43:58+08:00","run_name":"20260903_233046","best_val_epe_mm":33.76749801635742,"best_epoch":50} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260903_233046`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=50，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 50） | 11.152 | 33.767 mm | 30.813 mm | 22.135 mm | 20.876 mm |
+| 最终训练（epoch 50） | 6.152 | 23.825 mm | 22.056 mm | 15.041 mm | 15.321 mm |
+| 最终验证（epoch 50） | 11.152 | 33.767 mm | 30.813 mm | 22.135 mm | 20.876 mm |
+
+相比上一实验：最佳 Val EPE 上升 0.098 mm，性能下降。
+
+## 2026-09-04T09:50:21+08:00 · 20260904_092948
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/20260904_092948","completed_at":"2026-09-04T09:50:21+08:00","run_name":"20260904_092948","best_val_epe_mm":32.21030044555664,"best_epoch":73} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'direct_uv', 'direct_table_UV', 'preprocessed_table7_stage3', 'iris65_metric_head_origin', 'virtual_camera', 'TableFrame7_N', 'table_frame_FiLM', 'Condition17', 'train_dataset_13', 'val_dataset_11', 'selectable_preprocessed_contract', 'H5_small_stem_fpn24', 'face_tokens_3x3', 'eye_tokens_7x12', 'probabilistic_15_point_eye_keypoints', 'full_2d_keypoint_covariance']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/20260904_092948`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`DEFAULT` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=36,451,913 |
+| 训练 | epochs=80，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 73） | 10.279 | 32.210 mm | 28.594 mm | 20.443 mm | 20.507 mm |
+| 最终训练（epoch 80） | 4.052 | 18.972 mm | 17.217 mm | 11.639 mm | 12.569 mm |
+| 最终验证（epoch 80） | 10.326 | 32.264 mm | 28.468 mm | 20.507 mm | 20.521 mm |
+
+相比上一实验：最佳 Val EPE 下降 1.557 mm，性能提升。
+
+## 2026-09-23T15:44:56+08:00 · ablation_a2_blaze_style_d13_to_d11_seed42
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/ablation_a2_blaze_style_d13_to_d11_seed42","completed_at":"2026-09-23T15:44:56+08:00","run_name":"ablation_a2_blaze_style_d13_to_d11_seed42","best_val_epe_mm":31.370878219604492,"best_epoch":76} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'architecture_ablation', 'blaze_style', 'direct_uv', 'direct_table_UV', 'TableFrame7_N', 'table_frame_FiLM', 'train_dataset_13', 'val_dataset_11', 'seed42']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/ablation_a2_blaze_style_d13_to_d11_seed42`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`None` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=520,190 |
+| 训练 | epochs=80，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 76） | 9.495 | 31.371 mm | 28.961 mm | 22.038 mm | 18.053 mm |
+| 最终训练（epoch 80） | 5.659 | 23.376 mm | 21.283 mm | 14.734 mm | 15.135 mm |
+| 最终验证（epoch 80） | 9.530 | 31.447 mm | 28.872 mm | 22.097 mm | 18.091 mm |
+
+相比上一实验：最佳 Val EPE 下降 0.839 mm，性能提升。
+
+## 2026-09-23T16:10:22+08:00 · ablation_b2_blaze_style_recon_consistency_d13_to_d11_seed42
+
+<!-- experiment-record: {"run_dir":"outputs/ModelV1_virtual_camera_cross_camera/ablation_b2_blaze_style_recon_consistency_d13_to_d11_seed42","completed_at":"2026-09-23T16:10:22+08:00","run_name":"ablation_b2_blaze_style_recon_consistency_d13_to_d11_seed42","best_val_epe_mm":37.35683059692383,"best_epoch":80} -->
+
+- 实验目的：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- 模型变化：增加 RGB 人脸编码器及 face-eye 视觉融合；移除 crop_cam 36D 分支；Scene 从 full25 替换为 TableFrame 7D；不使用双眼 6D 几何先验。
+- W&B：project=`ModelV1_virtual_camera_cross_camera`，mode=`online`，tags=['ModelV1', 'architecture_ablation', 'blaze_style', 'gaze_aware_representation', 'reconstruction', 'embedding_consistency', 'direct_uv', 'direct_table_UV', 'TableFrame7_N', 'table_frame_FiLM', 'train_dataset_13', 'val_dataset_11', 'seed42']
+- 产物目录：`outputs/ModelV1_virtual_camera_cross_camera/ablation_b2_blaze_style_recon_consistency_d13_to_d11_seed42`
+
+### 关键参数
+
+| 类别 | 设置 |
+|---|---|
+| 数据划分 | `explicit_datasets`；datasets=['13'] → ['11']；train=887，val=578 |
+| 深度先验 | `numbered datasets [13, 11]; data/processed/depth_priors_iris_ipd_65mm_v1_<id>.csv` |
+| 人脸/双眼视觉融合 | use=True，face=`inception_resnet_v1(vggface2)`，eye=`resnet18`，cross_attention=8x128，face_frozen=False |
+| 眼部骨干 | `resnet18`，input_size=`(90, 56)` (W,H)，weights=`None` |
+| Crop分支 | use=False，input_dim=36 |
+| Scene分支 | representation=`table_frame7`，input_dim=7 |
+| 几何分支 | use=False，gate=`none` |
+| 融合层 | `[256, 128]`；总参数=928,937 |
+| 训练 | epochs=80，batch=64，optimizer=`adamw`，lr=0.0003，weight_decay=0.0001 |
+| 调度器 | `cosine`，eta_min=1e-06 |
+| 损失 | beta_mm=30.0，gate_reg=0.0 |
+
+### 性能指标
+
+| 记录 | Loss | EPE | Median EPE | MAE-U | MAE-V |
+|---|---:|---:|---:|---:|---:|
+| 最佳验证（epoch 80） | 12.950 | 37.357 mm | 33.785 mm | 26.744 mm | 20.766 mm |
+| 最终训练（epoch 80） | 7.633 | 27.187 mm | 26.256 mm | 17.634 mm | 16.760 mm |
+| 最终验证（epoch 80） | 12.950 | 37.357 mm | 33.785 mm | 26.744 mm | 20.766 mm |
+
+相比上一实验：最佳 Val EPE 上升 5.986 mm，性能下降。
 
 <!-- AUTO-DETAILS-END -->

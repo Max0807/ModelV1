@@ -14,31 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modelv1 import ModelV1, ModelV1Config
-from modelv1.model import DECA_BRANCH_MODES
 from modelv1.geometry_gate import EYE_GEOMETRY_GATE_MODES
 from modelv1.scene import SCENE_REPRESENTATIONS, scene_representation_dim
-from modelv1.deca_cache import (
-    DECA_FEATURE_REPRESENTATIONS,
-    DECA_FEATURE_REPRESENTATION_NONE,
-    deca_feature_representation_dim,
-)
 from modelv1.data.depth_prior import EYE_GEOMETRY_REPRESENTATIONS
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--deca-feature-representation",
-        choices=DECA_FEATURE_REPRESENTATIONS,
-        default="full236",
-        help="full236=all coarse DECA parameters; geometry156=shape+exp+pose.",
-    )
-    parser.add_argument(
-        "--deca-branch-mode",
-        choices=DECA_BRANCH_MODES,
-        default="flat",
-        help="flat=one DECA MLP; factorized_geometry=separate shape/exp/pose MLPs.",
-    )
     parser.add_argument(
         "--eye-backbone",
         default="resnet18",
@@ -102,9 +84,6 @@ def main() -> int:
         args.use_eye_geometry or args.eye_geometry_gate_mode != "none"
     )
     config = ModelV1Config(
-        deca_feature_dim=deca_feature_representation_dim(args.deca_feature_representation),
-        deca_feature_representation=args.deca_feature_representation,
-        deca_branch_mode=args.deca_branch_mode,
         use_face_image=args.use_face_image,
         freeze_face_image_backbone=args.freeze_face_image_backbone,
         eye_backbone=args.eye_backbone,
@@ -125,8 +104,6 @@ def main() -> int:
         "right_eye": torch.randn(batch_size, 3, 36, 60),
         "scene_vec": torch.randn(batch_size, config.scene_dim),
     }
-    if config.deca_feature_representation != DECA_FEATURE_REPRESENTATION_NONE:
-        batch["deca_feat"] = torch.randn(batch_size, config.deca_feature_dim)
     if config.use_face_image:
         batch["face"] = torch.randn(batch_size, 3, 160, 160)
     if config.use_crop_cam:
@@ -163,8 +140,6 @@ def main() -> int:
     print("eye_backbone:", config.eye_backbone)
     print("use_crop_cam:", config.use_crop_cam)
     print("scene_representation:", config.scene_representation)
-    print("deca_feature_representation:", config.deca_feature_representation)
-    print("deca_branch_mode:", config.deca_branch_mode)
     print("use_eye_geometry:", config.use_eye_geometry)
     print("eye_geometry_representation:", config.eye_geometry_representation)
     print("eye_geometry_gate_mode:", config.eye_geometry_gate_mode)

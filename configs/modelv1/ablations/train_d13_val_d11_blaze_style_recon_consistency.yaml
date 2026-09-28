@@ -1,0 +1,120 @@
+defaults: ../defaults_direct_uv.yaml
+
+experiment:
+  auto_experiment_identity: false
+  run_name: ablation_b2_blaze_style_recon_consistency_d13_to_d11_seed42
+  diary_enabled: true
+  diary_path: experiments/experiment_diary.md
+  output_dir: outputs
+  seed: 42
+  deterministic: true
+
+data:
+  table7_stage3_csv_paths:
+    - data/preprocessed_table7/dataset13/stage3_virtual_table7/training_table7_dataset13.csv
+    - data/preprocessed_table7/dataset11/stage3_virtual_table7/training_table7_dataset11.csv
+  dataset_ids: ["13", "11"]
+  image_source: legacy
+  eye_geometry_pseudo_label_paths:
+    - data/preprocessed_table7/dataset11/stage2_metric_head_pose/mediapipe_eye15_dataset11.npz
+    - data/preprocessed_table7/dataset13/stage2_metric_head_pose/mediapipe_eye15_dataset13.npz
+  train_datasets: ["13"]
+  val_datasets: ["11"]
+  batch_size: 64
+  num_workers: 2
+  persistent_workers: true
+  pin_memory: true
+  normalize_images: true
+  eye_augmentation: appearance_mild_v1
+  face_augmentation: appearance_mild_v1
+
+model:
+  architecture: blaze_style
+  prediction_mode: direct_uv
+  gaze_prediction_frame: camera
+  use_table_frame_film: true
+  use_depth_correction: false
+  use_face_image: true
+  freeze_face_image_backbone: false
+  visual_embedding_dim: 128
+  use_eye_keypoint_auxiliary: false
+  use_landmark_guided_eye_fusion: false
+  use_reconstruction_auxiliary: true
+  reconstruction_sample_limit: 8
+  eye_backbone: resnet18
+  eye_backbone_weights: null
+  use_crop_cam: false
+  scene_representation: table_frame7
+  scene_dim: 7
+  scene_embedding_dim: 64
+  scene_hidden_dims: [128]
+  eye_geometry_dim: 6
+  eye_geometry_representation: raw_eye6d
+  use_eye_geometry: false
+  eye_geometry_gate_mode: none
+  eye_geometry_quality_dim: 4
+  use_gaze_uncertainty: false
+  fusion_hidden_dims: [256, 128]
+  branch_dropout: 0.1
+  fusion_dropout: 0.2
+
+loss:
+  beta_mm: 30.0
+  blaze_reconstruction_weight: 1.0
+  blaze_consistency_weight: 0.2
+  eye_keypoint_nll_weight: 0.0
+  eye_landmark_coordinate_weight: 0.0
+  eye_landmark_heatmap_weight: 0.0
+  eye_landmark_visibility_weight: 0.0
+  eye_landmark_equivariance_weight: 0.0
+  eye_landmark_mirror_shape_weight: 0.0
+
+training:
+  epochs: 80
+  device: auto
+  amp: true
+  amp_dtype: bfloat16
+  grad_clip_norm: 1.0
+  trainable_components: all
+  initialization_checkpoint: null
+  eye_backbone_schedule:
+    enabled: false
+  optimizer:
+    name: adamw
+    lr: 0.0003
+    weight_decay: 0.0001
+    fused: true
+  ema:
+    enabled: true
+    decay: 0.99
+    start_after_warmup: true
+  scheduler:
+    name: cosine
+    eta_min: 0.000001
+    warmup_epochs: 3
+    warmup_start_factor: 0.1
+  checkpoint:
+    save_last: true
+    monitor: val/epe_mm
+
+logging:
+  terminal_every_epochs: 10
+  wandb:
+    enabled: true
+    project: ModelV1_virtual_camera_cross_camera
+    entity: null
+    mode: online
+    tags:
+      - ModelV1
+      - architecture_ablation
+      - blaze_style
+      - gaze_aware_representation
+      - reconstruction
+      - embedding_consistency
+      - direct_uv
+      - direct_table_UV
+      - TableFrame7_N
+      - table_frame_FiLM
+      - train_dataset_13
+      - val_dataset_11
+      - seed42

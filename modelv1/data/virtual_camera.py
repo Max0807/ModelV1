@@ -27,6 +27,8 @@ class VirtualCameraDependencyError(RuntimeError):
 
 
 def _require_cv2() -> Any:
+    """延迟导入 OpenCV，并在离线图像 warp 环境缺失时给出明确错误。"""
+
     try:
         import cv2  # type: ignore
     except ImportError as exc:  # pragma: no cover - depends on local environment
@@ -38,6 +40,8 @@ def _require_cv2() -> Any:
 
 
 def _finite_array(value: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
+    """将输入复制为 float64 数组，并严格检查 shape 和有限性。"""
+
     array = np.asarray(value, dtype=np.float64)
     if array.shape != shape:
         raise ValueError(f"{name} must have shape {shape}, got {array.shape}.")
@@ -47,66 +51,105 @@ def _finite_array(value: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
 
 
 def _normalize(vector: np.ndarray, name: str, epsilon: float = 1e-9) -> np.ndarray:
+    """验证向量长度大于阈值并返回单位方向。"""
+
     norm = float(np.linalg.norm(vector))
     if not np.isfinite(norm) or norm <= epsilon:
         raise ValueError(f"{name} has near-zero length.")
     return vector / norm
 
 
-@dataclass(frozen=True)
-class CameraCalibration:
-    """Real-camera pinhole intrinsics and OpenCV distortion coefficients."""
+@dataclass(frozen=True)  # 自动生成初始化等方法，并禁止初始化后重新给属性赋值
+class CameraCalibration:  # 定义真实相机标定参数数据类
+    """Real-camera pinhole intrinsics and OpenCV distortion coefficients.保存相机内参与 OpenCV 畸变系数""" 
 
-    camera_matrix: np.ndarray
-    distortion_coefficients: np.ndarray
+    camera_matrix: np.ndarray  # 真实相机的 3×3 内参矩阵 K
+    distortion_coefficients: np.ndarray  # OpenCV 格式的镜头畸变系数
 
-    def __post_init__(self) -> None:
-        matrix = _finite_array(self.camera_matrix, (3, 3), "camera_matrix")
-        distortion = np.asarray(self.distortion_coefficients, dtype=np.float64).reshape(-1)
-        if distortion.size not in (4, 5, 8, 12, 14):
-            raise ValueError(
-                "distortion_coefficients must contain 4, 5, 8, 12, or 14 values."
-            )
-        if not np.isfinite(distortion).all():
-            raise ValueError("distortion_coefficients must contain only finite values.")
-        if matrix[0, 0] <= 0 or matrix[1, 1] <= 0:
-            raise ValueError("camera focal lengths must be positive.")
-        if abs(float(matrix[2, 2])) <= 1e-12:
-            raise ValueError("camera_matrix[2, 2] must be non-zero.")
-        object.__setattr__(self, "camera_matrix", matrix)
-        object.__setattr__(self, "distortion_coefficients", distortion.copy())
+    def __post_init__(self) -> None:  # dataclass 完成 __init__ 后自动调用
+        """验证真实相机内参、畸变系数长度与数值有效性。"""  # 说明该方法的验证职责
 
+        matrix = _finite_array(  # 将相机矩阵标准化为合格的 float64 数组
+            self.camera_matrix,  # 读取构造函数传入的相机矩阵
+            (3, 3),  # 要求相机矩阵形状必须是 3×3
+            "camera_matrix",  # 验证失败时使用的参数名称
+        )
+        distortion = np.asarray(  # 将畸变系数转换为 NumPy 数组
+            self.distortion_coefficients,  # 读取传入的畸变系数
+            dtype=np.float64,  # 使用 float64 保证几何计算精度
+        ).reshape(-1)  # 展平为一维向量
 
-@dataclass(frozen=True)
-class VirtualCameraConfig:
-    """Fixed shared virtual-camera parameters used for every sample."""
+        # if distortion.size not in (4, 5, 8, 12, 14):  # 检查是否为 OpenCV 支持的畸变参数长度
+        #     raise ValueError(  # 长度不合法时拒绝创建标定对象
+        #         "distortion_coefficients must contain 4, 5, 8, 12, or 14 values."  # 给出允许的系数数量
+        #     )
 
-    output_width: int = 224
-    output_height: int = 224
-    focal_length_px: float = 480.0
-    distance_mm: float = 600.0
+        # if not np.isfinite(distortion).all():  # 检查所有畸变系数是否都是有限数字
+        #     raise ValueError(  # 发现 NaN 或无穷大时抛出异常
+        #         "distortion_coefficients must contain only finite values."
+        #     )
 
-    def __post_init__(self) -> None:
-        if self.output_width <= 0 or self.output_height <= 0:
-            raise ValueError("Virtual-camera output dimensions must be positive.")
-        if not np.isfinite(self.focal_length_px) or self.focal_length_px <= 0:
-            raise ValueError("focal_length_px must be finite and positive.")
-        if not np.isfinite(self.distance_mm) or self.distance_mm <= 0:
-            raise ValueError("distance_mm must be finite and positive.")
+        # if matrix[0, 0] <= 0 or matrix[1, 1] <= 0:  # 检查横向焦距 fx 和纵向焦距 fy
+        #     raise ValueError(  # 焦距非正数时相机模型无效
+        #         "camera focal lengths must be positive."
+        #     )
 
-    @property
-    def camera_matrix(self) -> np.ndarray:
-        """Return ``K_N`` with the principal point at the output image center."""
+        # if abs(float(matrix[2, 2])) <= 1e-12:  # 检查齐次坐标缩放项是否接近零
+        #     raise ValueError(  # 避免后续齐次坐标归一化时出现除零问题
+        #         "camera_matrix[2, 2] must be non-zero."
+        #     )
 
-        return np.array(
-            [
-                [self.focal_length_px, 0.0, self.output_width / 2.0],
-                [0.0, self.focal_length_px, self.output_height / 2.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
+        object.__setattr__(  # 绕过 frozen=True 的赋值限制完成初始化标准化
+            self,
+            "camera_matrix",
+            matrix,
+        )
+        object.__setattr__(  # 保存已经展平并复制的畸变系数
+            self,
+            "distortion_coefficients",
+            distortion.copy(),
         )
 
+
+@dataclass(frozen=True)  # 自动生成初始化方法，并禁止初始化后重新给字段赋值
+class VirtualCameraConfig:  # 定义所有样本共用的虚拟相机配置
+    """Fixed shared virtual-camera parameters used for every sample."""  # 表示这些固定参数会用于所有样本
+
+    output_width: int = 224  # 虚拟相机输出图像宽度，单位像素
+    output_height: int = 224  # 虚拟相机输出图像高度，单位像素
+    focal_length_px: float = 480.0  # 虚拟相机焦距，单位像素
+    distance_mm: float = 600.0  # 归一化后的标准观察距离，单位毫米
+
+    def __post_init__(self) -> None:  # dataclass 初始化完成后自动验证配置
+        """验证虚拟相机输出尺寸、焦距和标准距离均为有限正数。"""  # 说明验证内容
+
+        # if self.output_width <= 0 or self.output_height <= 0:  # 检查输出宽高是否为正数
+        #     raise ValueError(  # 输出尺寸非法时拒绝创建配置
+        #         "Virtual-camera output dimensions must be positive."
+        #     )
+
+        # if not np.isfinite(self.focal_length_px) or self.focal_length_px <= 0:  # 检查焦距是否有限且为正
+        #     raise ValueError(  # 焦距非法时拒绝创建配置
+        #         "focal_length_px must be finite and positive."
+        #     )
+
+        if not np.isfinite(self.distance_mm) or self.distance_mm <= 0:  # 检查标准距离是否有限且为正
+            raise ValueError(  # 标准距离非法时拒绝创建配置
+                "distance_mm must be finite and positive."
+            )
+
+    @property  # 将 camera_matrix 暴露为只读计算属性
+    def camera_matrix(self) -> np.ndarray:  # 根据配置动态构造虚拟相机内参矩阵
+        """Return ``K_N`` with the principal point at the output image center."""  # 主点位于输出图像中心
+
+        return np.array(  # 创建并返回 3×3 虚拟相机内参矩阵
+            [
+                [self.focal_length_px, 0.0, self.output_width / 2.0],  # 第一行：[fx, 0, cx]
+                [0.0, self.focal_length_px, self.output_height / 2.0],  # 第二行：[0, fy, cy]
+                [0.0, 0.0, 1.0],  # 第三行：齐次坐标固定项
+            ],
+            dtype=np.float64,  # 使用 float64 保持几何计算精度
+        )
 
 @dataclass(frozen=True)
 class EyeCropConfig:
@@ -118,6 +161,8 @@ class EyeCropConfig:
     minimum_source_width_px: float = 4.0
 
     def __post_init__(self) -> None:
+        """验证虚拟眼图输出尺寸、水平扩展比例和最小源宽度。"""
+
         if self.output_width <= 0 or self.output_height <= 0:
             raise ValueError("Eye output dimensions must be positive.")
         if not np.isfinite(self.horizontal_span_scale) or self.horizontal_span_scale <= 1:
@@ -155,6 +200,8 @@ class VirtualCameraTransform:
     config: VirtualCameraConfig
 
     def __post_init__(self) -> None:
+        """验证并复制样本级 R_N_C、R_N_H、单应矩阵、头中心和距离尺度。"""
+
         rotation = _finite_array(
             self.rotation_normalized_from_camera,
             (3, 3),
@@ -198,6 +245,8 @@ class VirtualCameraTransform:
 
     @staticmethod
     def _rotate_directions(value: Any, rotation: np.ndarray, name: str) -> np.ndarray:
+        """用旋转矩阵转换单个或批量三维方向，不应用虚拟相机距离缩放。"""
+
         directions = np.asarray(value, dtype=np.float64)
         if directions.ndim == 1:
             if directions.shape != (3,):

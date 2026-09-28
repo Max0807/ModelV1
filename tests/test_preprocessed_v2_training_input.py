@@ -30,7 +30,6 @@ class PreprocessedV2TrainingInputTests(unittest.TestCase):
             "virtual_camera_manifest": referenced / "virtual.csv",
             "virtual_camera_report": referenced / "virtual.json",
             "virtual_camera_pose_source": referenced / "pnp.csv",
-            "deca_cache": referenced / "deca.npz",
         }
         for path in paths.values():
             path.write_text("placeholder", encoding="utf-8")

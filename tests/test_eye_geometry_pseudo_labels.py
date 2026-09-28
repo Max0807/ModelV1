@@ -181,10 +181,7 @@ class EyeGeometryPseudoLabelTableTests(unittest.TestCase):
             dataset = ModelV1Dataset(
                 csv_path,
                 datasets=("13",),
-                load_face_image=False,
                 paired_eye_transform=full_occlusion_transform(),
-                deca_cache_path=None,
-                require_deca_features=False,
                 eye_geometry_pseudo_label_paths=(archive_path,),
                 require_eye_geometry_pseudo_labels=True,
             )
@@ -197,28 +194,10 @@ class EyeGeometryPseudoLabelTableTests(unittest.TestCase):
         )
         self.assertEqual(int(item["eye_pseudo_landmark_valid_mask"].count_nonzero()), 0)
         self.assertEqual(int(item["eye_pseudo_occluded_mask"].count_nonzero()), 30)
-        self.assertEqual(int(item["iris_center_valid_mask"].count_nonzero()), 0)
         torch.testing.assert_close(
             item["eye_pseudo_landmarks_xy"],
             torch.full((2, 15, 2), 0.5),
         )
-
-    def test_virtual_camera_eye_source_rejects_legacy_crop_coordinates(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "labels.npz"
-            write_archive(path, ("sample",))
-            table = EyeGeometryPseudoLabelTable.load((path,))
-            with self.assertRaisesRegex(ValueError, "legacy eye"):
-                ModelV1Dataset(
-                    "unused.csv",
-                    load_face_image=False,
-                    deca_cache_path=None,
-                    require_deca_features=False,
-                    image_source="virtual_camera",
-                    eye_image_source="virtual_camera",
-                    eye_geometry_pseudo_label_table=table,
-                )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -63,7 +63,7 @@ LEFT_EYE_MEDIAPIPE_INDICES = (
     475,
     476,
     477,
-)
+)  # 左眼15关键点
 RIGHT_EYE_MEDIAPIPE_INDICES = (
     33,
     246,
@@ -80,7 +80,7 @@ RIGHT_EYE_MEDIAPIPE_INDICES = (
     470,
     471,
     472,
-)
+)  # 右眼15关键点
 GEOMETRY_FEATURE_NAMES = EYE_PSEUDO_GEOMETRY_FEATURE_NAMES
 GEOMETRY_FEATURE_COUNT = len(GEOMETRY_FEATURE_NAMES)
 
@@ -96,6 +96,8 @@ class EyeFit:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析独立 Eye15 提取工具的输入 CSV、输出路径和质量阈值。"""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset-id",
@@ -164,6 +166,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    """校验输入文件、阈值范围、处理数量和输出覆盖策略。"""
+
     if not args.csv.is_file():
         raise FileNotFoundError(f"Dataset CSV does not exist: {args.csv}")
     if not 0.0 <= args.min_detection_confidence <= 1.0:
@@ -191,6 +195,8 @@ def read_rows(
     dataset_name: str,
     limit: int | None,
 ) -> list[dict[str, str]]:
+    """读取指定数据集的样本，验证必需列与 sample_id 唯一性并应用数量限制。"""
+
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
@@ -225,6 +231,8 @@ def read_rows(
 
 
 def eye_bbox(row: Mapping[str, str], side: str) -> tuple[float, float, float, float]:
+    """从样本行读取指定解剖侧眼框，并验证 xywh 数值有限且宽高为正。"""
+
     values = tuple(float(row[f"{side}_eye_bbox_{axis}"]) for axis in ("x", "y", "w", "h"))
     if not all(math.isfinite(value) for value in values) or values[2] <= 0 or values[3] <= 0:
         raise ValueError(f"invalid_{side}_eye_bbox")
@@ -238,6 +246,8 @@ def extract_selected_points(
     width: int,
     height: int,
 ) -> np.ndarray:
+    """按固定 Eye15 索引从 refined FaceMesh 中抽点并转换为原图像素坐标。"""
+
     if len(indices) != POINT_COUNT_PER_EYE:
         raise ValueError(f"Expected {POINT_COUNT_PER_EYE} landmark indices.")
     if len(landmarks) <= max(indices):
@@ -252,6 +262,8 @@ def extract_selected_points(
 
 
 def _soft_range_score(value: float, low: float, high: float, margin: float) -> float:
+    """将数值映射为区间内为 1、区间外按 margin 线性衰减的质量分数。"""
+
     if low <= value <= high:
         return 1.0
     if value < low:
@@ -269,6 +281,8 @@ def fit_eye_geometry(
     min_crop_inside_ratio: float,
     min_quality_score: float,
 ) -> EyeFit:
+    """建立眼部局部坐标，拟合虹膜/眼睑特征并依据几何阈值生成有效性结果。"""
+
     points = np.asarray(points_px, dtype=np.float64)
     if points.shape != (POINT_COUNT_PER_EYE, 2):
         raise ValueError(
@@ -375,36 +389,40 @@ def fit_eye_geometry(
 
 
 def _empty_arrays(count: int) -> dict[str, np.ndarray]:
+    """按样本数预分配 Eye15 坐标、几何特征、质量分数和各级 mask。"""
+
     point_shape = (count, POINT_COUNT_PER_EYE, 2)
     return {
-        "image_size_px": np.zeros((count, 2), dtype=np.int32),
-        "detection_success_mask": np.zeros(count, dtype=np.bool_),
-        "valid_mask": np.zeros(count, dtype=np.bool_),
-        "left_eye_valid_mask": np.zeros(count, dtype=np.bool_),
-        "right_eye_valid_mask": np.zeros(count, dtype=np.bool_),
-        "left_eye_points_px": np.full(point_shape, np.nan, dtype=np.float32),
-        "right_eye_points_px": np.full(point_shape, np.nan, dtype=np.float32),
-        "left_eye_points_crop_norm": np.full(point_shape, np.nan, dtype=np.float32),
-        "right_eye_points_crop_norm": np.full(point_shape, np.nan, dtype=np.float32),
-        "left_eye_points_local": np.full(point_shape, np.nan, dtype=np.float32),
-        "right_eye_points_local": np.full(point_shape, np.nan, dtype=np.float32),
+        "image_size_px": np.zeros((count, 2), dtype=np.int32),  # [N, 2] 每张图像的宽、高
+        "detection_success_mask": np.zeros(count, dtype=np.bool_),  # [N] FaceMesh 是否成功执行
+        "valid_mask": np.zeros(count, dtype=np.bool_),  # [N] 左右两眼是否都有效
+        "left_eye_valid_mask": np.zeros(count, dtype=np.bool_),  # [N] 左眼是否通过质量检查
+        "right_eye_valid_mask": np.zeros(count, dtype=np.bool_),  # [N] 右眼是否通过质量检查
+        "left_eye_points_px": np.full(point_shape, np.nan, dtype=np.float32),  # [N, 15, 2] 左眼 Eye15 像素坐标
+        "right_eye_points_px": np.full(point_shape, np.nan, dtype=np.float32),  # [N, 15, 2] 右眼 Eye15 像素坐标
+        "left_eye_points_crop_norm": np.full(point_shape, np.nan, dtype=np.float32),  # [N, 15, 2] 左眼 Eye15 相对裁剪框的归一化坐标
+        "right_eye_points_crop_norm": np.full(point_shape, np.nan, dtype=np.float32),  # [N, 15, 2] 右眼 Eye15 相对裁剪框的归一化坐标
+        "left_eye_points_local": np.full(point_shape, np.nan, dtype=np.float32),  # [N, 15, 2] 左眼 Eye15 局部坐标
+        "right_eye_points_local": np.full(point_shape, np.nan, dtype=np.float32),  # [N, 15, 2] 右眼 Eye15 局部坐标
         "left_eye_point_valid_mask": np.zeros(
             (count, POINT_COUNT_PER_EYE), dtype=np.bool_
-        ),
+        ),  # [N, 15] 每个左眼点是否有效
         "right_eye_point_valid_mask": np.zeros(
             (count, POINT_COUNT_PER_EYE), dtype=np.bool_
-        ),
+        ),  # [N, 15] 每个右眼点是否有效
         "left_eye_geometry": np.full(
             (count, GEOMETRY_FEATURE_COUNT), np.nan, dtype=np.float32
-        ),
+        ),  # [N, 10] 左眼的 10 个几何特征
         "right_eye_geometry": np.full(
             (count, GEOMETRY_FEATURE_COUNT), np.nan, dtype=np.float32
-        ),
-        "sample_quality_score": np.zeros(count, dtype=np.float32),
+        ),  # [N, 10] 右眼的 10 个几何特征
+        "sample_quality_score": np.zeros(count, dtype=np.float32),  # [N] 样本综合质量分数
     }
 
 
 def distribution(values: np.ndarray) -> dict[str, float | int | None]:
+    """统计有限数值的数量、极值和 5/50/95 分位数，供报告审计。"""
+
     finite = np.asarray(values, dtype=np.float64)
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
@@ -420,6 +438,8 @@ def distribution(values: np.ndarray) -> dict[str, float | int | None]:
 
 
 def sha256_file(path: Path) -> str:
+    """分块计算文件 SHA-256，供 NPZ 产物完整性记录。"""
+
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -428,6 +448,8 @@ def sha256_file(path: Path) -> str:
 
 
 def write_npz_atomic(path: Path, payload: Mapping[str, np.ndarray]) -> None:
+    """先写临时压缩 NPZ 再原子替换目标，避免半成品归档。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -442,6 +464,8 @@ def write_npz_atomic(path: Path, payload: Mapping[str, np.ndarray]) -> None:
 
 
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    """以 UTF-8 写入临时 JSON 后原子替换质量报告。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -456,6 +480,8 @@ def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def build_metadata(args: argparse.Namespace, row_count: int) -> dict[str, Any]:
+    """构建 Eye15 点序、左右语义、坐标约定和阈值等可复现实验元数据。"""
+
     return {
         "schema_version": SCHEMA_VERSION,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -498,6 +524,8 @@ def build_metadata(args: argparse.Namespace, row_count: int) -> dict[str, Any]:
 
 
 def main() -> int:
+    """运行独立 MediaPipe Eye15 提取流程并写出 NPZ 与统计报告。"""
+
     args = parse_args()
     validate_args(args)
     try:

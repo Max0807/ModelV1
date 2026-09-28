@@ -1,0 +1,63 @@
+# Final preprocessing for the model input table_frame7_n[7].
+# Normal use:
+#   python scripts/prepare_modelv1_table7.py
+# Run a single stage by changing execution.stages below.
+
+schema_version: modelv1_table7_preprocessing_v1
+
+dataset:
+  # Accepts "13" or "dataset_dual_rigid_body_13".
+  id: "11"
+
+paths:
+  # Directory containing dataset_dual_rigid_body_<ID>/.
+  source_root: D:/GithubCode/CrossGaze-main/CrossGaze-main/data_collection
+  # {dataset_id} is substituted automatically.
+  output_root: data/preprocessed_table7/dataset{dataset_id}
+
+camera:
+  # Real camera calibration used by Iris65 rays, DECA source-size checks,
+  # and virtual-camera image warping.
+  calibration_file: configs/camera/crossgaze_camera.yaml
+
+base_dataset:
+  face_image_dir: insightface_face
+  insightface_coordinates_file: insightface_coordinates.csv
+  handeye_translation_scale: 1000.0
+  # Per your data contract, each frame's gaze_target_tz defines its table plane.
+  table_z_source: per-sample-target
+
+mediapipe:
+  min_detection_confidence: 0.5
+  min_canthus_distance_px: 8.0
+  min_crop_inside_ratio: 0.8
+  min_eye_quality_score: 0.25
+
+metric_head_pose:
+  # The sole absolute metric-depth source.
+  ipd_mm: 65.0
+  max_ipd_residual_mm: 4.0
+  max_ray_condition: 250.0
+
+  face_preprocess: deca
+  deca_crop_scale: 1.25
+  fixed_shape_calibration:
+    # Inclusive range. Adapt these two values for every new subject/dataset.
+    start: 1
+    stop: 83
+    index_mode: frame_idx
+
+virtual_camera:
+  face_width: 160
+  face_height: 160
+  focal_length_px: 480.0
+  distance_mm: 600.0
+
+execution:
+  # [1, 2, 3] runs the complete pipeline; [2] or [3] reruns one stage.
+  stages: [1, 2, 3]
+  overwrite: true
+  dry_run: false
+  # null processes all samples; use a small positive value for debugging.
+  limit: null
+  log_every: 20
